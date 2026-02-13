@@ -106,13 +106,24 @@ impl Builder<DisconnectedState> {
         app: &RegisterAppRequest,
     ) -> Result<Builder<RequestingApprovalState>, BuilderError> {
         let resp = self.client.request_app_connection(app).await?;
+        self.with_connection_response(app.app_id, resp)
+    }
+
+    /// Transitions to [RequestingApprovalState] using a pre-fetched
+    /// connection response. This is useful when the HTTP call to
+    /// `POST /auth/connect` was made out-of-band (e.g. via curl).
+    pub fn with_connection_response(
+        self,
+        app_id: Hash256,
+        response: RegisterAppResponse,
+    ) -> Result<Builder<RequestingApprovalState>, BuilderError> {
         Ok(Builder {
             state: RequestingApprovalState {
-                app_id: app.app_id,
-                response_url: Url::parse(&resp.response_url)?,
-                register_url: Url::parse(&resp.register_url)?,
-                status_url: Url::parse(&resp.status_url)?,
-                expiration: resp.expiration,
+                app_id,
+                response_url: Url::parse(&response.response_url)?,
+                register_url: Url::parse(&response.register_url)?,
+                status_url: Url::parse(&response.status_url)?,
+                expiration: response.expiration,
             },
             client: self.client,
         })
@@ -153,7 +164,7 @@ impl Builder<RequestingApprovalState> {
                     client: self.client,
                 });
             }
-            tokio::time::sleep(Duration::from_secs(5)).await;
+            sleep(Duration::from_secs(5)).await;
         }
     }
 }
