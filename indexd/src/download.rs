@@ -175,7 +175,7 @@ impl Downloader {
                     let permit = semaphore.clone().acquire_owned().await?;
                     let transport = self.transport.clone();
                     let account_key = self.account_key.clone();
-                    download_tasks.spawn(Self::try_download_sector(
+                    join_set_spawn!(download_tasks, Self::try_download_sector(
                         permit,
                         transport,
                         account_key,
@@ -220,7 +220,7 @@ impl Downloader {
                                 // are not enough to satisfy the required number
                                 // of shards. The sleep arm will handle slow
                                 // hosts.
-                                download_tasks.spawn(Self::try_download_sector(
+                                join_set_spawn!(download_tasks, Self::try_download_sector(
                                     permit,
                                     transport,
                                     account_key,
@@ -235,7 +235,7 @@ impl Downloader {
                         && let Some(task) = sectors.pop_front() {
                             let transport = self.transport.clone();
                             let account_key = self.account_key.clone();
-                            download_tasks.spawn(Self::try_download_sector(
+                            join_set_spawn!(download_tasks, Self::try_download_sector(
                                 racer_permit,
                                 transport,
                                 account_key,
