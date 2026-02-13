@@ -337,8 +337,8 @@ impl Client {
         ]
     }
 }
-
-#[async_trait]
+#[cfg_attr(target_arch = "wasm32", async_trait(?Send))]
+#[cfg_attr(not(target_arch = "wasm32"), async_trait)]
 pub trait AppClient: Send + Sync {
     async fn check_app_authenticated(&self, app_key: &PrivateKey) -> Result<bool, Error>;
 
@@ -412,7 +412,8 @@ impl<'de> serde::Deserialize<'de> for EmptyResponse {
     }
 }
 
-#[async_trait]
+#[cfg_attr(target_arch = "wasm32", async_trait(?Send))]
+#[cfg_attr(not(target_arch = "wasm32"), async_trait)]
 impl AppClient for Client {
     /// Checks if the application is authenticated with the indexer. It returns
     /// true if authenticated, false if not, and an error if the request fails.
