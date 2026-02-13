@@ -5,7 +5,6 @@ use sia::rhp::{self, HostPrices};
 use sia::signing::{PrivateKey, PublicKey};
 use sia::types::Hash256;
 use thiserror::Error;
-use tokio::time::error::Elapsed;
 
 #[derive(Debug, Error)]
 pub enum Error {
@@ -24,8 +23,9 @@ pub enum Error {
     #[error("invalid signature")]
     InvalidSignature,
 
+    #[cfg(not(target_arch = "wasm32"))]
     #[error("timeout error: {0}")]
-    Timeout(#[from] Elapsed),
+    Timeout(#[from] tokio::time::error::Elapsed),
 
     #[error("transport error: {0}")]
     Transport(String),

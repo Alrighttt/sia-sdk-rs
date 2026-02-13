@@ -14,6 +14,10 @@ use tokio::sync::{OwnedSemaphorePermit, Semaphore, mpsc};
 use tokio::task::{JoinSet, spawn_blocking};
 use tokio::time::error::Elapsed;
 use tokio::time::{Instant, sleep, timeout};
+#[cfg(not(target_arch = "wasm32"))]
+use tokio::time::error::Elapsed;
+#[cfg(target_arch = "wasm32")]
+use crate::wasm_time::{Instant, sleep};
 use tokio_util::task::AbortOnDropHandle;
 
 use crate::hosts::{HostQueue, QueueError};
