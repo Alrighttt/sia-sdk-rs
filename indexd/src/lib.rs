@@ -65,6 +65,7 @@ pub struct SDK {
 
 impl SDK {
     /// Creates a new SDK instance.
+    #[cfg(not(target_arch = "wasm32"))]
     async fn new(
         api_client: Arc<dyn AppClient>,
         app_key: Arc<PrivateKey>,
@@ -75,6 +76,29 @@ impl SDK {
         hosts.update(usable_hosts);
 
         let transport = quic::Client::new(tls_config, hosts.clone())?;
+
+        let downloader =
+            Downloader::new(hosts.clone(), Arc::new(transport.clone()), app_key.clone());
+        let uploader = Uploader::new(hosts.clone(), Arc::new(transport), app_key.clone());
+        Ok(Self {
+            app_key,
+            api_client,
+            downloader,
+            uploader,
+        })
+    }
+
+    /// Creates a new SDK instance.
+    #[cfg(target_arch = "wasm32")]
+    async fn new(
+        api_client: Arc<dyn AppClient>,
+        app_key: Arc<PrivateKey>,
+    ) -> Result<Self, BuilderError> {
+        let usable_hosts = api_client.hosts(&app_key, HostQuery::default()).await?;
+        let hosts = Hosts::new();
+        hosts.update(usable_hosts);
+
+        let transport = web_transport::Client::new(hosts.clone());
 
         let downloader =
             Downloader::new(hosts.clone(), Arc::new(transport.clone()), app_key.clone());
