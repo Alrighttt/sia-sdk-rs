@@ -167,6 +167,7 @@ impl Builder<ApprovedState> {
     ///
     /// # Errors
     /// Returns [BuilderError] if the registration fails or the SDK cannot be created.
+    #[cfg(not(target_arch = "wasm32"))]
     pub async fn register(
         self,
         mnemonic: &str,
@@ -177,6 +178,26 @@ impl Builder<ApprovedState> {
             .register_app(&app_key, self.state.register_url.clone())
             .await?;
         SDK::new(self.client, Arc::new(app_key), tls_config).await
+    }
+
+    /// Completes the registration process and returns an SDK instance.
+    ///
+    /// # Arguments
+    /// * `mnemonic` - The user's mnemonic phrase used to derive the application key.
+    /// * `tls_config` - The TLS configuration for secure communication.
+    ///
+    /// # Errors
+    /// Returns [BuilderError] if the registration fails or the SDK cannot be created.
+    #[cfg(target_arch = "wasm32")]
+    pub async fn register(
+        self,
+        mnemonic: &str,
+    ) -> Result<SDK, BuilderError> {
+        let app_key = derive_app_key(mnemonic, &self.state.app_id, &self.state.user_secret)?;
+        self.client
+            .register_app(&app_key, self.state.register_url.clone())
+            .await?;
+        SDK::new(self.client, Arc::new(app_key)).await
     }
 }
 
