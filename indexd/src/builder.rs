@@ -95,6 +95,7 @@ impl Builder<DisconnectedState> {
     /// # Arguments
     /// * `app_key` - The application key used for authentication.
     /// * `tls_config` - The TLS configuration for secure communication.
+    #[cfg(not(target_arch = "wasm32"))]
     pub async fn connected(
         &self,
         app_key: &PrivateKey,
@@ -104,7 +105,21 @@ impl Builder<DisconnectedState> {
         if !connected {
             return Ok(None);
         }
-        let sdk = SDK::new(self.client.clone(), Arc::new(app_key.clone()), tls_config).await?;
+
+        let sdk = SDK::new(self.client.clone(), Arc::new(app_key.clone(), tls_config)).await?;
+        Ok(Some(sdk))
+    }
+    #[cfg(target_arch = "wasm32")]
+    pub async fn connected(
+        &self,
+        app_key: &PrivateKey,
+    ) -> Result<Option<SDK>, BuilderError> {
+        let connected = self.client.check_app_authenticated(app_key).await?;
+        if !connected {
+            return Ok(None);
+        }
+
+        let sdk = SDK::new(self.client.clone(), Arc::new(app_key.clone())).await?;
         Ok(Some(sdk))
     }
 
