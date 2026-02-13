@@ -32,7 +32,15 @@ mod object_encryption;
 mod slabs;
 
 pub mod app_client;
+
+#[cfg(not(target_arch = "wasm32"))]
 pub mod quic;
+
+#[cfg(target_arch = "wasm32")]
+pub mod web_transport;
+
+#[cfg(target_arch = "wasm32")]
+pub(crate) mod wasm_time;
 
 mod builder;
 pub use builder::*;
