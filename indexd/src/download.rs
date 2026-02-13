@@ -304,12 +304,19 @@ impl Downloader {
                 .await?;
             let data_shards = slab.min_shards as usize;
             let parity_shards = slab.sectors.len() - slab.min_shards as usize;
+            #[cfg(not(target_arch = "wasm32"))]
             let shards = spawn_blocking(move || -> Result<Vec<Option<Vec<u8>>>, DownloadError> {
                 let rs = ErasureCoder::new(data_shards, parity_shards)?;
                 rs.reconstruct_data_shards(&mut shards)?;
                 Ok(shards)
             })
             .await??;
+            #[cfg(target_arch = "wasm32")]
+            let shards = {
+                let rs = ErasureCoder::new(data_shards, parity_shards)?;
+                rs.reconstruct_data_shards(&mut shards)?;
+                shards
+            };
             ErasureCoder::write_data_shards(
                 &mut w,
                 &shards[..data_shards],
