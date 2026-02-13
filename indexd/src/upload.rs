@@ -227,6 +227,7 @@ impl Uploader {
         write_timeout: Duration,
     ) -> Result<Sector, UploadError> {
         let now = Instant::now();
+        #[cfg(not(target_arch = "wasm32"))]
         let root = timeout(
             write_timeout,
             transport.write_sector(host_key, &account_key, data),
@@ -246,11 +247,33 @@ impl Uploader {
             );
             let _ = hosts.retry(host_key);
         })?;
+        #[cfg(target_arch = "wasm32")]
+        let root = tokio::select! {
+            result = transport.write_sector(host_key, &account_key, data) => {
+                result.inspect_err(|e| {
+                    debug!(
+                        "upload to host {host_key} failed after {:?} {e}",
+                        now.elapsed()
+                    );
+                    let _ = hosts.retry(host_key);
+                })?
+            }
+            _ = sleep(write_timeout) => {
+                debug!(
+                    "upload to host {host_key} timed out after {:?}",
+                    now.elapsed()
+                );
+                let _ = hosts.retry(host_key);
+                return Err(UploadError::Rhp4(crate::rhp4::Error::Transport(
+                    format!("write_sector to {host_key} timed out after {write_timeout:?}")
+                )));
+            }
+        };
         Ok(Sector { root, host_key })
     }
 
     fn upload_timeout(attempts: usize) -> Duration {
-        Duration::from_secs((15 + (attempts as u64 * 2)).max(120))
+        Duration::from_secs((15 + (attempts as u64 * 2)).min(120))
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -268,7 +291,7 @@ impl Uploader {
         let (host_key, attempts) = initial_host;
         let mut write_timeout = Self::upload_timeout(attempts); // mutable so that it can be adjusted on retries
         let mut tasks = JoinSet::new();
-        tasks.spawn(Self::upload_shard(
+        join_set_spawn!(tasks, Self::upload_shard(
             transport.clone(),
             hosts.clone(),
             host_key,
@@ -295,7 +318,7 @@ impl Uploader {
                             if tasks.is_empty() {
                                 let (host_key, attempts) = hosts.pop_front()?;
                                 write_timeout = Self::upload_timeout(attempts);
-                                tasks.spawn(Self::upload_shard(transport.clone(), hosts.clone(), host_key, account_key.clone(), data.clone(), write_timeout));
+                                join_set_spawn!(tasks, Self::upload_shard(transport.clone(), hosts.clone(), host_key, account_key.clone(), data.clone(), write_timeout));
                             }
                         }
                     }
@@ -306,7 +329,7 @@ impl Uploader {
                         let transport = transport.clone();
                         let data = data.clone();
                         let account_key = account_key.clone();
-                        tasks.spawn(async move {
+                        join_set_spawn!(tasks, async move {
                             let _racer = racer; // hold the permit until the task completes
                             debug!("slab {slab_index} shard {shard_index} racing slow host");
                             let (host_key, attempts) = hosts.pop_front()?;
@@ -363,12 +386,15 @@ impl Uploader {
         let mut slab_upload_tasks = JoinSet::new();
         let rs = Arc::new(ErasureCoder::new(data_shards, parity_shards).unwrap());
         let mut slab_index: usize = 0;
+        debug!("upload_slabs: starting upload ({data_shards} data + {parity_shards} parity shards, max_inflight={})", options.max_inflight);
         loop {
             let slab_permit = slab_sema.clone().acquire_owned().await?;
             let mut shards = vec![vec![0u8; SECTOR_SIZE]; total_shards];
+            let read_start = Instant::now();
             let length =
                 ErasureCoder::read_slab_shards(&mut r, options.data_shards as usize, &mut shards)
                     .await?;
+            debug!("slab {slab_index}: read_slab_shards took {:?} ({length} bytes)", read_start.elapsed());
             if length == 0 {
                 break; // EoF
             }
@@ -380,7 +406,7 @@ impl Uploader {
             let rs = rs.clone();
             let shard_sema = shard_sema.clone();
 
-            slab_upload_tasks.spawn(async move {
+            join_set_spawn!(slab_upload_tasks, async move {
                 let _slab_guard = slab_permit;
 
                 // note: it may seem like a good idea to start uploading the data shards
@@ -390,11 +416,19 @@ impl Uploader {
                 //
                 // It could probably be resolved by using a pool, but leaving that as a
                 // future optimization for now.
+                let encode_start = Instant::now();
+                #[cfg(not(target_arch = "wasm32"))]
                 let shards = spawn_blocking(move || -> erasure_coding::Result<Vec<Vec<u8>>> {
                     rs.encode_shards(&mut shards)?;
                     Ok(shards)
                 })
                 .await??;
+                #[cfg(target_arch = "wasm32")]
+                let shards = {
+                    rs.encode_shards(&mut shards)?;
+                    shards
+                };
+                debug!("slab {slab_index}: erasure encode took {:?}", encode_start.elapsed());
 
                 // generate a unique encryption key for the slab
                 let slab_key: EncryptionKey = rand::random::<[u8; 32]>().into();
@@ -414,12 +448,20 @@ impl Uploader {
                     let progress_tx = progress_tx.clone();
                     let initial_host = reserved_hosts[shard_index];
                     // spawn a task to encrypt and upload each shard for this slab.
-                    shard_upload_tasks.spawn(async move {
+                    join_set_spawn!(shard_upload_tasks, async move {
+                        let encrypt_start = Instant::now();
+                        #[cfg(not(target_arch = "wasm32"))]
                         let shard = spawn_blocking(move || {
                             encrypt_shard(&owned_slab_key, shard_index as u8, 0, &mut shard);
                             shard
                         })
                         .await?;
+                        #[cfg(target_arch = "wasm32")]
+                        let shard = {
+                            encrypt_shard(&owned_slab_key, shard_index as u8, 0, &mut shard);
+                            shard
+                        };
+                        debug!("slab {slab_index} shard {shard_index}: encrypt took {:?}", encrypt_start.elapsed());
                         Self::upload_slab_shard(
                             permit,
                             transport,
@@ -529,10 +571,18 @@ impl Uploader {
             length: 0,
             writer,
             objects: Vec::new(),
-            upload_handle: AbortOnDropHandle::new(tokio::spawn(async move {
-                let slabs = Self::upload_slabs(transport, hosts, app_key, reader, options).await?;
-                Ok(slabs)
-            })),
+            upload_handle: AbortOnDropHandle::new({
+                #[cfg(not(target_arch = "wasm32"))]
+                { tokio::spawn(async move {
+                    let slabs = Self::upload_slabs(transport, hosts, app_key, reader, options).await?;
+                    Ok(slabs)
+                }) }
+                #[cfg(target_arch = "wasm32")]
+                { tokio::task::spawn_local(async move {
+                    let slabs = Self::upload_slabs(transport, hosts, app_key, reader, options).await?;
+                    Ok(slabs)
+                }) }
+            }),
         }
     }
 }
