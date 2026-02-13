@@ -56,6 +56,7 @@ pub enum UploadError {
     #[error("invalid range: {0}-{1}")]
     OutOfRange(usize, usize),
 
+    #[cfg(not(target_arch = "wasm32"))]
     #[error("timeout error: {0}")]
     Timeout(#[from] Elapsed),
 
