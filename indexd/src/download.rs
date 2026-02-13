@@ -14,6 +14,8 @@ use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 use tokio::task::{JoinSet, spawn_blocking};
 use tokio::time::error::Elapsed;
 use tokio::time::sleep;
+#[cfg(target_arch = "wasm32")]
+use crate::wasm_time::sleep;
 
 use crate::rhp4::RHP4Client;
 use crate::{Hosts, Object, Sector};
