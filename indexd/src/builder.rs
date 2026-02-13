@@ -10,9 +10,19 @@ use sia::types::Hash256;
 use thiserror::Error;
 use url::Url;
 
-use crate::app_client::{self, AppClient, Client, RegisterAppRequest};
+use crate::app_client::{self, AppClient, Client, RegisterAppRequest, RegisterAppResponse};
 use crate::object_encryption::derive;
-use crate::{SDK, quic};
+use crate::SDK;
+
+#[cfg(not(target_arch = "wasm32"))]
+use crate::quic;
+
+#[cfg(not(target_arch = "wasm32"))]
+use tokio::time::sleep;
+
+#[cfg(target_arch = "wasm32")]
+use crate::wasm_time::sleep;
+
 
 /// The initial state of the SDK builder, before connecting to the indexd service.
 pub struct DisconnectedState;
@@ -48,6 +58,7 @@ pub enum BuilderError {
     #[error("client error: {0}")]
     Client(#[from] app_client::Error),
 
+    #[cfg(not(target_arch = "wasm32"))]
     #[error("quic error: {0}")]
     QUIC(#[from] quic::ConnectError),
 
