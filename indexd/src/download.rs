@@ -11,8 +11,12 @@ use sia::signing::PrivateKey;
 use thiserror::Error;
 use tokio::io::AsyncWriteExt;
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
-use tokio::task::{JoinSet, spawn_blocking};
+use tokio::task::JoinSet;
+#[cfg(not(target_arch = "wasm32"))]
+use tokio::task::spawn_blocking;
+#[cfg(not(target_arch = "wasm32"))]
 use tokio::time::error::Elapsed;
+#[cfg(not(target_arch = "wasm32"))]
 use tokio::time::sleep;
 #[cfg(target_arch = "wasm32")]
 use crate::wasm_time::sleep;
