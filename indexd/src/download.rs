@@ -195,10 +195,16 @@ impl Downloader {
                     match res? { // safe because tasks are never cancelled
                         Ok((index, mut data)) => {
                             let encryption_key = encryption_key.clone();
+                            #[cfg(not(target_arch = "wasm32"))]
                             let data = spawn_blocking(move || {
                                 encrypt_shard(&encryption_key, index as u8, offset as usize, &mut data);
                                 data
                             }).await?;
+                            #[cfg(target_arch = "wasm32")]
+                            let data = {
+                                encrypt_shard(&encryption_key, index as u8, offset as usize, &mut data);
+                                data
+                            };
                             shards[index] = Some(data);
                             successful += 1;
                             if successful >= min_shards {
