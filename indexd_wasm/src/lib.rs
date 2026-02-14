@@ -373,7 +373,14 @@ impl SDK {
             .inner
             .share_object(&obj, valid_until.into())
             .map_err(to_js_err)?;
-        Ok(url.to_string())
+        // sia:// URLs can open the mobile app when clicked
+        // FIXME Alright - could leave this for the app to implement
+        let url_str = url.to_string();
+        Ok(if let Some(rest) = url_str.strip_prefix("https://") {
+            format!("sia://{rest}")
+        } else {
+            url_str
+        })
     }
 
     /// Retrieves a shared object from a signed share URL.
