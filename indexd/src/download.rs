@@ -10,7 +10,7 @@ use sia::rhp::SEGMENT_SIZE;
 use sia::signing::PrivateKey;
 use thiserror::Error;
 use tokio::io::AsyncWriteExt;
-use tokio::sync::{OwnedSemaphorePermit, Semaphore};
+use tokio::sync::{OwnedSemaphorePermit, Semaphore, mpsc};
 use tokio::task::JoinSet;
 #[cfg(not(target_arch = "wasm32"))]
 use tokio::task::spawn_blocking;
@@ -74,6 +74,10 @@ pub struct DownloadOptions {
     pub max_inflight: usize,
     pub offset: u64,
     pub length: Option<u64>,
+
+    /// Optional channel to notify when each slab is downloaded.
+    /// This can be used to implement progress reporting.
+    pub slab_downloaded: Option<mpsc::UnboundedSender<()>>,
 }
 
 impl Default for DownloadOptions {
@@ -82,6 +86,7 @@ impl Default for DownloadOptions {
             max_inflight: 20,
             offset: 0,
             length: None,
+            slab_downloaded: None,
         }
     }
 }
@@ -325,6 +330,9 @@ impl Downloader {
             )
             .await?;
             length -= slab_length;
+            if let Some(ref tx) = options.slab_downloaded {
+                let _ = tx.send(());
+            }
         }
         w.flush().await?;
         Ok(())
