@@ -193,6 +193,104 @@ impl SDK {
         Ok(Uint8Array::from(buf.as_slice()))
     }
 
+    /// Uploads a Uint8Array with per-shard progress reporting.
+    ///
+    /// The `on_progress` callback receives `(current_shards, total_shards)`.
+    #[wasm_bindgen(js_name = "uploadWithProgress")]
+    pub async fn upload_with_progress(
+        &self,
+        data: &[u8],
+        on_progress: &js_sys::Function,
+    ) -> Result<PinnedObject, JsError> {
+        log::info!("upload_with_progress: starting ({} bytes)", data.len());
+        let slab_data_size = 10usize * 4_194_304; // data_shards(10) * SECTOR_SIZE(4 MiB)
+        let num_slabs = if data.is_empty() { 0 } else { data.len().div_ceil(slab_data_size) };
+        let total_shards = (num_slabs as u32) * 30; // 30 shards per slab (10 data + 20 parity)
+
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let options = indexd::UploadOptions {
+            shard_uploaded: Some(tx),
+            ..Default::default()
+        };
+
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .map_err(to_js_err)?;
+        let _guard = rt.enter();
+        let local = tokio::task::LocalSet::new();
+        let cursor = Cursor::new(data.to_vec());
+        let on_progress = on_progress.clone();
+        let object: indexd::Object = local
+            .run_until(async {
+                tokio::task::spawn_local(async move {
+                    let mut count: u32 = 0;
+                    while rx.recv().await.is_some() {
+                        count += 1;
+                        let _ = on_progress.call2(
+                            &JsValue::NULL,
+                            &JsValue::from(count),
+                            &JsValue::from(total_shards),
+                        );
+                    }
+                });
+                self.inner.upload(cursor, options).await
+            })
+            .await
+            .map_err(to_js_err)?;
+        log::info!("upload_with_progress: complete");
+        Ok(PinnedObject {
+            inner: Arc::new(Mutex::new(object)),
+        })
+    }
+
+    /// Downloads an object's data with per-slab progress reporting.
+    ///
+    /// The `on_progress` callback receives `(current_slabs, total_slabs)`.
+    #[wasm_bindgen(js_name = "downloadWithProgress")]
+    pub async fn download_with_progress(
+        &self,
+        object: &PinnedObject,
+        on_progress: &js_sys::Function,
+    ) -> Result<Uint8Array, JsError> {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .map_err(to_js_err)?;
+        let _guard = rt.enter();
+        let local = tokio::task::LocalSet::new();
+        let obj = object.inner.lock().map_err(to_js_err)?.clone();
+        let size = obj.size() as usize;
+        let total_slabs = obj.slabs().len() as u32;
+        let mut buf = vec![0u8; size];
+
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let options = indexd::DownloadOptions {
+            slab_downloaded: Some(tx),
+            ..Default::default()
+        };
+
+        let on_progress = on_progress.clone();
+        local
+            .run_until(async {
+                tokio::task::spawn_local(async move {
+                    let mut count: u32 = 0;
+                    while rx.recv().await.is_some() {
+                        count += 1;
+                        let _ = on_progress.call2(
+                            &JsValue::NULL,
+                            &JsValue::from(count),
+                            &JsValue::from(total_slabs),
+                        );
+                    }
+                });
+                self.inner
+                    .download(&mut Cursor::new(&mut buf), &obj, options)
+                    .await
+            })
+            .await
+            .map_err(to_js_err)?;
+        Ok(Uint8Array::from(buf.as_slice()))
+    }
+
     /// Returns hosts as a JSON array.
     pub async fn hosts(&self) -> Result<JsValue, JsError> {
         let hosts = self
