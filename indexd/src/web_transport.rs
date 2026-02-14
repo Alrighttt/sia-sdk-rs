@@ -49,9 +49,6 @@ struct Stream {
     read_buf: Vec<u8>,
 }
 
-// SAFETY: WASM is single-threaded; Send/Sync are no-ops.
-unsafe impl Send for Stream {}
-unsafe impl Sync for Stream {}
 
 impl Stream {
     /// Read exactly `buf.len()` bytes from the stream, buffering as needed.
