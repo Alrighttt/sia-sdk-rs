@@ -83,6 +83,9 @@ pub struct DownloadOptions {
 impl Default for DownloadOptions {
     fn default() -> Self {
         Self {
+            #[cfg(target_arch = "wasm32")]
+            max_inflight: 2, // Browsers can't handle many concurrent WebTransport connections (no connection pooling)
+            #[cfg(not(target_arch = "wasm32"))]
             max_inflight: 20,
             offset: 0,
             length: None,
@@ -96,6 +99,8 @@ pub(crate) struct Downloader {
     account_key: Arc<PrivateKey>,
     hosts: Hosts,
     transport: Arc<dyn RHP4Client>,
+    #[cfg(target_arch = "wasm32")]
+    default_max_inflight: usize,
 }
 
 struct SectorDownloadTask {
@@ -127,11 +132,36 @@ impl Downloader {
         Ok((task.index, data.to_vec()))
     }
 
+    #[cfg(not(target_arch = "wasm32"))]
     pub fn new(hosts: Hosts, transport: Arc<dyn RHP4Client>, account_key: Arc<PrivateKey>) -> Self {
         Self {
             account_key,
             hosts,
             transport,
+        }
+    }
+
+    #[cfg(target_arch = "wasm32")]
+    pub fn new(
+        hosts: Hosts,
+        transport: Arc<dyn RHP4Client>,
+        account_key: Arc<PrivateKey>,
+        default_max_inflight: usize,
+    ) -> Self {
+        Self {
+            account_key,
+            hosts,
+            transport,
+            default_max_inflight,
+        }
+    }
+
+    /// Returns default download options with the configured max_inflight.
+    #[cfg(target_arch = "wasm32")]
+    pub fn default_options(&self) -> DownloadOptions {
+        DownloadOptions {
+            max_inflight: self.default_max_inflight,
+            ..Default::default()
         }
     }
 
@@ -193,6 +223,9 @@ impl Downloader {
 
         let mut successful: u8 = 0;
         let mut shards = vec![None; total_shards];
+        let mut total_failures: usize = 0;
+        const MAX_TOTAL_FAILURES: usize = 30; // Give up after 30 failed attempts total
+
         loop {
             tokio::select! {
                 biased;
@@ -217,7 +250,13 @@ impl Downloader {
                             }
                         }
                         Err(e) => {
-                            debug!("sector download failed {:?}", e);
+                            total_failures += 1;
+                            debug!("sector download failed ({total_failures}/{MAX_TOTAL_FAILURES}): {:?}", e);
+
+                            if total_failures >= MAX_TOTAL_FAILURES {
+                                return Err(DownloadError::NotEnoughShards(successful, min_shards));
+                            }
+
                             let rem = min_shards.saturating_sub(successful);
                             if rem == 0 {
                                 return Ok(shards); // sanity check

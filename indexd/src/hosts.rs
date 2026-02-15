@@ -335,6 +335,9 @@ pub enum QueueError {
     MutexError,
 }
 
+/// Maximum number of times to retry a host before giving up
+const MAX_HOST_RETRIES: usize = 3;
+
 #[derive(Debug)]
 struct HostQueueInner {
     hosts: VecDeque<PublicKey>,
@@ -381,12 +384,17 @@ impl HostQueue {
 
     pub fn retry(&self, host: PublicKey) -> Result<(), QueueError> {
         let mut inner = self.inner.lock().map_err(|_| QueueError::MutexError)?;
-        inner.hosts.push_back(host);
-        inner
-            .attempts
-            .entry(host)
-            .and_modify(|e| *e += 1)
-            .or_insert(1);
+        let attempts = inner.attempts.get(&host).cloned().unwrap_or(0);
+
+        // Only retry if we haven't exceeded the maximum retry limit
+        if attempts < MAX_HOST_RETRIES {
+            inner.hosts.push_back(host);
+            inner
+                .attempts
+                .entry(host)
+                .and_modify(|e| *e += 1)
+                .or_insert(1);
+        }
         Ok(())
     }
 }

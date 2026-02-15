@@ -1,8 +1,9 @@
 use std::collections::HashMap;
 use std::future::Future;
 use std::pin::Pin;
-use std::sync::RwLock;
+use std::sync::{Arc, RwLock};
 use std::task::{Context, Poll};
+use tokio::sync::Semaphore;
 
 use bytes::Bytes;
 use chrono::Utc;
@@ -223,11 +224,13 @@ pub struct Client {
 }
 
 impl Client {
-    pub fn new(hosts: Hosts) -> Client {
+    pub fn new(hosts: Hosts, max_price_fetches: usize) -> Client {
         Client {
             hosts,
             cached_prices: std::sync::Arc::new(RwLock::new(HashMap::new())),
             cached_tokens: std::sync::Arc::new(RwLock::new(HashMap::new())),
+            // Limit concurrent price fetches to prevent browser connection overload
+            price_fetch_semaphore: std::sync::Arc::new(Semaphore::new(max_price_fetches)),
         }
     }
 
@@ -311,6 +314,18 @@ impl RHP4Client for Client {
             if !refresh {
                 if let Some(prices) = self.get_cached_prices(&host_key) {
                     debug!("host_prices: using cached prices for {host_key}");
+                    return Ok(prices);
+                }
+            }
+
+            // Acquire semaphore permit to limit concurrent price fetches
+            let _permit = self.price_fetch_semaphore.acquire().await
+                .map_err(|e| Error::Transport(format!("semaphore error: {}", e)))?;
+
+            // Check cache again in case another task fetched while we were waiting
+            if !refresh {
+                if let Some(prices) = self.get_cached_prices(&host_key) {
+                    debug!("host_prices: using cached prices for {host_key} (fetched by other task)");
                     return Ok(prices);
                 }
             }

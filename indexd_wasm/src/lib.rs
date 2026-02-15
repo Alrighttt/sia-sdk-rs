@@ -1,8 +1,11 @@
 use std::io::Cursor;
+use std::pin::Pin;
 use std::sync::{Arc, Mutex};
+use std::task::{Context, Poll};
 
 use indexd::app_client::{RegisterAppRequest, RegisterAppResponse};
 use js_sys::Uint8Array;
+use tokio::io::AsyncWrite;
 use sia::seed::Seed;
 use sia::signing::{PrivateKey, Signature};
 use sia::types::Hash256;
@@ -16,7 +19,8 @@ use wasm_bindgen::prelude::*;
 #[wasm_bindgen(start)]
 fn init_panic_hook() {
     console_error_panic_hook::set_once();
-    console_log::init_with_level(log::Level::Debug).ok();
+    console_log::init_with_level(log::Level::Trace).ok();
+    log::info!("indexd WASM initialized - logging at TRACE level");
 }
 
 /// Converts a JsValue error context into a JsError.
@@ -210,7 +214,7 @@ impl SDK {
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
         let options = indexd::UploadOptions {
             shard_uploaded: Some(tx),
-            ..Default::default()
+            ..self.inner.default_upload_options()
         };
 
         let rt = tokio::runtime::Builder::new_current_thread()
@@ -265,7 +269,7 @@ impl SDK {
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
         let options = indexd::DownloadOptions {
             slab_downloaded: Some(tx),
-            ..Default::default()
+            ..self.inner.default_download_options()
         };
 
         let on_progress = on_progress.clone();
@@ -289,6 +293,85 @@ impl SDK {
             .await
             .map_err(to_js_err)?;
         Ok(Uint8Array::from(buf.as_slice()))
+    }
+
+    /// Downloads an object with streaming chunks.
+    /// Fires `on_chunk(bytes)` after each slab is decoded and `on_progress(current, total)` for progress.
+    #[wasm_bindgen(js_name = "downloadStreaming")]
+    pub async fn download_streaming(
+        &self,
+        object: &PinnedObject,
+        on_chunk: &js_sys::Function,
+        on_progress: &js_sys::Function,
+    ) -> Result<(), JsError> {
+        /// Custom AsyncWrite that calls JS callback with each chunk
+        struct ChunkWriter {
+            callback: js_sys::Function,
+        }
+
+        impl AsyncWrite for ChunkWriter {
+            fn poll_write(
+                self: Pin<&mut Self>,
+                _cx: &mut Context<'_>,
+                buf: &[u8],
+            ) -> Poll<Result<usize, std::io::Error>> {
+                let array = Uint8Array::from(buf);
+                let _ = self.callback.call1(&JsValue::NULL, &array);
+                Poll::Ready(Ok(buf.len()))
+            }
+
+            fn poll_flush(
+                self: Pin<&mut Self>,
+                _cx: &mut Context<'_>,
+            ) -> Poll<Result<(), std::io::Error>> {
+                Poll::Ready(Ok(()))
+            }
+
+            fn poll_shutdown(
+                self: Pin<&mut Self>,
+                _cx: &mut Context<'_>,
+            ) -> Poll<Result<(), std::io::Error>> {
+                Poll::Ready(Ok(()))
+            }
+        }
+
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .map_err(to_js_err)?;
+        let _guard = rt.enter();
+        let local = tokio::task::LocalSet::new();
+        let obj = object.inner.lock().map_err(to_js_err)?.clone();
+        let total_slabs = obj.slabs().len() as u32;
+
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let options = indexd::DownloadOptions {
+            slab_downloaded: Some(tx),
+            ..self.inner.default_download_options()
+        };
+
+        let mut writer = ChunkWriter {
+            callback: on_chunk.clone(),
+        };
+
+        let on_progress = on_progress.clone();
+        local
+            .run_until(async {
+                tokio::task::spawn_local(async move {
+                    let mut count: u32 = 0;
+                    while rx.recv().await.is_some() {
+                        count += 1;
+                        let _ = on_progress.call2(
+                            &JsValue::NULL,
+                            &JsValue::from(count),
+                            &JsValue::from(total_slabs),
+                        );
+                    }
+                });
+                self.inner.download(&mut writer, &obj, options).await
+            })
+            .await
+            .map_err(to_js_err)?;
+        Ok(())
     }
 
     /// Returns hosts as a JSON array.
@@ -426,6 +509,48 @@ impl Builder {
         Ok(Builder {
             state: Arc::new(Mutex::new(Some(BuilderState::Disconnected(builder)))),
         })
+    }
+
+    /// Sets the maximum number of concurrent price fetches (default: 1).
+    /// Lower values = more stable, higher values = faster but may crash browser.
+    #[wasm_bindgen(js_name = "withMaxPriceFetches")]
+    pub fn with_max_price_fetches(&self, max: usize) -> Result<(), JsError> {
+        let mut state = self.state.lock().map_err(to_js_err)?;
+        if let Some(BuilderState::Disconnected(builder)) = state.take() {
+            let builder = builder.with_max_price_fetches(max);
+            *state = Some(BuilderState::Disconnected(builder));
+            Ok(())
+        } else {
+            Err(JsError::new("Can only set concurrency on disconnected builder"))
+        }
+    }
+
+    /// Sets the maximum number of concurrent downloads (default: 2).
+    /// Lower values = more stable, higher values = faster but may crash browser.
+    #[wasm_bindgen(js_name = "withMaxDownloads")]
+    pub fn with_max_downloads(&self, max: usize) -> Result<(), JsError> {
+        let mut state = self.state.lock().map_err(to_js_err)?;
+        if let Some(BuilderState::Disconnected(builder)) = state.take() {
+            let builder = builder.with_max_downloads(max);
+            *state = Some(BuilderState::Disconnected(builder));
+            Ok(())
+        } else {
+            Err(JsError::new("Can only set concurrency on disconnected builder"))
+        }
+    }
+
+    /// Sets the maximum number of concurrent uploads (default: 3).
+    /// Lower values = more stable, higher values = faster but may crash browser.
+    #[wasm_bindgen(js_name = "withMaxUploads")]
+    pub fn with_max_uploads(&self, max: usize) -> Result<(), JsError> {
+        let mut state = self.state.lock().map_err(to_js_err)?;
+        if let Some(BuilderState::Disconnected(builder)) = state.take() {
+            let builder = builder.with_max_uploads(max);
+            *state = Some(BuilderState::Disconnected(builder));
+            Ok(())
+        } else {
+            Err(JsError::new("Can only set concurrency on disconnected builder"))
+        }
     }
 
     /// Attempts to connect using an existing app key.

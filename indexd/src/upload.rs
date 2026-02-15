@@ -94,6 +94,9 @@ impl Default for UploadOptions {
         Self {
             data_shards: 10,
             parity_shards: 20,
+            #[cfg(target_arch = "wasm32")]
+            max_inflight: 3, // Browsers can't handle many concurrent WebTransport connections
+            #[cfg(not(target_arch = "wasm32"))]
             max_inflight: 16,
             shard_uploaded: None,
         }
@@ -207,14 +210,41 @@ pub(crate) struct Uploader {
     app_key: Arc<PrivateKey>,
     hosts: Hosts,
     transport: Arc<dyn RHP4Client>,
+    #[cfg(target_arch = "wasm32")]
+    default_max_inflight: usize,
 }
 
 impl Uploader {
+    #[cfg(not(target_arch = "wasm32"))]
     pub fn new(hosts: Hosts, transport: Arc<dyn RHP4Client>, app_key: Arc<PrivateKey>) -> Self {
         Uploader {
             app_key,
             hosts,
             transport,
+        }
+    }
+
+    #[cfg(target_arch = "wasm32")]
+    pub fn new(
+        hosts: Hosts,
+        transport: Arc<dyn RHP4Client>,
+        app_key: Arc<PrivateKey>,
+        default_max_inflight: usize,
+    ) -> Self {
+        Uploader {
+            app_key,
+            hosts,
+            transport,
+            default_max_inflight,
+        }
+    }
+
+    /// Returns default upload options with the configured max_inflight.
+    #[cfg(target_arch = "wasm32")]
+    pub fn default_options(&self) -> UploadOptions {
+        UploadOptions {
+            max_inflight: self.default_max_inflight,
+            ..Default::default()
         }
     }
 
@@ -300,6 +330,9 @@ impl Uploader {
             write_timeout,
         ));
         let semaphore = permit.semaphore();
+        let mut total_failures: usize = 0;
+        const MAX_TOTAL_FAILURES: usize = 30; // Give up after 30 failed attempts total
+
         loop {
             let active = tasks.len();
             let hosts = hosts.clone();
@@ -314,7 +347,15 @@ impl Uploader {
                             return Ok((shard_index, sector));
                         }
                         Err(e) => {
-                            debug!("slab {slab_index} shard {shard_index} upload failed {e:?}");
+                            total_failures += 1;
+                            debug!("slab {slab_index} shard {shard_index} upload failed ({total_failures}/{MAX_TOTAL_FAILURES}): {e:?}");
+
+                            if total_failures >= MAX_TOTAL_FAILURES {
+                                return Err(UploadError::Rhp4(crate::rhp4::Error::Transport(
+                                    format!("failed to upload shard after {MAX_TOTAL_FAILURES} attempts")
+                                )));
+                            }
+
                             if tasks.is_empty() {
                                 let (host_key, attempts) = hosts.pop_front()?;
                                 write_timeout = Self::upload_timeout(attempts);
