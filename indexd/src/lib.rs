@@ -42,6 +42,9 @@ pub mod web_transport;
 #[cfg(target_arch = "wasm32")]
 pub(crate) mod wasm_time;
 
+#[cfg(target_arch = "wasm32")]
+pub mod js_chunked_reader;
+
 mod builder;
 pub use builder::*;
 

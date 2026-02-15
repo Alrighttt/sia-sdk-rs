@@ -217,7 +217,12 @@ impl Downloader {
                         task,
                     ));
                 }
-                None => panic!("not enough sectors to satisfy min_shards"), // should be unreachable
+                None => {
+                    return Err(DownloadError::InvalidSlab(format!(
+                        "not enough sectors to satisfy min_shards: have {}, need {}",
+                        total_shards, min_shards
+                    )));
+                }
             };
         }
 
@@ -227,6 +232,35 @@ impl Downloader {
         const MAX_TOTAL_FAILURES: usize = 30; // Give up after 30 failed attempts total
 
         loop {
+            // If no tasks are in-flight and we still need more shards, give up.
+            // This prevents an infinite loop when all tasks have completed but
+            // min_shards was not reached.
+            if download_tasks.is_empty() {
+                let rem = min_shards.saturating_sub(successful);
+                if rem == 0 {
+                    return Ok(shards);
+                }
+                if sectors.is_empty() {
+                    return Err(DownloadError::NotEnoughShards(successful, min_shards));
+                }
+                // Still have sectors to try — spawn them
+                while download_tasks.len() < rem as usize {
+                    if let Some(task) = sectors.pop_front() {
+                        let permit = semaphore.clone().acquire_owned().await?;
+                        let transport = self.transport.clone();
+                        let account_key = self.account_key.clone();
+                        join_set_spawn!(download_tasks, Self::try_download_sector(
+                            permit,
+                            transport,
+                            account_key,
+                            task,
+                        ));
+                    } else {
+                        break;
+                    }
+                }
+            }
+
             tokio::select! {
                 biased;
                 Some(res) = download_tasks.join_next() => {

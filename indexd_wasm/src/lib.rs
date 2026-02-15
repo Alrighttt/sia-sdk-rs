@@ -1,6 +1,7 @@
+use std::collections::HashMap;
 use std::io::Cursor;
 use std::pin::Pin;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::task::{Context, Poll};
 
 use indexd::app_client::{RegisterAppRequest, RegisterAppResponse};
@@ -12,6 +13,22 @@ use sia::types::Hash256;
 use std::str::FromStr;
 use std::time::SystemTime;
 use wasm_bindgen::prelude::*;
+
+/// Global storage for chunked upload buffers
+/// Key: session_id (usize), Value: (pre-allocated buffer, current offset)
+static CHUNK_BUFFERS: OnceLock<Mutex<HashMap<usize, (Vec<u8>, usize)>>> = OnceLock::new();
+
+fn get_chunk_buffers() -> &'static Mutex<HashMap<usize, (Vec<u8>, usize)>> {
+    CHUNK_BUFFERS.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+/// Global storage for streaming readers
+/// Key: reader_id (usize), Value: Arc<Mutex<ReaderState>>
+static STREAMING_READERS: OnceLock<Mutex<HashMap<usize, Arc<Mutex<indexd::js_chunked_reader::ReaderState>>>>> = OnceLock::new();
+
+fn get_streaming_readers() -> &'static Mutex<HashMap<usize, Arc<Mutex<indexd::js_chunked_reader::ReaderState>>>> {
+    STREAMING_READERS.get_or_init(|| Mutex::new(HashMap::new()))
+}
 
 /// Install a panic hook and logging bridge so that Rust panics show a proper
 /// stack trace and `log::debug!()` / `log::info!()` etc. appear in the browser
@@ -26,6 +43,105 @@ fn init_panic_hook() {
 /// Converts a JsValue error context into a JsError.
 fn to_js_err(e: impl std::fmt::Display) -> JsError {
     JsError::new(&e.to_string())
+}
+
+// ── StreamingUpload ─────────────────────────────────────────────────────
+
+/// Handle for a streaming upload operation.
+/// JavaScript should call `pushChunk(data)` for each chunk, then `pushChunk(null)` to signal EOF.
+/// The `promise` resolves to a PinnedObject when the upload completes.
+#[wasm_bindgen]
+pub struct StreamingUpload {
+    reader_id: usize,
+
+    #[wasm_bindgen(skip)]
+    pub promise: js_sys::Promise,
+}
+
+#[wasm_bindgen]
+impl StreamingUpload {
+    /// Pushes a chunk of data to the upload.
+    /// Pass data as Uint8Array. Call with `null` or `undefined` to signal EOF.
+    ///
+    /// **Backpressure**: This method applies backpressure to prevent memory exhaustion.
+    /// It returns a Promise that resolves when the chunk has been queued.
+    /// If the queue is full, it waits until space becomes available.
+    ///
+    /// **IMPORTANT**: JavaScript MUST await this Promise before pushing the next chunk:
+    /// ```javascript
+    /// await upload.pushChunk(data);  // ← await here!
+    /// ```
+    #[wasm_bindgen(js_name = "pushChunk")]
+    pub fn push_chunk(&self, chunk: Option<Vec<u8>>) -> js_sys::Promise {
+        let reader_id = self.reader_id;
+
+        wasm_bindgen_futures::future_to_promise(async move {
+            let readers = get_streaming_readers().lock().map_err(to_js_err)?;
+            let state = readers
+                .get(&reader_id)
+                .ok_or_else(|| JsError::new("Invalid reader ID or upload already finalized"))?
+                .clone();
+            drop(readers); // Release the global lock
+
+            match chunk {
+                Some(data) => {
+                    // Wait for space if queue is full (backpressure)
+                    loop {
+                        {
+                            let mut reader_state = state.lock().map_err(to_js_err)?;
+
+                            // Maximum 3 chunks queued = ~384 MB overhead (3 × 128 MB)
+                            if reader_state.chunks.len() < 3 {
+                                // Space available, push the chunk
+                                reader_state.chunks.push_back(data);
+
+                                // Wake the reader if it's waiting
+                                if let Some(waker) = reader_state.waker.take() {
+                                    waker.wake();
+                                }
+                                break;
+                            }
+                            // Queue is full, release lock and wait
+                        }
+
+                        // Wait 50ms for space to become available
+                        let promise = js_sys::Promise::new(&mut |resolve, _reject| {
+                            let window = web_sys::window().expect("no window");
+                            let _ = window.set_timeout_with_callback_and_timeout_and_arguments_0(
+                                &resolve,
+                                50,
+                            );
+                        });
+                        let _ = wasm_bindgen_futures::JsFuture::from(promise).await;
+                    }
+                }
+                None => {
+                    // Signal EOF - no backpressure needed
+                    let mut reader_state = state.lock().map_err(to_js_err)?;
+                    reader_state.eof = true;
+
+                    // Wake the reader if it's waiting
+                    if let Some(waker) = reader_state.waker.take() {
+                        waker.wake();
+                    }
+                }
+            }
+
+            Ok(JsValue::UNDEFINED)
+        })
+    }
+
+    /// Returns the reader ID for this upload session (mainly for debugging)
+    #[wasm_bindgen(js_name = "getReaderId", getter)]
+    pub fn reader_id(&self) -> f64 {
+        self.reader_id as f64
+    }
+
+    /// Returns the promise that resolves when the upload completes
+    #[wasm_bindgen(getter)]
+    pub fn promise(&self) -> js_sys::Promise {
+        self.promise.clone()
+    }
 }
 
 // ── AppKey ──────────────────────────────────────────────────────────────
@@ -349,9 +465,13 @@ impl SDK {
             ..self.inner.default_download_options()
         };
 
-        let mut writer = ChunkWriter {
-            callback: on_chunk.clone(),
-        };
+        // Buffer writes to avoid crossing the WASM→JS boundary for every
+        // 64-byte segment.  Without this, a 40 MB slab generates ~625 000
+        // individual JS calls and Promises, which crashes the browser.
+        let mut writer = tokio::io::BufWriter::with_capacity(
+            4 * 1024 * 1024, // 4 MiB — flushes ~10 times per slab
+            ChunkWriter { callback: on_chunk.clone() },
+        );
 
         let on_progress = on_progress.clone();
         local
@@ -372,6 +492,238 @@ impl SDK {
             .await
             .map_err(to_js_err)?;
         Ok(())
+    }
+
+    /// Starts a new chunked upload session with the total file size.
+    /// Returns a session ID (as a number) to track this upload.
+    ///
+    /// Note: Due to WASM 32-bit limitations, maximum file size is approximately 1.5 GB.
+    #[wasm_bindgen(js_name = "startChunkedUpload")]
+    pub fn start_chunked_upload(&self, total_size: f64) -> Result<f64, JsError> {
+        let session_id = self as *const _ as usize as f64;
+        let size = total_size as usize;
+
+        // WASM has a 32-bit address space, so we can't allocate more than ~2GB
+        // Set a conservative limit of 1.5GB to avoid capacity overflow
+        const MAX_SIZE: usize = 1536 * 1024 * 1024; // 1.5 GB
+        if size > MAX_SIZE {
+            return Err(JsError::new(&format!(
+                "File too large ({:.2} GB). Maximum upload size is 1.5 GB due to WASM memory limitations.",
+                size as f64 / (1024.0 * 1024.0 * 1024.0)
+            )));
+        }
+
+        let mut buffers = get_chunk_buffers().lock().map_err(to_js_err)?;
+
+        // Pre-allocate the buffer with the exact size needed
+        let mut buffer = Vec::with_capacity(size);
+        // SAFETY: We're creating uninitialized memory, but we'll fill it chunk by chunk
+        // This is safe because we track the offset and only read initialized portions
+        unsafe {
+            buffer.set_len(size);
+        }
+
+        buffers.insert(session_id as usize, (buffer, 0)); // (buffer, current_offset)
+
+        log::info!("startChunkedUpload: session {} initialized with {} bytes", session_id, size);
+        Ok(session_id)
+    }
+
+    /// Adds a chunk to an existing upload session.
+    /// Returns the current offset after adding this chunk.
+    #[wasm_bindgen(js_name = "uploadChunk")]
+    pub fn upload_chunk(&self, session_id: f64, chunk: &[u8]) -> Result<f64, JsError> {
+        let mut buffers = get_chunk_buffers().lock().map_err(to_js_err)?;
+
+        let (buffer, offset) = buffers.get_mut(&(session_id as usize))
+            .ok_or_else(|| JsError::new("Invalid session ID. Call startChunkedUpload first."))?;
+
+        // Copy chunk data to the pre-allocated buffer at the current offset
+        let end = *offset + chunk.len();
+        if end > buffer.len() {
+            return Err(JsError::new("Chunk exceeds total size"));
+        }
+
+        buffer[*offset..end].copy_from_slice(chunk);
+        *offset = end;
+
+        log::debug!("uploadChunk: wrote {} bytes at offset {}, total progress: {}/{}",
+                   chunk.len(), *offset - chunk.len(), *offset, buffer.len());
+        Ok(*offset as f64)
+    }
+
+    /// Finalizes a chunked upload and returns the PinnedObject.
+    /// on_progress callback receives (current_shards, total_shards).
+    #[wasm_bindgen(js_name = "finalizeChunkedUpload")]
+    pub async fn finalize_chunked_upload(
+        &self,
+        session_id: f64,
+        on_progress: &js_sys::Function,
+    ) -> Result<PinnedObject, JsError> {
+        // Retrieve and remove the accumulated buffer
+        let (data, final_offset) = {
+            let mut buffers = get_chunk_buffers().lock().map_err(to_js_err)?;
+            buffers.remove(&(session_id as usize))
+                .ok_or_else(|| JsError::new("Invalid session ID or session already finalized"))?
+        };
+
+        // Verify all data was written
+        if final_offset != data.len() {
+            return Err(JsError::new(&format!(
+                "Incomplete upload: expected {} bytes, got {} bytes",
+                data.len(), final_offset
+            )));
+        }
+
+        log::info!("finalizeChunkedUpload: uploading {} bytes", data.len());
+
+        // Calculate progress metadata
+        let slab_data_size = 10usize * 4_194_304; // data_shards(10) * SECTOR_SIZE(4 MiB)
+        let num_slabs = if data.is_empty() { 0 } else { data.len().div_ceil(slab_data_size) };
+        let total_shards = (num_slabs as u32) * 30; // 30 shards per slab (10 data + 20 parity)
+
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let options = indexd::UploadOptions {
+            shard_uploaded: Some(tx),
+            ..self.inner.default_upload_options()
+        };
+
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .map_err(to_js_err)?;
+        let _guard = rt.enter();
+        let local = tokio::task::LocalSet::new();
+        let cursor = Cursor::new(data);
+        let on_progress = on_progress.clone();
+        let object: indexd::Object = local
+            .run_until(async {
+                tokio::task::spawn_local(async move {
+                    let mut count: u32 = 0;
+                    while rx.recv().await.is_some() {
+                        count += 1;
+                        let _ = on_progress.call2(
+                            &JsValue::NULL,
+                            &JsValue::from(count),
+                            &JsValue::from(total_shards),
+                        );
+                    }
+                });
+                self.inner.upload(cursor, options).await
+            })
+            .await
+            .map_err(to_js_err)?;
+        log::info!("finalizeChunkedUpload: complete");
+        Ok(PinnedObject {
+            inner: Arc::new(Mutex::new(object)),
+        })
+    }
+
+    /// Starts a streaming upload that reads chunks on-demand from JavaScript.
+    /// This bypasses WASM memory limitations by never accumulating the entire file.
+    ///
+    /// Returns a StreamingUpload object with a `pushChunk` method and a `promise` property.
+    /// JavaScript should:
+    /// 1. Start pushing chunks immediately using `pushChunk(chunk)`
+    /// 2. Call `pushChunk(null)` to signal EOF when all chunks are sent
+    /// 3. `await upload.promise` to get the uploaded object
+    ///
+    /// # Example JavaScript Usage
+    /// ```javascript
+    /// const totalSize = file.size;
+    /// const upload = sdk.streamingUpload(totalSize, (current, total) => {
+    ///   console.log(`Progress: ${current}/${total} shards`);
+    /// });
+    ///
+    /// // Read and push chunks asynchronously
+    /// (async () => {
+    ///   const CHUNK_SIZE = 128 * 1024 * 1024; // 128 MB
+    ///   for (let offset = 0; offset < totalSize; offset += CHUNK_SIZE) {
+    ///     const chunk = file.slice(offset, offset + CHUNK_SIZE);
+    ///     const data = new Uint8Array(await chunk.arrayBuffer());
+    ///     upload.pushChunk(data);
+    ///   }
+    ///   upload.pushChunk(null); // Signal EOF
+    /// })();
+    ///
+    /// // Wait for upload to complete
+    /// const obj = await upload.promise;
+    /// ```
+    #[wasm_bindgen(js_name = "streamingUpload")]
+    pub fn streaming_upload(
+        &self,
+        total_size: f64,
+        on_progress: &js_sys::Function,
+    ) -> Result<StreamingUpload, JsError> {
+        use indexd::js_chunked_reader::JsChunkedReader;
+
+        // Generate a unique reader ID
+        let reader_id = self as *const _ as usize;
+
+        // Create the reader
+        let reader = JsChunkedReader::new(reader_id);
+
+        // Register the reader state globally so pushChunk can access it
+        {
+            let mut readers = get_streaming_readers().lock().map_err(to_js_err)?;
+            readers.insert(reader_id, reader.state().clone());
+        }
+
+        // Calculate progress metadata
+        let slab_data_size = 10usize * 4_194_304; // data_shards(10) * SECTOR_SIZE(4 MiB)
+        let size = total_size as usize;
+        let num_slabs = if size == 0 { 0 } else { size.div_ceil(slab_data_size) };
+        let total_shards = (num_slabs as u32) * 30; // 30 shards per slab (10 data + 20 parity)
+
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let options = indexd::UploadOptions {
+            shard_uploaded: Some(tx),
+            ..self.inner.default_upload_options()
+        };
+
+        let on_progress = on_progress.clone();
+        let inner = self.inner.clone();
+
+        // Convert to a JavaScript Promise that spawns the upload task
+        let promise = wasm_bindgen_futures::future_to_promise(async move {
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .build()
+                .map_err(to_js_err)?;
+            let _guard = rt.enter();
+            let local = tokio::task::LocalSet::new();
+
+            let object: indexd::Object = local.run_until(async move {
+                // Spawn progress tracking task
+                tokio::task::spawn_local(async move {
+                    let mut count: u32 = 0;
+                    while rx.recv().await.is_some() {
+                        count += 1;
+                        let _ = on_progress.call2(
+                            &JsValue::NULL,
+                            &JsValue::from(count),
+                            &JsValue::from(total_shards),
+                        );
+                    }
+                });
+
+                // Run the upload
+                inner.upload(reader, options).await
+            }).await.map_err(to_js_err)?;
+
+            // Clean up the reader from the global registry
+            let _ = get_streaming_readers().lock().map(|mut readers| {
+                readers.remove(&reader_id);
+            });
+
+            let pinned = PinnedObject {
+                inner: Arc::new(Mutex::new(object)),
+            };
+            Ok(JsValue::from(pinned))
+        });
+
+        Ok(StreamingUpload {
+            reader_id,
+            promise: js_sys::Promise::from(promise),
+        })
     }
 
     /// Returns hosts as a JSON array.
@@ -557,7 +909,7 @@ impl Builder {
     ///
     /// Returns the SDK if authenticated, or null if the key is not recognized.
     /// Call `requestConnection` if null is returned.
-    pub async fn connected(&self, app_key: &AppKey) -> Result<JsValue, JsError> {
+    pub async fn connected(&self, app_key: &AppKey) -> Result<SDK, JsError> {
         let state = self
             .state
             .lock()
@@ -570,12 +922,12 @@ impl Builder {
                 match builder.connected(&app_key.0).await.map_err(to_js_err)? {
                     Some(sdk) => {
                         *self.state.lock().map_err(to_js_err)? = Some(BuilderState::Finalized);
-                        Ok(SDK { inner: sdk }.into())
+                        Ok(SDK { inner: sdk })
                     }
                     None => {
                         *self.state.lock().map_err(to_js_err)? =
                             Some(BuilderState::Disconnected(builder));
-                        Ok(JsValue::NULL)
+                        Err(JsError::new("connection failed: no SDK returned"))
                     }
                 }
             }

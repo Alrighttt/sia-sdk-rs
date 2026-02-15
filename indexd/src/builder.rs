@@ -177,9 +177,7 @@ impl Builder<DisconnectedState> {
         let sdk = SDK::new(
             self.client.clone(),
             Arc::new(app_key.clone()),
-            self.max_price_fetches,
-            self.max_downloads,
-            self.max_uploads,
+            self.concurrency,
         )
         .await?;
         Ok(Some(sdk))

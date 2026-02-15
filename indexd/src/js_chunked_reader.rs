@@ -1,0 +1,173 @@
+/// JavaScript-backed chunked reader for streaming large file uploads in WASM
+///
+/// This module provides a bridge between JavaScript's File API and Rust's AsyncRead trait,
+/// allowing large files to be uploaded without loading the entire file into WASM memory.
+
+use std::collections::VecDeque;
+use std::io;
+use std::pin::Pin;
+use std::sync::{Arc, Mutex};
+use std::task::{Context, Poll, Waker};
+use tokio::io::AsyncRead;
+
+/// Maximum number of chunks to queue before applying backpressure
+/// 3 chunks × 128 MB = 384 MB maximum memory overhead
+const MAX_QUEUED_CHUNKS: usize = 3;
+
+/// State shared between the reader and the WASM binding layer
+pub struct ReaderState {
+    /// Queue of data chunks received from JavaScript
+    pub chunks: VecDeque<Vec<u8>>,
+    /// Current chunk being read
+    pub(crate) current_chunk: Option<Vec<u8>>,
+    /// Current read position within the current chunk
+    pub(crate) position: usize,
+    /// Whether EOF has been reached
+    pub eof: bool,
+    /// Waker to notify when new data arrives (for the upload pipeline)
+    pub waker: Option<Waker>,
+    /// Waker to notify JavaScript when queue space is available (for backpressure)
+    pub backpressure_waker: Option<Waker>,
+    /// Error from JavaScript side
+    pub error: Option<String>,
+}
+
+/// A reader that receives chunks from JavaScript on-demand
+pub struct JsChunkedReader {
+    /// Unique ID for this reader session
+    pub(crate) reader_id: usize,
+    /// Shared state for this reader
+    state: Arc<Mutex<ReaderState>>,
+}
+
+impl JsChunkedReader {
+    /// Creates a new JsChunkedReader with the given ID
+    pub fn new(reader_id: usize) -> Self {
+        Self {
+            reader_id,
+            state: Arc::new(Mutex::new(ReaderState {
+                chunks: VecDeque::new(),
+                current_chunk: None,
+                position: 0,
+                eof: false,
+                waker: None,
+                backpressure_waker: None,
+                error: None,
+            })),
+        }
+    }
+
+    /// Returns a reference to the reader state for external access
+    pub fn state(&self) -> &Arc<Mutex<ReaderState>> {
+        &self.state
+    }
+
+    /// Pushes a new chunk of data from JavaScript
+    pub(crate) fn push_chunk(&self, chunk: Vec<u8>) {
+        let mut state = self.state.lock().unwrap();
+        state.chunks.push_back(chunk);
+
+        // Wake the reader if it's waiting
+        if let Some(waker) = state.waker.take() {
+            waker.wake();
+        }
+    }
+
+    /// Signals EOF from JavaScript
+    pub(crate) fn push_eof(&self) {
+        let mut state = self.state.lock().unwrap();
+        state.eof = true;
+
+        // Wake the reader if it's waiting
+        if let Some(waker) = state.waker.take() {
+            waker.wake();
+        }
+    }
+
+    /// Sets an error from the JavaScript side
+    pub(crate) fn set_error(&self, error: String) {
+        let mut state = self.state.lock().unwrap();
+        state.error = Some(error);
+
+        // Wake the reader if it's waiting
+        if let Some(waker) = state.waker.take() {
+            waker.wake();
+        }
+    }
+}
+
+impl AsyncRead for JsChunkedReader {
+    fn poll_read(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &mut tokio::io::ReadBuf<'_>,
+    ) -> Poll<io::Result<()>> {
+        let mut state = self.state.lock().unwrap();
+
+        // Check for error first
+        if let Some(error) = &state.error {
+            return Poll::Ready(Err(io::Error::new(
+                io::ErrorKind::Other,
+                error.clone(),
+            )));
+        }
+
+        loop {
+            // Try to read from current chunk if available
+            if state.current_chunk.is_some() {
+                let chunk_len = state.current_chunk.as_ref().unwrap().len();
+                let available = chunk_len - state.position;
+
+                if available > 0 {
+                    // We have data to read from current chunk
+                    let to_read = available.min(buf.remaining());
+                    let start = state.position;
+                    let end = start + to_read;
+
+                    // Extract the slice, copying it into buf
+                    // We need to get the data out before mutating state
+                    let data = state.current_chunk.as_ref().unwrap()[start..end].to_vec();
+                    buf.put_slice(&data);
+
+                    // Now we can mutate state
+                    state.position = end;
+
+                    // If we've consumed the entire chunk, clear it
+                    if state.position >= chunk_len {
+                        state.current_chunk = None;
+                        state.position = 0;
+                    }
+
+                    return Poll::Ready(Ok(()));
+                }
+            }
+
+            // Current chunk is exhausted or doesn't exist, try to get the next one
+            if let Some(next_chunk) = state.chunks.pop_front() {
+                state.current_chunk = Some(next_chunk);
+                state.position = 0;
+
+                // Wake JavaScript if it's waiting due to backpressure
+                if let Some(waker) = state.backpressure_waker.take() {
+                    waker.wake();
+                }
+
+                // Continue the loop to read from this new chunk
+                continue;
+            }
+
+            // No chunks available
+            if state.eof {
+                // No more data and EOF reached
+                return Poll::Ready(Ok(()));
+            } else {
+                // No data available yet, register waker and wait
+                state.waker = Some(cx.waker().clone());
+                return Poll::Pending;
+            }
+        }
+    }
+}
+
+// WASM is single-threaded, so Send is safe
+unsafe impl Send for JsChunkedReader {}

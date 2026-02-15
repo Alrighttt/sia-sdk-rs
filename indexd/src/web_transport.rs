@@ -1,7 +1,7 @@
 use std::collections::HashMap;
 use std::future::Future;
 use std::pin::Pin;
-use std::sync::{Arc, RwLock};
+use std::sync::RwLock;
 use std::task::{Context, Poll};
 use tokio::sync::Semaphore;
 
@@ -221,6 +221,7 @@ pub struct Client {
     hosts: Hosts,
     cached_prices: std::sync::Arc<RwLock<HashMap<PublicKey, HostPrices>>>,
     cached_tokens: std::sync::Arc<RwLock<HashMap<PublicKey, AccountToken>>>,
+    price_fetch_semaphore: std::sync::Arc<Semaphore>,
 }
 
 impl Client {
