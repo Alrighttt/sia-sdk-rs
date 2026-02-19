@@ -794,6 +794,36 @@ impl SDK {
         self.inner.prune_slabs().await.map_err(to_js_err)
     }
 
+    /// Lists objects from the indexer. Returns a JSON array of object events.
+    /// Each event has { id, deleted, updatedAt, size }.
+    /// Pass limit=0 or null to use the server default.
+    #[wasm_bindgen(js_name = "listObjects")]
+    pub async fn list_objects(&self, limit: Option<usize>) -> Result<String, JsError> {
+        let limit = limit.filter(|&l| l > 0);
+        let events = self
+            .inner
+            .object_events(None, limit)
+            .await
+            .map_err(to_js_err)?;
+
+        let json_events: Vec<serde_json::Value> = events
+            .iter()
+            .map(|e| {
+                let mut obj = serde_json::json!({
+                    "id": e.id.to_string(),
+                    "deleted": e.deleted,
+                    "updated_at": e.updated_at.to_rfc3339(),
+                });
+                if let Some(ref object) = e.object {
+                    obj["size"] = serde_json::json!(object.size());
+                }
+                obj
+            })
+            .collect();
+
+        serde_json::to_string(&json_events).map_err(to_js_err)
+    }
+
     /// Creates a share URL for an object, valid until the given timestamp (ms since epoch).
     #[wasm_bindgen(js_name = "shareObject")]
     pub fn share_object(
