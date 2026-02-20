@@ -36,8 +36,8 @@ fn get_streaming_readers() -> &'static Mutex<HashMap<usize, Arc<Mutex<indexd::js
 #[wasm_bindgen(start)]
 fn init_panic_hook() {
     console_error_panic_hook::set_once();
-    console_log::init_with_level(log::Level::Trace).ok();
-    log::info!("indexd WASM initialized - logging at TRACE level");
+    console_log::init_with_level(log::Level::Info).ok();
+    log::info!("indexd WASM initialized");
 }
 
 /// Converts a JsValue error context into a JsError.
