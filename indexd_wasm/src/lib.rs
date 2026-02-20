@@ -554,7 +554,6 @@ impl SDK {
         data_key: &[u8],
         stream_offset: f64,
         on_progress: &js_sys::Function,
-        allow_host_reuse: Option<bool>,
     ) -> Result<String, JsError> {
         let key = sia::encryption::EncryptionKey::try_from(data_key)
             .map_err(|e| JsError::new(&format!("invalid data key: {e}")))?;
@@ -564,7 +563,6 @@ impl SDK {
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
         let mut options = self.inner.default_upload_options();
         options.shard_uploaded = Some(tx);
-        options.allow_host_reuse = allow_host_reuse.unwrap_or(false);
 
         let rt = tokio::runtime::Builder::new_current_thread()
             .build()

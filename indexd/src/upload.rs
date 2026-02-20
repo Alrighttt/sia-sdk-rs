@@ -88,11 +88,6 @@ pub struct UploadOptions {
     /// This can be used to implement progress reporting.
     pub shard_uploaded: Option<mpsc::UnboundedSender<()>>,
 
-    /// When true, if the host queue is exhausted the upload will recycle
-    /// hosts instead of failing. This allows multiple shards to land on
-    /// the same host, reducing redundancy but letting the upload succeed
-    /// when there aren't enough unique reachable hosts.
-    pub allow_host_reuse: bool,
 }
 
 impl Default for UploadOptions {
@@ -105,7 +100,6 @@ impl Default for UploadOptions {
             #[cfg(not(target_arch = "wasm32"))]
             max_inflight: 16,
             shard_uploaded: None,
-            allow_host_reuse: false,
         }
     }
 }
@@ -330,7 +324,6 @@ impl Uploader {
         shard_index: usize,
         progress_tx: Option<mpsc::UnboundedSender<()>>,
         initial_host: (PublicKey, usize),
-        allow_host_reuse: bool,
     ) -> Result<(usize, Sector), UploadError> {
         let (host_key, attempts) = initial_host;
         let mut write_timeout = Self::upload_timeout(attempts); // mutable so that it can be adjusted on retries
@@ -345,7 +338,7 @@ impl Uploader {
         ));
         let semaphore = permit.semaphore();
         let mut total_failures: usize = 0;
-        let max_total_failures: usize = if allow_host_reuse { 90 } else { 30 };
+        let max_total_failures: usize = 30;
 
         loop {
             let active = tasks.len();
@@ -373,11 +366,6 @@ impl Uploader {
                             if tasks.is_empty() {
                                 let next_host = match hosts.pop_front() {
                                     Ok(h) => h,
-                                    Err(QueueError::NoMoreHosts) if allow_host_reuse => {
-                                        debug!("slab {slab_index} shard {shard_index}: host queue exhausted, refilling (host reuse enabled)");
-                                        hosts.refill()?;
-                                        hosts.pop_front()?
-                                    }
                                     Err(e) => return Err(e.into()),
                                 };
                                 let (host_key, attempts) = next_host;
@@ -393,16 +381,11 @@ impl Uploader {
                         let transport = transport.clone();
                         let data = data.clone();
                         let account_key = account_key.clone();
-                        let allow_host_reuse = allow_host_reuse;
                         join_set_spawn!(tasks, async move {
                             let _racer = racer; // hold the permit until the task completes
                             debug!("slab {slab_index} shard {shard_index} racing slow host");
                             let next_host = match hosts.pop_front() {
                                 Ok(h) => h,
-                                Err(QueueError::NoMoreHosts) if allow_host_reuse => {
-                                    hosts.refill()?;
-                                    hosts.pop_front()?
-                                }
                                 Err(e) => return Err(e.into()),
                             };
                             let (host_key, attempts) = next_host;
@@ -437,7 +420,6 @@ impl Uploader {
         }
         let data_shards = options.data_shards as usize;
         let parity_shards = options.parity_shards as usize;
-        let allow_host_reuse = options.allow_host_reuse;
         let total_shards = data_shards + parity_shards;
 
         // fail fast if there aren't enough hosts before doing any encoding
@@ -546,7 +528,6 @@ impl Uploader {
                             shard_index,
                             progress_tx,
                             initial_host,
-                            allow_host_reuse,
                         )
                         .await
                     });

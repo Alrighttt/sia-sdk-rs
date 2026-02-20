@@ -370,7 +370,6 @@ const MAX_HOST_RETRIES: usize = 3;
 #[derive(Debug)]
 struct HostQueueInner {
     hosts: VecDeque<PublicKey>,
-    all_hosts: Vec<PublicKey>,
     attempts: HashMap<PublicKey, usize>,
 }
 
@@ -384,20 +383,10 @@ impl HostQueue {
     pub fn new(hosts: Vec<PublicKey>) -> Self {
         Self {
             inner: Arc::new(Mutex::new(HostQueueInner {
-                hosts: VecDeque::from(hosts.clone()),
-                all_hosts: hosts,
+                hosts: VecDeque::from(hosts),
                 attempts: HashMap::new(),
             })),
         }
-    }
-
-    /// Refills the queue with all original hosts, resetting attempt counts.
-    /// Used when host reuse is allowed and the queue is exhausted.
-    pub fn refill(&self) -> Result<(), QueueError> {
-        let mut inner = self.inner.lock().map_err(|_| QueueError::MutexError)?;
-        inner.attempts.clear();
-        inner.hosts = inner.all_hosts.iter().copied().collect();
-        Ok(())
     }
 
     pub fn pop_front(&self) -> Result<(PublicKey, usize), QueueError> {
