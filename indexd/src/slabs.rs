@@ -240,7 +240,7 @@ pub struct Object {
 }
 
 impl Object {
-    pub(crate) fn new(data_key: EncryptionKey, slabs: Vec<Slab>, metadata: Vec<u8>) -> Self {
+    pub fn new(data_key: EncryptionKey, slabs: Vec<Slab>, metadata: Vec<u8>) -> Self {
         Object {
             data_key,
             slabs,
