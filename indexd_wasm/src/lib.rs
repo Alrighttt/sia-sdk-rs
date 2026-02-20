@@ -6,12 +6,12 @@ use std::task::{Context, Poll};
 
 use indexd::app_client::{RegisterAppRequest, RegisterAppResponse};
 use js_sys::Uint8Array;
-use tokio::io::AsyncWrite;
 use sia::seed::Seed;
 use sia::signing::{PrivateKey, Signature};
 use sia::types::Hash256;
 use std::str::FromStr;
 use std::time::SystemTime;
+use tokio::io::AsyncWrite;
 use wasm_bindgen::prelude::*;
 
 /// Global storage for chunked upload buffers
@@ -24,9 +24,12 @@ fn get_chunk_buffers() -> &'static Mutex<HashMap<usize, (Vec<u8>, usize)>> {
 
 /// Global storage for streaming readers
 /// Key: reader_id (usize), Value: Arc<Mutex<ReaderState>>
-static STREAMING_READERS: OnceLock<Mutex<HashMap<usize, Arc<Mutex<indexd::js_chunked_reader::ReaderState>>>>> = OnceLock::new();
+static STREAMING_READERS: OnceLock<
+    Mutex<HashMap<usize, Arc<Mutex<indexd::js_chunked_reader::ReaderState>>>>,
+> = OnceLock::new();
 
-fn get_streaming_readers() -> &'static Mutex<HashMap<usize, Arc<Mutex<indexd::js_chunked_reader::ReaderState>>>> {
+fn get_streaming_readers()
+-> &'static Mutex<HashMap<usize, Arc<Mutex<indexd::js_chunked_reader::ReaderState>>>> {
     STREAMING_READERS.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
@@ -108,8 +111,7 @@ impl StreamingUpload {
                         let promise = js_sys::Promise::new(&mut |resolve, _reject| {
                             let window = web_sys::window().expect("no window");
                             let _ = window.set_timeout_with_callback_and_timeout_and_arguments_0(
-                                &resolve,
-                                50,
+                                &resolve, 50,
                             );
                         });
                         let _ = wasm_bindgen_futures::JsFuture::from(promise).await;
@@ -129,12 +131,6 @@ impl StreamingUpload {
 
             Ok(JsValue::UNDEFINED)
         })
-    }
-
-    /// Returns the reader ID for this upload session (mainly for debugging)
-    #[wasm_bindgen(js_name = "getReaderId", getter)]
-    pub fn reader_id(&self) -> f64 {
-        self.reader_id as f64
     }
 
     /// Returns the promise that resolves when the upload completes
@@ -165,7 +161,9 @@ impl AppKey {
                 seed.copy_from_slice(key);
                 Ok(AppKey(PrivateKey::from_seed(&seed)))
             }
-            _ => Err(JsError::new("app key must be 64 bytes (keypair) or 32 bytes (seed)")),
+            _ => Err(JsError::new(
+                "app key must be 64 bytes (keypair) or 32 bytes (seed)",
+            )),
         }
     }
 
@@ -212,8 +210,7 @@ pub struct PinnedObject {
 impl PinnedObject {
     /// Opens a sealed object (JSON) using the provided app key.
     pub fn open(app_key: &AppKey, sealed_json: &str) -> Result<PinnedObject, JsError> {
-        let sealed: indexd::SealedObject =
-            serde_json::from_str(sealed_json).map_err(to_js_err)?;
+        let sealed: indexd::SealedObject = serde_json::from_str(sealed_json).map_err(to_js_err)?;
         let obj = sealed.open(&app_key.0).map_err(to_js_err)?;
         Ok(PinnedObject {
             inner: Arc::new(Mutex::new(obj)),
@@ -293,62 +290,21 @@ impl SDK {
         AppKey(self.inner.app_key().clone())
     }
 
-    /// Uploads a Uint8Array to the Sia network.
-    ///
-    /// Returns a PinnedObject containing the metadata needed to download the data.
-    pub async fn upload(&self, data: &[u8]) -> Result<PinnedObject, JsError> {
-        log::info!("upload: starting ({} bytes)", data.len());
-        let rt = tokio::runtime::Builder::new_current_thread()
-            .build()
-            .map_err(to_js_err)?;
-        let _guard = rt.enter();
-        let local = tokio::task::LocalSet::new();
-        let cursor = Cursor::new(data.to_vec());
-        let object: indexd::Object = local
-            .run_until(self.inner.upload(cursor, indexd::UploadOptions::default()))
-            .await
-            .map_err(to_js_err)?;
-        log::info!("upload: complete");
-        Ok(PinnedObject {
-            inner: Arc::new(Mutex::new(object)),
-        })
-    }
-
-    /// Downloads an object's data, returning a Uint8Array.
-    pub async fn download(&self, object: &PinnedObject) -> Result<Uint8Array, JsError> {
-        let rt = tokio::runtime::Builder::new_current_thread()
-            .build()
-            .map_err(to_js_err)?;
-        let _guard = rt.enter();
-        let local = tokio::task::LocalSet::new();
-        let obj = object.inner.lock().map_err(to_js_err)?.clone();
-        let size = obj.size() as usize;
-        let mut buf = vec![0u8; size];
-        local
-            .run_until(async {
-                self.inner.download(
-                    &mut Cursor::new(&mut buf),
-                    &obj,
-                    indexd::DownloadOptions::default(),
-                ).await
-            })
-            .await
-            .map_err(to_js_err)?;
-        Ok(Uint8Array::from(buf.as_slice()))
-    }
-
     /// Uploads a Uint8Array with per-shard progress reporting.
     ///
     /// The `on_progress` callback receives `(current_shards, total_shards)`.
-    #[wasm_bindgen(js_name = "uploadWithProgress")]
-    pub async fn upload_with_progress(
+    pub async fn upload(
         &self,
         data: &[u8],
         on_progress: &js_sys::Function,
     ) -> Result<PinnedObject, JsError> {
-        log::info!("upload_with_progress: starting ({} bytes)", data.len());
+        log::info!("upload: starting ({} bytes)", data.len());
         let slab_data_size = 10usize * 4_194_304; // data_shards(10) * SECTOR_SIZE(4 MiB)
-        let num_slabs = if data.is_empty() { 0 } else { data.len().div_ceil(slab_data_size) };
+        let num_slabs = if data.is_empty() {
+            0
+        } else {
+            data.len().div_ceil(slab_data_size)
+        };
         let total_shards = (num_slabs as u32) * 30; // 30 shards per slab (10 data + 20 parity)
 
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
@@ -381,7 +337,7 @@ impl SDK {
             })
             .await
             .map_err(to_js_err)?;
-        log::info!("upload_with_progress: complete");
+        log::info!("upload: complete");
         Ok(PinnedObject {
             inner: Arc::new(Mutex::new(object)),
         })
@@ -390,8 +346,7 @@ impl SDK {
     /// Downloads an object's data with per-slab progress reporting.
     ///
     /// The `on_progress` callback receives `(current_slabs, total_slabs)`.
-    #[wasm_bindgen(js_name = "downloadWithProgress")]
-    pub async fn download_with_progress(
+    pub async fn download(
         &self,
         object: &PinnedObject,
         on_progress: &js_sys::Function,
@@ -514,6 +469,153 @@ impl SDK {
         Ok(())
     }
 
+    /// Downloads a single slab by index, returning its decrypted data as a Uint8Array.
+    ///
+    /// Used by slab download workers to enable parallel slab downloads across
+    /// multiple Web Workers, each with their own SDK instance and thread.
+    #[wasm_bindgen(js_name = "downloadSlabByIndex")]
+    pub async fn download_slab_by_index(
+        &self,
+        object: &PinnedObject,
+        slab_index: u32,
+    ) -> Result<Uint8Array, JsError> {
+        let obj = object.inner.lock().map_err(to_js_err)?.clone();
+        let slabs = obj.slabs();
+        let idx = slab_index as usize;
+        if idx >= slabs.len() {
+            return Err(JsError::new(&format!(
+                "slab index {} out of range (object has {} slabs)",
+                idx,
+                slabs.len()
+            )));
+        }
+        // Compute byte offset into the object for this slab
+        let offset: u64 = slabs[..idx].iter().map(|s| s.length as u64).sum();
+        let length = slabs[idx].length as u64;
+        let mut buf = vec![0u8; length as usize];
+
+        let options = indexd::DownloadOptions {
+            offset,
+            length: Some(length),
+            ..self.inner.default_download_options()
+        };
+
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .map_err(to_js_err)?;
+        let _guard = rt.enter();
+        let local = tokio::task::LocalSet::new();
+        local
+            .run_until(async {
+                self.inner
+                    .download(&mut Cursor::new(&mut buf), &obj, options)
+                    .await
+            })
+            .await
+            .map_err(to_js_err)?;
+        Ok(Uint8Array::from(buf.as_slice()))
+    }
+
+    /// Configures this SDK instance as one of N parallel upload workers.
+    /// The upload host queue is rotated by `workerIndex * (hostCount / numWorkers)`
+    /// so workers pick different hosts and avoid overlap.
+    #[wasm_bindgen(js_name = "setUploadWorker")]
+    pub fn set_upload_worker(&self, worker_index: usize, num_workers: usize) {
+        self.inner.set_upload_worker(worker_index, num_workers);
+    }
+
+    /// Returns the slab data size in bytes (data_shards * SECTOR_SIZE).
+    /// Used by JS to split files into slab-sized chunks for parallel upload.
+    #[wasm_bindgen(js_name = "slabDataSize")]
+    pub fn slab_data_size(&self) -> f64 {
+        (10usize * 4_194_304) as f64 // data_shards(10) * SECTOR_SIZE(4 MiB)
+    }
+
+    /// Generates a random 32-byte encryption key for object-level encryption.
+    /// Used by parallel upload workers that share a single data key.
+    #[wasm_bindgen(js_name = "generateDataKey")]
+    pub fn generate_data_key(&self) -> Uint8Array {
+        let key: [u8; 32] = rand::random();
+        Uint8Array::from(&key[..])
+    }
+
+    /// Uploads a single slab's worth of raw data with object-level encryption
+    /// at the given stream offset. Returns the slab metadata as JSON.
+    ///
+    /// Used by parallel upload workers. Each worker calls this with a different
+    /// chunk of the file and the correct stream offset. The shared data_key
+    /// ensures all slabs can be decrypted together.
+    ///
+    /// The `on_progress` callback receives `(current_shards, total_shards)`.
+    #[wasm_bindgen(js_name = "uploadSlab")]
+    pub async fn upload_slab(
+        &self,
+        data: &[u8],
+        data_key: &[u8],
+        stream_offset: f64,
+        on_progress: &js_sys::Function,
+        allow_host_reuse: Option<bool>,
+    ) -> Result<String, JsError> {
+        let key = sia::encryption::EncryptionKey::try_from(data_key)
+            .map_err(|e| JsError::new(&format!("invalid data key: {e}")))?;
+
+        let total_shards: u32 = 30; // 10 data + 20 parity for one slab
+
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut options = self.inner.default_upload_options();
+        options.shard_uploaded = Some(tx);
+        options.allow_host_reuse = allow_host_reuse.unwrap_or(false);
+
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .map_err(to_js_err)?;
+        let _guard = rt.enter();
+        let local = tokio::task::LocalSet::new();
+
+        let on_progress = on_progress.clone();
+        let slab = local
+            .run_until(async {
+                tokio::task::spawn_local(async move {
+                    let mut count: u32 = 0;
+                    while rx.recv().await.is_some() {
+                        count += 1;
+                        let _ = on_progress.call2(
+                            &JsValue::NULL,
+                            &JsValue::from(count),
+                            &JsValue::from(total_shards),
+                        );
+                    }
+                });
+                self.inner
+                    .upload_slab_raw(data, &key, stream_offset as u64, options)
+                    .await
+            })
+            .await
+            .map_err(to_js_err)?;
+
+        serde_json::to_string(&slab).map_err(to_js_err)
+    }
+
+    /// Assembles a PinnedObject from a data key and an array of slab metadata JSONs.
+    ///
+    /// Used after parallel upload workers have uploaded all slabs independently.
+    /// The main thread collects the slab JSONs and calls this to create the
+    /// final object that can be pinned to the indexer.
+    #[wasm_bindgen(js_name = "assembleObject")]
+    pub fn assemble_object(
+        &self,
+        data_key: &[u8],
+        slabs_json: &str,
+    ) -> Result<PinnedObject, JsError> {
+        let key = sia::encryption::EncryptionKey::try_from(data_key)
+            .map_err(|e| JsError::new(&format!("invalid data key: {e}")))?;
+        let slabs: Vec<indexd::Slab> = serde_json::from_str(slabs_json).map_err(to_js_err)?;
+        let object = indexd::Object::new(key, slabs, Vec::new());
+        Ok(PinnedObject {
+            inner: Arc::new(Mutex::new(object)),
+        })
+    }
+
     /// Starts a new chunked upload session with the total file size.
     /// Returns a session ID (as a number) to track this upload.
     ///
@@ -545,7 +647,11 @@ impl SDK {
 
         buffers.insert(session_id as usize, (buffer, 0)); // (buffer, current_offset)
 
-        log::info!("startChunkedUpload: session {} initialized with {} bytes", session_id, size);
+        log::info!(
+            "startChunkedUpload: session {} initialized with {} bytes",
+            session_id,
+            size
+        );
         Ok(session_id)
     }
 
@@ -555,7 +661,8 @@ impl SDK {
     pub fn upload_chunk(&self, session_id: f64, chunk: &[u8]) -> Result<f64, JsError> {
         let mut buffers = get_chunk_buffers().lock().map_err(to_js_err)?;
 
-        let (buffer, offset) = buffers.get_mut(&(session_id as usize))
+        let (buffer, offset) = buffers
+            .get_mut(&(session_id as usize))
             .ok_or_else(|| JsError::new("Invalid session ID. Call startChunkedUpload first."))?;
 
         // Copy chunk data to the pre-allocated buffer at the current offset
@@ -567,8 +674,13 @@ impl SDK {
         buffer[*offset..end].copy_from_slice(chunk);
         *offset = end;
 
-        log::debug!("uploadChunk: wrote {} bytes at offset {}, total progress: {}/{}",
-                   chunk.len(), *offset - chunk.len(), *offset, buffer.len());
+        log::debug!(
+            "uploadChunk: wrote {} bytes at offset {}, total progress: {}/{}",
+            chunk.len(),
+            *offset - chunk.len(),
+            *offset,
+            buffer.len()
+        );
         Ok(*offset as f64)
     }
 
@@ -583,7 +695,8 @@ impl SDK {
         // Retrieve and remove the accumulated buffer
         let (data, final_offset) = {
             let mut buffers = get_chunk_buffers().lock().map_err(to_js_err)?;
-            buffers.remove(&(session_id as usize))
+            buffers
+                .remove(&(session_id as usize))
                 .ok_or_else(|| JsError::new("Invalid session ID or session already finalized"))?
         };
 
@@ -591,7 +704,8 @@ impl SDK {
         if final_offset != data.len() {
             return Err(JsError::new(&format!(
                 "Incomplete upload: expected {} bytes, got {} bytes",
-                data.len(), final_offset
+                data.len(),
+                final_offset
             )));
         }
 
@@ -599,7 +713,11 @@ impl SDK {
 
         // Calculate progress metadata
         let slab_data_size = 10usize * 4_194_304; // data_shards(10) * SECTOR_SIZE(4 MiB)
-        let num_slabs = if data.is_empty() { 0 } else { data.len().div_ceil(slab_data_size) };
+        let num_slabs = if data.is_empty() {
+            0
+        } else {
+            data.len().div_ceil(slab_data_size)
+        };
         let total_shards = (num_slabs as u32) * 30; // 30 shards per slab (10 data + 20 parity)
 
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
@@ -691,7 +809,11 @@ impl SDK {
         // Calculate progress metadata
         let slab_data_size = 10usize * 4_194_304; // data_shards(10) * SECTOR_SIZE(4 MiB)
         let size = total_size as usize;
-        let num_slabs = if size == 0 { 0 } else { size.div_ceil(slab_data_size) };
+        let num_slabs = if size == 0 {
+            0
+        } else {
+            size.div_ceil(slab_data_size)
+        };
         let total_shards = (num_slabs as u32) * 30; // 30 shards per slab (10 data + 20 parity)
 
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
@@ -711,23 +833,26 @@ impl SDK {
             let _guard = rt.enter();
             let local = tokio::task::LocalSet::new();
 
-            let object: indexd::Object = local.run_until(async move {
-                // Spawn progress tracking task
-                tokio::task::spawn_local(async move {
-                    let mut count: u32 = 0;
-                    while rx.recv().await.is_some() {
-                        count += 1;
-                        let _ = on_progress.call2(
-                            &JsValue::NULL,
-                            &JsValue::from(count),
-                            &JsValue::from(total_shards),
-                        );
-                    }
-                });
+            let object: indexd::Object = local
+                .run_until(async move {
+                    // Spawn progress tracking task
+                    tokio::task::spawn_local(async move {
+                        let mut count: u32 = 0;
+                        while rx.recv().await.is_some() {
+                            count += 1;
+                            let _ = on_progress.call2(
+                                &JsValue::NULL,
+                                &JsValue::from(count),
+                                &JsValue::from(total_shards),
+                            );
+                        }
+                    });
 
-                // Run the upload
-                inner.upload(reader, options).await
-            }).await.map_err(to_js_err)?;
+                    // Run the upload
+                    inner.upload(reader, options).await
+                })
+                .await
+                .map_err(to_js_err)?;
 
             // Clean up the reader from the global registry
             let _ = get_streaming_readers().lock().map(|mut readers| {
@@ -877,11 +1002,7 @@ impl SDK {
         } else {
             share_url.to_string()
         };
-        let obj = self
-            .inner
-            .shared_object(url)
-            .await
-            .map_err(to_js_err)?;
+        let obj = self.inner.shared_object(url).await.map_err(to_js_err)?;
         Ok(PinnedObject {
             inner: Arc::new(Mutex::new(obj)),
         })
@@ -923,7 +1044,9 @@ impl Builder {
             *state = Some(BuilderState::Disconnected(builder));
             Ok(())
         } else {
-            Err(JsError::new("Can only set concurrency on disconnected builder"))
+            Err(JsError::new(
+                "Can only set concurrency on disconnected builder",
+            ))
         }
     }
 
@@ -937,7 +1060,9 @@ impl Builder {
             *state = Some(BuilderState::Disconnected(builder));
             Ok(())
         } else {
-            Err(JsError::new("Can only set concurrency on disconnected builder"))
+            Err(JsError::new(
+                "Can only set concurrency on disconnected builder",
+            ))
         }
     }
 
@@ -951,7 +1076,9 @@ impl Builder {
             *state = Some(BuilderState::Disconnected(builder));
             Ok(())
         } else {
-            Err(JsError::new("Can only set concurrency on disconnected builder"))
+            Err(JsError::new(
+                "Can only set concurrency on disconnected builder",
+            ))
         }
     }
 
@@ -1001,8 +1128,7 @@ impl Builder {
     /// ```
     #[wasm_bindgen(js_name = "requestConnection")]
     pub async fn request_connection(&self, app_meta_json: &str) -> Result<(), JsError> {
-        let meta: RegisterAppRequest =
-            serde_json::from_str(app_meta_json).map_err(to_js_err)?;
+        let meta: RegisterAppRequest = serde_json::from_str(app_meta_json).map_err(to_js_err)?;
 
         let state = self
             .state
@@ -1013,10 +1139,7 @@ impl Builder {
 
         match state {
             BuilderState::Disconnected(builder) => {
-                let builder = builder
-                    .request_connection(&meta)
-                    .await
-                    .map_err(to_js_err)?;
+                let builder = builder.request_connection(&meta).await.map_err(to_js_err)?;
                 *self.state.lock().map_err(to_js_err)? =
                     Some(BuilderState::RequestingApproval(builder));
                 Ok(())
@@ -1075,9 +1198,7 @@ impl Builder {
             Some(BuilderState::RequestingApproval(builder)) => {
                 Ok(builder.response_url().to_owned())
             }
-            _ => Err(JsError::new(
-                "invalid state: expected RequestingApproval",
-            )),
+            _ => Err(JsError::new("invalid state: expected RequestingApproval")),
         }
     }
 
@@ -1099,9 +1220,7 @@ impl Builder {
             }
             other => {
                 *self.state.lock().map_err(to_js_err)? = Some(other);
-                Err(JsError::new(
-                    "invalid state: expected RequestingApproval",
-                ))
+                Err(JsError::new("invalid state: expected RequestingApproval"))
             }
         }
     }
