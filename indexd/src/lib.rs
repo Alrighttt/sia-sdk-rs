@@ -4,6 +4,7 @@ use crate::app_client::{HostQuery, SlabPinParams};
 use crate::rhp4::RHP4Client;
 
 use chrono::{DateTime, Utc};
+use sia::encryption::EncryptionKey;
 use sia::signing::PrivateKey;
 pub use slabs::*;
 
