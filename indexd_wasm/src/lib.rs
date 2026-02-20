@@ -252,6 +252,30 @@ impl PinnedObject {
         inner.metadata = metadata.to_vec();
         Ok(())
     }
+
+    /// Returns the number of slabs in the object.
+    ///
+    /// Useful for sizing a Web Worker pool (cap workers at slab count) and
+    /// for tracking completion when downloading or uploading slabs in parallel.
+    #[wasm_bindgen(js_name = "slabCount")]
+    pub fn slab_count(&self) -> Result<u32, JsError> {
+        let inner = self.inner.lock().map_err(to_js_err)?;
+        Ok(inner.slabs().len() as u32)
+    }
+
+    /// Returns the actual data length of each slab as a JS array of numbers.
+    ///
+    /// Useful for computing per-slab byte offsets and for accurate download
+    /// progress reporting.
+    #[wasm_bindgen(js_name = "slabLengths")]
+    pub fn slab_lengths(&self) -> Result<js_sys::Array, JsError> {
+        let inner = self.inner.lock().map_err(to_js_err)?;
+        let arr = js_sys::Array::new();
+        for slab in inner.slabs() {
+            arr.push(&JsValue::from(slab.length as f64));
+        }
+        Ok(arr)
+    }
 }
 
 // ── SDK ─────────────────────────────────────────────────────────────────
