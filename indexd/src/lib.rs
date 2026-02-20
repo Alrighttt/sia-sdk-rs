@@ -118,8 +118,11 @@ impl SDK {
         app_key: Arc<PrivateKey>,
         concurrency: crate::builder::ConcurrencyConfig,
     ) -> Result<Self, BuilderError> {
-        // Fetch all hosts - concurrency limits in price fetching and downloads prevent crashes
-        let usable_hosts = api_client.hosts(&app_key, HostQuery::default()).await?;
+        // Fetch only QUIC hosts — WASM uses WebTransport which requires QUIC.
+        let usable_hosts = api_client.hosts(&app_key, HostQuery {
+            protocol: Some(sia::types::v2::Protocol::QUIC),
+            ..Default::default()
+        }).await?;
         let hosts = Hosts::new();
         hosts.update(usable_hosts);
 
