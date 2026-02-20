@@ -1,10 +1,10 @@
-use std::io;
+use std::io::{self, Cursor};
 use std::sync::Arc;
 use std::time::Duration;
 
 use bytes::Bytes;
 use log::debug;
-use sia::encryption::{EncryptionKey, encrypt_shard};
+use sia::encryption::{CipherReader, EncryptionKey, encrypt_shard};
 use sia::erasure_coding::{self, ErasureCoder};
 use sia::rhp::{self, SECTOR_SIZE};
 use sia::signing::{PrivateKey, PublicKey};
@@ -87,6 +87,12 @@ pub struct UploadOptions {
     /// Optional channel to notify when each shard is uploaded.
     /// This can be used to implement progress reporting.
     pub shard_uploaded: Option<mpsc::UnboundedSender<()>>,
+
+    /// When true, if the host queue is exhausted the upload will recycle
+    /// hosts instead of failing. This allows multiple shards to land on
+    /// the same host, reducing redundancy but letting the upload succeed
+    /// when there aren't enough unique reachable hosts.
+    pub allow_host_reuse: bool,
 }
 
 impl Default for UploadOptions {
@@ -99,6 +105,7 @@ impl Default for UploadOptions {
             #[cfg(not(target_arch = "wasm32"))]
             max_inflight: 16,
             shard_uploaded: None,
+            allow_host_reuse: false,
         }
     }
 }
@@ -239,6 +246,12 @@ impl Uploader {
         }
     }
 
+    /// Configures this uploader as one of N parallel workers.
+    /// See [`Hosts::set_upload_worker`].
+    pub fn set_upload_worker(&self, worker_index: usize, num_workers: usize) {
+        self.hosts.set_upload_worker(worker_index, num_workers);
+    }
+
     /// Returns default upload options with the configured max_inflight.
     #[cfg(target_arch = "wasm32")]
     pub fn default_options(&self) -> UploadOptions {
@@ -317,6 +330,7 @@ impl Uploader {
         shard_index: usize,
         progress_tx: Option<mpsc::UnboundedSender<()>>,
         initial_host: (PublicKey, usize),
+        allow_host_reuse: bool,
     ) -> Result<(usize, Sector), UploadError> {
         let (host_key, attempts) = initial_host;
         let mut write_timeout = Self::upload_timeout(attempts); // mutable so that it can be adjusted on retries
@@ -331,7 +345,7 @@ impl Uploader {
         ));
         let semaphore = permit.semaphore();
         let mut total_failures: usize = 0;
-        const MAX_TOTAL_FAILURES: usize = 30; // Give up after 30 failed attempts total
+        let max_total_failures: usize = if allow_host_reuse { 90 } else { 30 };
 
         loop {
             let active = tasks.len();
@@ -348,16 +362,25 @@ impl Uploader {
                         }
                         Err(e) => {
                             total_failures += 1;
-                            debug!("slab {slab_index} shard {shard_index} upload failed ({total_failures}/{MAX_TOTAL_FAILURES}): {e:?}");
+                            debug!("slab {slab_index} shard {shard_index} upload failed ({total_failures}/{max_total_failures}): {e:?}");
 
-                            if total_failures >= MAX_TOTAL_FAILURES {
+                            if total_failures >= max_total_failures {
                                 return Err(UploadError::Rhp4(crate::rhp4::Error::Transport(
-                                    format!("failed to upload shard after {MAX_TOTAL_FAILURES} attempts")
+                                    format!("failed to upload shard after {max_total_failures} attempts")
                                 )));
                             }
 
                             if tasks.is_empty() {
-                                let (host_key, attempts) = hosts.pop_front()?;
+                                let next_host = match hosts.pop_front() {
+                                    Ok(h) => h,
+                                    Err(QueueError::NoMoreHosts) if allow_host_reuse => {
+                                        debug!("slab {slab_index} shard {shard_index}: host queue exhausted, refilling (host reuse enabled)");
+                                        hosts.refill()?;
+                                        hosts.pop_front()?
+                                    }
+                                    Err(e) => return Err(e.into()),
+                                };
+                                let (host_key, attempts) = next_host;
                                 write_timeout = Self::upload_timeout(attempts);
                                 join_set_spawn!(tasks, Self::upload_shard(transport.clone(), hosts.clone(), host_key, account_key.clone(), data.clone(), write_timeout));
                             }
@@ -370,10 +393,19 @@ impl Uploader {
                         let transport = transport.clone();
                         let data = data.clone();
                         let account_key = account_key.clone();
+                        let allow_host_reuse = allow_host_reuse;
                         join_set_spawn!(tasks, async move {
                             let _racer = racer; // hold the permit until the task completes
                             debug!("slab {slab_index} shard {shard_index} racing slow host");
-                            let (host_key, attempts) = hosts.pop_front()?;
+                            let next_host = match hosts.pop_front() {
+                                Ok(h) => h,
+                                Err(QueueError::NoMoreHosts) if allow_host_reuse => {
+                                    hosts.refill()?;
+                                    hosts.pop_front()?
+                                }
+                                Err(e) => return Err(e.into()),
+                            };
+                            let (host_key, attempts) = next_host;
                             let write_timeout = Self::upload_timeout(attempts);
                             Self::upload_shard(transport.clone(), hosts.clone(), host_key, account_key, data, write_timeout).await
                         });
@@ -405,6 +437,7 @@ impl Uploader {
         }
         let data_shards = options.data_shards as usize;
         let parity_shards = options.parity_shards as usize;
+        let allow_host_reuse = options.allow_host_reuse;
         let total_shards = data_shards + parity_shards;
 
         // fail fast if there aren't enough hosts before doing any encoding
@@ -513,6 +546,7 @@ impl Uploader {
                             shard_index,
                             progress_tx,
                             initial_host,
+                            allow_host_reuse,
                         )
                         .await
                     });
@@ -560,6 +594,34 @@ impl Uploader {
         }
         let slabs = slabs.into_iter().map(|s| s.unwrap()).collect();
         Ok(slabs)
+    }
+
+    /// Uploads a single slab's worth of raw data, applying object-level encryption
+    /// at the given stream offset using the provided data key.
+    ///
+    /// This is used by parallel upload workers where each worker uploads
+    /// one slab independently. The caller is responsible for:
+    /// 1. Generating a shared data_key
+    /// 2. Splitting input into slab-sized chunks
+    /// 3. Computing the correct stream offset for each chunk
+    /// 4. Assembling the resulting Slabs into an Object
+    pub async fn upload_slab_raw(
+        &self,
+        data: &[u8],
+        data_key: &EncryptionKey,
+        stream_offset: u64,
+        options: UploadOptions,
+    ) -> Result<Slab, UploadError> {
+        let reader = CipherReader::new(Cursor::new(data.to_vec()), data_key.clone(), stream_offset as usize);
+        let mut slabs = Self::upload_slabs(
+            self.transport.clone(),
+            self.hosts.clone(),
+            self.app_key.clone(),
+            reader,
+            options,
+        )
+        .await?;
+        slabs.pop().ok_or_else(|| UploadError::Io(io::Error::other("no slabs produced")))
     }
 
     /// Reads until EOF and uploads all slabs.

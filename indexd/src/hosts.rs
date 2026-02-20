@@ -176,6 +176,12 @@ struct HostInfo {
 struct HostsInner {
     hosts: HashMap<PublicKey, HostInfo>,
     preferred_hosts: PriorityQueue<PublicKey, HostMetric>,
+    /// Worker index and total worker count for upload host rotation.
+    /// upload_queue() uses these to compute the rotation offset based
+    /// on the actual number of upload-eligible hosts, ensuring workers
+    /// are evenly spaced across the host list.
+    upload_worker_index: usize,
+    upload_num_workers: usize,
 }
 
 /// Manages a list of known hosts and their performance metrics.
@@ -201,6 +207,8 @@ impl Hosts {
             inner: Arc::new(RwLock::new(HostsInner {
                 hosts: HashMap::new(),
                 preferred_hosts: PriorityQueue::new(),
+                upload_worker_index: 0,
+                upload_num_workers: 0,
             })),
         }
     }
@@ -273,8 +281,17 @@ impl Hosts {
         hosts
     }
 
+    /// Configures this instance as one of N parallel upload workers.
+    /// The upload queue will be rotated by `worker_index * (host_count / num_workers)`
+    /// so that workers are evenly spaced across the available hosts.
+    pub fn set_upload_worker(&self, worker_index: usize, num_workers: usize) {
+        let mut inner = self.inner.write().unwrap();
+        inner.upload_worker_index = worker_index;
+        inner.upload_num_workers = num_workers;
+    }
+
     /// Creates a queue of hosts that are good to upload to for sequential
-    /// access sorted by priority.
+    /// access sorted by priority, rotated by the configured upload offset.
     pub fn upload_queue(&self) -> HostQueue {
         let inner = self.inner.read().unwrap();
         let preferred_hosts = &inner.preferred_hosts;
@@ -289,6 +306,18 @@ impl Hosts {
                 .get_priority(b)
                 .cmp(&preferred_hosts.get_priority(a))
         });
+
+        // Rotate so parallel workers start at different positions.
+        // Stride = host_count / num_workers ensures even spacing.
+        if inner.upload_num_workers > 1 && !hosts.is_empty() {
+            let stride = hosts.len() / inner.upload_num_workers;
+            if stride > 0 {
+                let n = hosts.len();
+                let offset = (inner.upload_worker_index * stride) % n;
+                hosts.rotate_left(offset);
+            }
+        }
+
         HostQueue::new(hosts)
     }
 
@@ -341,6 +370,7 @@ const MAX_HOST_RETRIES: usize = 3;
 #[derive(Debug)]
 struct HostQueueInner {
     hosts: VecDeque<PublicKey>,
+    all_hosts: Vec<PublicKey>,
     attempts: HashMap<PublicKey, usize>,
 }
 
@@ -354,10 +384,20 @@ impl HostQueue {
     pub fn new(hosts: Vec<PublicKey>) -> Self {
         Self {
             inner: Arc::new(Mutex::new(HostQueueInner {
-                hosts: VecDeque::from(hosts),
+                hosts: VecDeque::from(hosts.clone()),
+                all_hosts: hosts,
                 attempts: HashMap::new(),
             })),
         }
+    }
+
+    /// Refills the queue with all original hosts, resetting attempt counts.
+    /// Used when host reuse is allowed and the queue is exhausted.
+    pub fn refill(&self) -> Result<(), QueueError> {
+        let mut inner = self.inner.lock().map_err(|_| QueueError::MutexError)?;
+        inner.attempts.clear();
+        inner.hosts = inner.all_hosts.iter().copied().collect();
+        Ok(())
     }
 
     pub fn pop_front(&self) -> Result<(PublicKey, usize), QueueError> {
