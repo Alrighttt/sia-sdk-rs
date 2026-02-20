@@ -489,13 +489,9 @@ impl SDK {
             ..self.inner.default_download_options()
         };
 
-        // Buffer writes to avoid crossing the WASM→JS boundary for every
-        // 64-byte segment.  Without this, a 40 MB slab generates ~625 000
-        // individual JS calls and Promises, which crashes the browser.
-        let mut writer = tokio::io::BufWriter::with_capacity(
-            4 * 1024 * 1024, // 4 MiB — flushes ~10 times per slab
-            ChunkWriter { callback: on_chunk.clone() },
-        );
+        let mut writer = ChunkWriter {
+            callback: on_chunk.clone(),
+        };
 
         let on_progress = on_progress.clone();
         local
