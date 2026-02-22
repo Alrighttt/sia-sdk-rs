@@ -13,8 +13,6 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt, BufReader, SimplexStream, WriteHalf
 use tokio::sync::{OwnedSemaphorePermit, Semaphore, mpsc};
 use tokio::task::JoinSet;
 #[cfg(not(target_arch = "wasm32"))]
-use tokio::task::spawn_blocking;
-#[cfg(not(target_arch = "wasm32"))]
 use tokio::time::{Instant, sleep, timeout};
 #[cfg(not(target_arch = "wasm32"))]
 use tokio::time::error::Elapsed;
@@ -449,17 +447,10 @@ impl Uploader {
                 // It could probably be resolved by using a pool, but leaving that as a
                 // future optimization for now.
                 let encode_start = Instant::now();
-                #[cfg(not(target_arch = "wasm32"))]
-                let shards = spawn_blocking(move || -> erasure_coding::Result<Vec<Vec<u8>>> {
+                let shards = maybe_spawn_blocking!({
                     rs.encode_shards(&mut shards)?;
-                    Ok(shards)
-                })
-                .await??;
-                #[cfg(target_arch = "wasm32")]
-                let shards = {
-                    rs.encode_shards(&mut shards)?;
-                    shards
-                };
+                    Ok::<_, erasure_coding::Error>(shards)
+                })?;
                 debug!("slab {slab_index}: erasure encode took {:?}", encode_start.elapsed());
 
                 // generate a unique encryption key for the slab
@@ -484,17 +475,10 @@ impl Uploader {
                     // spawn a task to encrypt and upload each shard for this slab.
                     join_set_spawn!(shard_upload_tasks, async move {
                         let encrypt_start = Instant::now();
-                        #[cfg(not(target_arch = "wasm32"))]
-                        let shard = spawn_blocking(move || {
+                        let shard = maybe_spawn_blocking!({
                             encrypt_shard(&owned_slab_key, shard_index as u8, 0, &mut shard);
                             shard
-                        })
-                        .await?;
-                        #[cfg(target_arch = "wasm32")]
-                        let shard = {
-                            encrypt_shard(&owned_slab_key, shard_index as u8, 0, &mut shard);
-                            shard
-                        };
+                        });
                         debug!("slab {slab_index} shard {shard_index}: encrypt took {:?}", encrypt_start.elapsed());
                         Self::upload_slab_shard(
                             permit,
