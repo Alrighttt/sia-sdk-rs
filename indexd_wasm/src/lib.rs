@@ -308,6 +308,7 @@ impl SDK {
     pub async fn upload(
         &self,
         data: &[u8],
+        max_inflight: usize,
         on_progress: &js_sys::Function,
     ) -> Result<PinnedObject, JsError> {
         log::info!("upload: starting ({} bytes)", data.len());
@@ -321,8 +322,9 @@ impl SDK {
 
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
         let options = indexd::UploadOptions {
+            max_inflight,
             shard_uploaded: Some(tx),
-            ..self.inner.default_upload_options()
+            ..Default::default()
         };
 
         let rt = tokio::runtime::Builder::new_current_thread()
@@ -361,6 +363,7 @@ impl SDK {
     pub async fn download(
         &self,
         object: &PinnedObject,
+        max_inflight: usize,
         on_progress: &js_sys::Function,
     ) -> Result<Uint8Array, JsError> {
         let rt = tokio::runtime::Builder::new_current_thread()
@@ -375,8 +378,9 @@ impl SDK {
 
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
         let options = indexd::DownloadOptions {
+            max_inflight,
             slab_downloaded: Some(tx),
-            ..self.inner.default_download_options()
+            ..Default::default()
         };
 
         let on_progress = on_progress.clone();
@@ -408,6 +412,7 @@ impl SDK {
     pub async fn download_streaming(
         &self,
         object: &PinnedObject,
+        max_inflight: usize,
         on_chunk: &js_sys::Function,
         on_progress: &js_sys::Function,
     ) -> Result<(), JsError> {
@@ -452,8 +457,9 @@ impl SDK {
 
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
         let options = indexd::DownloadOptions {
+            max_inflight,
             slab_downloaded: Some(tx),
-            ..self.inner.default_download_options()
+            ..Default::default()
         };
 
         let mut writer = ChunkWriter {
@@ -490,6 +496,7 @@ impl SDK {
         &self,
         object: &PinnedObject,
         slab_index: u32,
+        max_inflight: usize,
     ) -> Result<Uint8Array, JsError> {
         let obj = object.inner.lock().map_err(to_js_err)?.clone();
         let slabs = obj.slabs();
@@ -507,9 +514,10 @@ impl SDK {
         let mut buf = vec![0u8; length as usize];
 
         let options = indexd::DownloadOptions {
+            max_inflight,
             offset,
             length: Some(length),
-            ..self.inner.default_download_options()
+            ..Default::default()
         };
 
         let rt = tokio::runtime::Builder::new_current_thread()
@@ -565,6 +573,7 @@ impl SDK {
         data: &[u8],
         data_key: &[u8],
         stream_offset: f64,
+        max_inflight: usize,
         on_progress: &js_sys::Function,
     ) -> Result<String, JsError> {
         let key = sia::encryption::EncryptionKey::try_from(data_key)
@@ -573,8 +582,11 @@ impl SDK {
         let total_shards: u32 = 30; // 10 data + 20 parity for one slab
 
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
-        let mut options = self.inner.default_upload_options();
-        options.shard_uploaded = Some(tx);
+        let options = indexd::UploadOptions {
+            max_inflight,
+            shard_uploaded: Some(tx),
+            ..Default::default()
+        };
 
         let rt = tokio::runtime::Builder::new_current_thread()
             .build()
@@ -700,6 +712,7 @@ impl SDK {
     pub async fn finalize_chunked_upload(
         &self,
         session_id: f64,
+        max_inflight: usize,
         on_progress: &js_sys::Function,
     ) -> Result<PinnedObject, JsError> {
         // Retrieve and remove the accumulated buffer
@@ -732,8 +745,9 @@ impl SDK {
 
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
         let options = indexd::UploadOptions {
+            max_inflight,
             shard_uploaded: Some(tx),
-            ..self.inner.default_upload_options()
+            ..Default::default()
         };
 
         let rt = tokio::runtime::Builder::new_current_thread()
@@ -800,6 +814,7 @@ impl SDK {
     pub fn streaming_upload(
         &self,
         total_size: f64,
+        max_inflight: usize,
         on_progress: &js_sys::Function,
     ) -> Result<StreamingUpload, JsError> {
         use indexd::js_chunked_reader::JsChunkedReader;
@@ -828,8 +843,9 @@ impl SDK {
 
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
         let options = indexd::UploadOptions {
+            max_inflight,
             shard_uploaded: Some(tx),
-            ..self.inner.default_upload_options()
+            ..Default::default()
         };
 
         let on_progress = on_progress.clone();
@@ -1042,54 +1058,6 @@ impl Builder {
         Ok(Builder {
             state: Arc::new(Mutex::new(Some(BuilderState::Disconnected(builder)))),
         })
-    }
-
-    /// Sets the maximum number of concurrent price fetches (default: 1).
-    /// Lower values = more stable, higher values = faster but may crash browser.
-    #[wasm_bindgen(js_name = "withMaxPriceFetches")]
-    pub fn with_max_price_fetches(&self, max: usize) -> Result<(), JsError> {
-        let mut state = self.state.lock().map_err(to_js_err)?;
-        if let Some(BuilderState::Disconnected(builder)) = state.take() {
-            let builder = builder.with_max_price_fetches(max);
-            *state = Some(BuilderState::Disconnected(builder));
-            Ok(())
-        } else {
-            Err(JsError::new(
-                "Can only set concurrency on disconnected builder",
-            ))
-        }
-    }
-
-    /// Sets the maximum number of concurrent downloads (default: 2).
-    /// Lower values = more stable, higher values = faster but may crash browser.
-    #[wasm_bindgen(js_name = "withMaxDownloads")]
-    pub fn with_max_downloads(&self, max: usize) -> Result<(), JsError> {
-        let mut state = self.state.lock().map_err(to_js_err)?;
-        if let Some(BuilderState::Disconnected(builder)) = state.take() {
-            let builder = builder.with_max_downloads(max);
-            *state = Some(BuilderState::Disconnected(builder));
-            Ok(())
-        } else {
-            Err(JsError::new(
-                "Can only set concurrency on disconnected builder",
-            ))
-        }
-    }
-
-    /// Sets the maximum number of concurrent uploads (default: 3).
-    /// Lower values = more stable, higher values = faster but may crash browser.
-    #[wasm_bindgen(js_name = "withMaxUploads")]
-    pub fn with_max_uploads(&self, max: usize) -> Result<(), JsError> {
-        let mut state = self.state.lock().map_err(to_js_err)?;
-        if let Some(BuilderState::Disconnected(builder)) = state.take() {
-            let builder = builder.with_max_uploads(max);
-            *state = Some(BuilderState::Disconnected(builder));
-            Ok(())
-        } else {
-            Err(JsError::new(
-                "Can only set concurrency on disconnected builder",
-            ))
-        }
     }
 
     /// Attempts to connect using an existing app key.

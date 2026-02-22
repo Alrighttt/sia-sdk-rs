@@ -99,8 +99,6 @@ pub(crate) struct Downloader {
     account_key: Arc<PrivateKey>,
     hosts: Hosts,
     transport: Arc<dyn RHP4Client>,
-    #[cfg(target_arch = "wasm32")]
-    default_max_inflight: usize,
 }
 
 struct SectorDownloadTask {
@@ -132,36 +130,11 @@ impl Downloader {
         Ok((task.index, data.to_vec()))
     }
 
-    #[cfg(not(target_arch = "wasm32"))]
     pub fn new(hosts: Hosts, transport: Arc<dyn RHP4Client>, account_key: Arc<PrivateKey>) -> Self {
         Self {
             account_key,
             hosts,
             transport,
-        }
-    }
-
-    #[cfg(target_arch = "wasm32")]
-    pub fn new(
-        hosts: Hosts,
-        transport: Arc<dyn RHP4Client>,
-        account_key: Arc<PrivateKey>,
-        default_max_inflight: usize,
-    ) -> Self {
-        Self {
-            account_key,
-            hosts,
-            transport,
-            default_max_inflight,
-        }
-    }
-
-    /// Returns default download options with the configured max_inflight.
-    #[cfg(target_arch = "wasm32")]
-    pub fn default_options(&self) -> DownloadOptions {
-        DownloadOptions {
-            max_inflight: self.default_max_inflight,
-            ..Default::default()
         }
     }
 

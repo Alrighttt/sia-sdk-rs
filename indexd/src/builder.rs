@@ -17,26 +17,6 @@ use crate::SDK;
 #[cfg(not(target_arch = "wasm32"))]
 use crate::quic;
 
-/// Configuration for concurrency limits (WASM only).
-#[cfg(target_arch = "wasm32")]
-#[derive(Debug, Clone, Copy)]
-pub struct ConcurrencyConfig {
-    pub max_price_fetches: usize,
-    pub max_downloads: usize,
-    pub max_uploads: usize,
-}
-
-#[cfg(target_arch = "wasm32")]
-impl Default for ConcurrencyConfig {
-    fn default() -> Self {
-        Self {
-            max_price_fetches: 10,
-            max_downloads: 20,
-            max_uploads: 16,
-        }
-    }
-}
-
 #[cfg(not(target_arch = "wasm32"))]
 use tokio::time::sleep;
 
@@ -67,11 +47,6 @@ pub struct ApprovedState {
 pub struct Builder<S> {
     state: S,
     client: Arc<dyn AppClient>,
-    // FIXME this can be removed if neccesary
-    // this is needed to allow the webapp user to set their own
-    // concurrency settings. Now being used to determine reasonable settings.
-    #[cfg(target_arch = "wasm32")]
-    concurrency: ConcurrencyConfig,
 }
 
 /// Errors that can occur during the SDK building process.
@@ -109,37 +84,7 @@ impl Builder<DisconnectedState> {
         Ok(Self {
             state: DisconnectedState,
             client: Arc::new(client),
-            #[cfg(target_arch = "wasm32")]
-            concurrency: ConcurrencyConfig::default(),
         })
-    }
-
-    /// Sets the concurrency configuration (WASM only).
-    #[cfg(target_arch = "wasm32")]
-    pub fn with_concurrency(mut self, config: ConcurrencyConfig) -> Self {
-        self.concurrency = config;
-        self
-    }
-
-    /// Sets the maximum number of concurrent price fetches (WASM only).
-    #[cfg(target_arch = "wasm32")]
-    pub fn with_max_price_fetches(mut self, max: usize) -> Self {
-        self.concurrency.max_price_fetches = max;
-        self
-    }
-
-    /// Sets the maximum number of concurrent downloads (WASM only).
-    #[cfg(target_arch = "wasm32")]
-    pub fn with_max_downloads(mut self, max: usize) -> Self {
-        self.concurrency.max_downloads = max;
-        self
-    }
-
-    /// Sets the maximum number of concurrent uploads (WASM only).
-    #[cfg(target_arch = "wasm32")]
-    pub fn with_max_uploads(mut self, max: usize) -> Self {
-        self.concurrency.max_uploads = max;
-        self
     }
 
     /// Attempts to connect using the provided app key and TLS configuration.
@@ -174,12 +119,7 @@ impl Builder<DisconnectedState> {
             return Ok(None);
         }
 
-        let sdk = SDK::new(
-            self.client.clone(),
-            Arc::new(app_key.clone()),
-            self.concurrency,
-        )
-        .await?;
+        let sdk = SDK::new(self.client.clone(), Arc::new(app_key.clone())).await?;
         Ok(Some(sdk))
     }
 
@@ -212,8 +152,6 @@ impl Builder<DisconnectedState> {
                 expiration: response.expiration,
             },
             client: self.client,
-            #[cfg(target_arch = "wasm32")]
-            concurrency: self.concurrency,
         })
     }
 }
@@ -250,8 +188,6 @@ impl Builder<RequestingApprovalState> {
                         user_secret,
                     },
                     client: self.client,
-                    #[cfg(target_arch = "wasm32")]
-                    concurrency: self.concurrency,
                 });
             }
             sleep(Duration::from_secs(5)).await;
@@ -298,12 +234,7 @@ impl Builder<ApprovedState> {
         self.client
             .register_app(&app_key, self.state.register_url.clone())
             .await?;
-        SDK::new(
-            self.client,
-            Arc::new(app_key),
-            self.concurrency,
-        )
-        .await
+        SDK::new(self.client, Arc::new(app_key)).await
     }
 }
 

@@ -211,12 +211,9 @@ pub(crate) struct Uploader {
     app_key: Arc<PrivateKey>,
     hosts: Hosts,
     transport: Arc<dyn RHP4Client>,
-    #[cfg(target_arch = "wasm32")]
-    default_max_inflight: usize,
 }
 
 impl Uploader {
-    #[cfg(not(target_arch = "wasm32"))]
     pub fn new(hosts: Hosts, transport: Arc<dyn RHP4Client>, app_key: Arc<PrivateKey>) -> Self {
         Uploader {
             app_key,
@@ -225,34 +222,10 @@ impl Uploader {
         }
     }
 
-    #[cfg(target_arch = "wasm32")]
-    pub fn new(
-        hosts: Hosts,
-        transport: Arc<dyn RHP4Client>,
-        app_key: Arc<PrivateKey>,
-        default_max_inflight: usize,
-    ) -> Self {
-        Uploader {
-            app_key,
-            hosts,
-            transport,
-            default_max_inflight,
-        }
-    }
-
     /// Configures this uploader as one of N parallel workers.
     /// See [`Hosts::set_upload_worker`].
     pub fn set_upload_worker(&self, worker_index: usize, num_workers: usize) {
         self.hosts.set_upload_worker(worker_index, num_workers);
-    }
-
-    /// Returns default upload options with the configured max_inflight.
-    #[cfg(target_arch = "wasm32")]
-    pub fn default_options(&self) -> UploadOptions {
-        UploadOptions {
-            max_inflight: self.default_max_inflight,
-            ..Default::default()
-        }
     }
 
     async fn upload_shard(

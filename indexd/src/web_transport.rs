@@ -4,8 +4,6 @@ use std::pin::Pin;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, RwLock};
 use std::task::{Context, Poll};
-use tokio::sync::Semaphore;
-
 static PENDING_SESSIONS: AtomicUsize = AtomicUsize::new(0);
 static ACTIVE_SESSIONS: AtomicUsize = AtomicUsize::new(0);
 
@@ -293,17 +291,15 @@ pub struct Client {
     hosts: Hosts,
     cached_prices: Arc<RwLock<HashMap<PublicKey, HostPrices>>>,
     cached_tokens: Arc<RwLock<HashMap<PublicKey, AccountToken>>>,
-    price_fetch_semaphore: Arc<Semaphore>,
     connection_pool: Arc<RwLock<HashMap<PublicKey, Arc<Connection>>>>,
 }
 
 impl Client {
-    pub fn new(hosts: Hosts, max_price_fetches: usize) -> Client {
+    pub fn new(hosts: Hosts) -> Client {
         Client {
             hosts,
             cached_prices: Arc::new(RwLock::new(HashMap::new())),
             cached_tokens: Arc::new(RwLock::new(HashMap::new())),
-            price_fetch_semaphore: Arc::new(Semaphore::new(max_price_fetches)),
             connection_pool: Arc::new(RwLock::new(HashMap::new())),
         }
     }
@@ -429,23 +425,6 @@ impl RHP4Client for Client {
             if !refresh {
                 if let Some(prices) = self.get_cached_prices(&host_key) {
                     debug!("host_prices: using cached prices for {host_key}");
-                    return Ok(prices);
-                }
-            }
-
-            // Acquire semaphore permit to limit concurrent price fetches
-            let _permit = self
-                .price_fetch_semaphore
-                .acquire()
-                .await
-                .map_err(|e| Error::Transport(format!("semaphore error: {}", e)))?;
-
-            // Check cache again in case another task fetched while we were waiting
-            if !refresh {
-                if let Some(prices) = self.get_cached_prices(&host_key) {
-                    debug!(
-                        "host_prices: using cached prices for {host_key} (fetched by other task)"
-                    );
                     return Ok(prices);
                 }
             }

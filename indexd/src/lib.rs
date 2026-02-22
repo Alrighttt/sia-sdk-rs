@@ -76,17 +76,6 @@ pub struct SDK {
 }
 
 impl SDK {
-    /// Returns default download options with the configured concurrency settings.
-    #[cfg(target_arch = "wasm32")]
-    pub fn default_download_options(&self) -> DownloadOptions {
-        self.downloader.default_options()
-    }
-
-    /// Returns default upload options with the configured concurrency settings.
-    #[cfg(target_arch = "wasm32")]
-    pub fn default_upload_options(&self) -> UploadOptions {
-        self.uploader.default_options()
-    }
     /// Creates a new SDK instance.
     #[cfg(not(target_arch = "wasm32"))]
     async fn new(
@@ -116,7 +105,6 @@ impl SDK {
     async fn new(
         api_client: Arc<dyn AppClient>,
         app_key: Arc<PrivateKey>,
-        concurrency: crate::builder::ConcurrencyConfig,
     ) -> Result<Self, BuilderError> {
         // Fetch only QUIC hosts — WASM uses WebTransport which requires QUIC.
         let usable_hosts = api_client.hosts(&app_key, HostQuery {
@@ -126,19 +114,17 @@ impl SDK {
         let hosts = Hosts::new();
         hosts.update(usable_hosts);
 
-        let transport = web_transport::Client::new(hosts.clone(), concurrency.max_price_fetches);
+        let transport = web_transport::Client::new(hosts.clone());
 
         let downloader = Downloader::new(
             hosts.clone(),
             Arc::new(transport.clone()),
             app_key.clone(),
-            concurrency.max_downloads,
         );
         let uploader = Uploader::new(
             hosts.clone(),
             Arc::new(transport),
             app_key.clone(),
-            concurrency.max_uploads,
         );
         Ok(Self {
             app_key,
