@@ -40,7 +40,6 @@ fn get_streaming_readers()
 fn init_panic_hook() {
     console_error_panic_hook::set_once();
     console_log::init_with_level(log::Level::Info).ok();
-    log::info!("indexd WASM initialized");
 }
 
 /// Sets the log level filter. Accepts "debug", "info", "warn", or "error".
