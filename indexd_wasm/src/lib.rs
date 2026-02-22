@@ -43,6 +43,19 @@ fn init_panic_hook() {
     log::info!("indexd WASM initialized");
 }
 
+/// Sets the log level filter. Accepts "debug", "info", "warn", or "error".
+/// Allows JavaScript to control the verbosity of Rust logs at runtime.
+#[wasm_bindgen(js_name = "setLogLevel")]
+pub fn set_log_level(level: &str) {
+    let filter = match level {
+        "debug" => log::LevelFilter::Debug,
+        "warn" => log::LevelFilter::Warn,
+        "error" => log::LevelFilter::Error,
+        _ => log::LevelFilter::Info,
+    };
+    log::set_max_level(filter);
+}
+
 /// Converts a JsValue error context into a JsError.
 fn to_js_err(e: impl std::fmt::Display) -> JsError {
     JsError::new(&e.to_string())
