@@ -111,6 +111,3 @@ impl AsyncRead for JsChunkedReader {
         }
     }
 }
-
-// WASM is single-threaded, so Send is safe
-unsafe impl Send for JsChunkedReader {}
