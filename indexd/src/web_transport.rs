@@ -10,7 +10,9 @@ use chrono::Utc;
 use js_sys::{Reflect, Uint8Array};
 use log::debug;
 use sia::encoding_async::{AsyncDecoder, AsyncEncoder};
-use sia::rhp::{self, AccountToken, HostPrices, RPCReadSector, RPCSettings, RPCWriteSector, Transport};
+use sia::rhp::{
+    self, AccountToken, HostPrices, RPCReadSector, RPCSettings, RPCWriteSector, Transport,
+};
 use sia::signing::{PrivateKey, PublicKey};
 use sia::types::Hash256;
 use sia::types::v2::Protocol;
@@ -42,14 +44,52 @@ impl<F: Future> Future for SendFuture<F> {
     }
 }
 
-/// Wraps the browser's WebTransport bidirectional stream for use with
-/// the sia RHP4 protocol.
+/// A WebTransport connection to a host. Supports opening multiple
+/// bidirectional streams for sequential RPCs without reconnecting.
+struct Connection {
+    transport: web_sys::WebTransport,
+}
+
+impl Drop for Connection {
+    fn drop(&mut self) {
+        self.transport.close();
+    }
+}
+
+impl Connection {
+    /// Opens a new bidirectional stream on this connection.
+    async fn open_stream(&self) -> Result<Stream, Error> {
+        let bidi_stream = JsFuture::from(self.transport.create_bidirectional_stream())
+            .await
+            .map_err(|e| Error::Transport(format!("createBidirectionalStream error: {:?}", e)))?;
+
+        let bidi = web_sys::WebTransportBidirectionalStream::from(bidi_stream);
+        let reader = bidi
+            .readable()
+            .get_reader()
+            .dyn_into::<ReadableStreamDefaultReader>()
+            .map_err(|e| Error::Transport(format!("get_reader error: {:?}", e)))?;
+        let writer = bidi
+            .writable()
+            .get_writer()
+            .map_err(|e| Error::Transport(format!("get_writer error: {:?}", e)))?;
+
+        Ok(Stream {
+            reader,
+            writer,
+            read_buf: Vec::new(),
+        })
+    }
+}
+
+/// A bidirectional stream on a WebTransport connection, used for a
+/// single RHP4 RPC. The stream does not own the underlying connection —
+/// the [`Connection`] must be kept alive for the stream's lifetime.
 struct Stream {
     reader: ReadableStreamDefaultReader,
     writer: WritableStreamDefaultWriter,
     read_buf: Vec<u8>,
 }
-
 
 impl Stream {
     /// Read exactly `buf.len()` bytes from the stream, buffering as needed.
@@ -132,10 +172,7 @@ impl Transport for Stream {
         R::decode_response(self).await
     }
 
-    async fn write_response<RR: rhp::RPCResponse>(
-        &mut self,
-        resp: &RR,
-    ) -> Result<(), Self::Error> {
+    async fn write_response<RR: rhp::RPCResponse>(&mut self, resp: &RR) -> Result<(), Self::Error> {
         resp.encode_response(self).await?;
         Ok(())
     }
@@ -156,10 +193,10 @@ fn suppress_closed_rejection(wt: &web_sys::WebTransport) {
 /// The WebTransport URL path for the RHP4 protocol.
 const RHP4_PATH: &str = "/sia/rhp/v4";
 
-/// Opens a WebTransport connection to the given address and creates
-/// a bidirectional stream. If the address is a bare `host:port`, the
-/// RHP4 path (`/sia/rhp/v4`) is appended automatically.
-async fn connect_stream(address: &str) -> Result<Stream, Error> {
+/// Opens a WebTransport connection to the given address. The connection
+/// can be used to open multiple bidirectional streams via
+/// [`Connection::open_stream`].
+async fn connect(address: &str) -> Result<Connection, Error> {
     let url = if address.starts_with("https://") {
         address.to_string()
     } else if address.contains('/') {
@@ -177,42 +214,24 @@ async fn connect_stream(address: &str) -> Result<Stream, Error> {
 
     suppress_closed_rejection(&wt);
 
-    JsFuture::from(wt.ready())
+    // Wrap immediately so .close() is called if ready() fails or
+    // the future is cancelled (e.g. by a timeout in tokio::select!).
+    let conn = Connection { transport: wt };
+
+    JsFuture::from(conn.transport.ready())
         .await
         .map_err(|e| Error::Transport(format!("WebTransport ready error: {:?}", e)))?;
 
     debug!("WebTransport connected to {url}");
-
-    let bidi_stream = JsFuture::from(wt.create_bidirectional_stream())
-        .await
-        .map_err(|e| Error::Transport(format!("createBidirectionalStream error: {:?}", e)))?;
-
-    let bidi = web_sys::WebTransportBidirectionalStream::from(bidi_stream);
-    let reader = bidi
-        .readable()
-        .get_reader()
-        .dyn_into::<ReadableStreamDefaultReader>()
-        .map_err(|e| Error::Transport(format!("get_reader error: {:?}", e)))?;
-    let writer = bidi
-        .writable()
-        .get_writer()
-        .map_err(|e| Error::Transport(format!("get_writer error: {:?}", e)))?;
-
-    Ok(Stream {
-        reader,
-        writer,
-        read_buf: Vec::new(),
-    })
+    Ok(conn)
 }
 
 /// Connects to a host at the given address via WebTransport and fetches
 /// its settings using the RHP4 settings RPC.
 pub async fn fetch_host_settings(address: &str) -> Result<HostSettings, Error> {
-    let stream = connect_stream(address).await?;
-    let resp = RPCSettings::send_request(stream)
-        .await?
-        .complete()
-        .await?;
+    let conn = connect(address).await?;
+    let stream = conn.open_stream().await?;
+    let resp = RPCSettings::send_request(stream).await?.complete().await?;
     Ok(resp.settings)
 }
 
@@ -230,7 +249,6 @@ impl Client {
             hosts,
             cached_prices: std::sync::Arc::new(RwLock::new(HashMap::new())),
             cached_tokens: std::sync::Arc::new(RwLock::new(HashMap::new())),
-            // Limit concurrent price fetches to prevent browser connection overload
             price_fetch_semaphore: std::sync::Arc::new(Semaphore::new(max_price_fetches)),
         }
     }
@@ -268,9 +286,7 @@ impl Client {
         }
     }
 
-    /// Connects to a host via WebTransport and opens a bidirectional stream.
-    /// Tries all QUIC addresses for a host before giving up.
-    async fn host_stream(&self, host_key: PublicKey) -> Result<Stream, Error> {
+    async fn host_connection(&self, host_key: PublicKey) -> Result<Connection, Error> {
         let addresses = self
             .hosts
             .addresses(&host_key)
@@ -282,10 +298,13 @@ impl Client {
                 continue;
             }
 
-            match connect_stream(&addr.address).await {
-                Ok(stream) => return Ok(stream),
+            match connect(&addr.address).await {
+                Ok(conn) => return Ok(conn),
                 Err(e) => {
-                    debug!("connection to {host_key} at {} failed: {e}", addr.address);
+                    debug!(
+                        "host_connection({host_key}): connect to {} failed: {e}",
+                        addr.address
+                    );
                     last_err = Some(e);
                 }
             }
@@ -296,6 +315,29 @@ impl Client {
                 "no QUIC/WebTransport address found for host {host_key}"
             ))
         }))
+    }
+
+    /// Fetches host prices, either from cache or by running the settings
+    /// RPC on the provided connection. This avoids opening a second
+    /// WebTransport session just for the price fetch.
+    async fn get_or_fetch_prices(
+        &self,
+        host_key: &PublicKey,
+        conn: &Connection,
+        refresh: bool,
+    ) -> Result<HostPrices, Error> {
+        if !refresh {
+            if let Some(prices) = self.get_cached_prices(host_key) {
+                debug!("get_or_fetch_prices: using cached prices for {host_key}");
+                return Ok(prices);
+            }
+        }
+
+        debug!("get_or_fetch_prices: fetching prices from {host_key}");
+        let stream = conn.open_stream().await?;
+        let resp = RPCSettings::send_request(stream).await?.complete().await?;
+        self.set_cached_prices(host_key, resp.settings.prices.clone());
+        Ok(resp.settings.prices)
     }
 }
 
@@ -320,23 +362,26 @@ impl RHP4Client for Client {
             }
 
             // Acquire semaphore permit to limit concurrent price fetches
-            let _permit = self.price_fetch_semaphore.acquire().await
+            let _permit = self
+                .price_fetch_semaphore
+                .acquire()
+                .await
                 .map_err(|e| Error::Transport(format!("semaphore error: {}", e)))?;
 
             // Check cache again in case another task fetched while we were waiting
             if !refresh {
                 if let Some(prices) = self.get_cached_prices(&host_key) {
-                    debug!("host_prices: using cached prices for {host_key} (fetched by other task)");
+                    debug!(
+                        "host_prices: using cached prices for {host_key} (fetched by other task)"
+                    );
                     return Ok(prices);
                 }
             }
 
             debug!("host_prices: fetching prices from {host_key}");
-            let stream = self.host_stream(host_key).await?;
-            let resp = RPCSettings::send_request(stream)
-                .await?
-                .complete()
-                .await?;
+            let conn = self.host_connection(host_key).await?;
+            let stream = conn.open_stream().await?;
+            let resp = RPCSettings::send_request(stream).await?.complete().await?;
 
             debug!("host_prices: got prices from {host_key}");
             self.set_cached_prices(&host_key, resp.settings.prices.clone());
@@ -356,10 +401,9 @@ impl RHP4Client for Client {
         Self: 'async_trait,
     {
         Box::pin(SendFuture(async move {
-            debug!("write_sector: getting prices for {host_key}");
-            let prices = self.host_prices(host_key, false).await?;
-            debug!("write_sector: connecting to {host_key}");
-            let stream = self.host_stream(host_key).await?;
+            let conn = self.host_connection(host_key).await?;
+            let prices = self.get_or_fetch_prices(&host_key, &conn, false).await?;
+            let stream = conn.open_stream().await?;
             let token = self.account_token(account_key, host_key);
             debug!("write_sector: sending {} bytes to {host_key}", sector.len());
             let resp = RPCWriteSector::send_request(stream, prices, token, sector)
@@ -385,14 +429,14 @@ impl RHP4Client for Client {
         Self: 'async_trait,
     {
         Box::pin(SendFuture(async move {
-            let prices = self.host_prices(host_key, false).await?;
-            let stream = self.host_stream(host_key).await?;
+            let conn = self.host_connection(host_key).await?;
+            let prices = self.get_or_fetch_prices(&host_key, &conn, false).await?;
+            let stream = conn.open_stream().await?;
             let token = self.account_token(account_key, host_key);
-            let resp =
-                RPCReadSector::send_request(stream, prices, token, root, offset, length)
-                    .await?
-                    .complete()
-                    .await?;
+            let resp = RPCReadSector::send_request(stream, prices, token, root, offset, length)
+                .await?
+                .complete()
+                .await?;
             Ok(resp.data)
         }))
     }
