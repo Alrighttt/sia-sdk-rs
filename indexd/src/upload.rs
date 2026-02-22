@@ -12,12 +12,11 @@ use thiserror::Error;
 use tokio::io::{AsyncReadExt, AsyncWriteExt, BufReader, SimplexStream, WriteHalf, copy, simplex};
 use tokio::sync::{OwnedSemaphorePermit, Semaphore, mpsc};
 use tokio::task::JoinSet;
+use crate::{Instant, sleep};
 #[cfg(not(target_arch = "wasm32"))]
-use tokio::time::{Instant, sleep, timeout};
+use tokio::time::timeout;
 #[cfg(not(target_arch = "wasm32"))]
 use tokio::time::error::Elapsed;
-#[cfg(target_arch = "wasm32")]
-use crate::wasm_time::{Instant, sleep};
 use tokio_util::task::AbortOnDropHandle;
 
 use crate::hosts::{HostQueue, QueueError};

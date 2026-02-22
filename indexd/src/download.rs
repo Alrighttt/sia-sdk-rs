@@ -3,8 +3,7 @@ use std::fmt::Debug;
 use std::sync::Arc;
 use std::time::Duration;
 
-#[cfg(target_arch = "wasm32")]
-use crate::wasm_time::sleep;
+use crate::sleep;
 use log::debug;
 use sia::encryption::{EncryptionKey, encrypt_shard};
 use sia::erasure_coding::{self, ErasureCoder};
@@ -16,8 +15,6 @@ use tokio::sync::{OwnedSemaphorePermit, Semaphore, mpsc};
 use tokio::task::JoinSet;
 #[cfg(not(target_arch = "wasm32"))]
 use tokio::time::error::Elapsed;
-#[cfg(not(target_arch = "wasm32"))]
-use tokio::time::sleep;
 
 use crate::rhp4::RHP4Client;
 use crate::{Hosts, Object, Sector};

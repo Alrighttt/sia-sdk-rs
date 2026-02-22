@@ -17,11 +17,7 @@ use crate::SDK;
 #[cfg(not(target_arch = "wasm32"))]
 use crate::quic;
 
-#[cfg(not(target_arch = "wasm32"))]
-use tokio::time::sleep;
-
-#[cfg(target_arch = "wasm32")]
-use crate::wasm_time::sleep;
+use crate::sleep;
 
 
 /// The initial state of the SDK builder, before connecting to the indexd service.

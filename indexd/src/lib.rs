@@ -65,6 +65,12 @@ pub mod web_transport;
 #[cfg(target_arch = "wasm32")]
 pub(crate) mod wasm_time;
 
+// Unified re-exports so consumers don't need cfg-gated imports.
+#[cfg(not(target_arch = "wasm32"))]
+pub(crate) use tokio::time::{sleep, Instant};
+#[cfg(target_arch = "wasm32")]
+pub(crate) use wasm_time::{sleep, Instant};
+
 #[cfg(target_arch = "wasm32")]
 pub mod js_chunked_reader;
 
