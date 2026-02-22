@@ -57,7 +57,7 @@ impl AsyncRead for JsChunkedReader {
         cx: &mut Context<'_>,
         buf: &mut tokio::io::ReadBuf<'_>,
     ) -> Poll<io::Result<()>> {
-        let mut state = self.state.lock().unwrap();
+        let mut state = self.state.lock().expect("WASM is single-threaded; mutex cannot be poisoned");
 
         // Check for error first
         if let Some(error) = &state.error {
@@ -66,25 +66,18 @@ impl AsyncRead for JsChunkedReader {
 
         loop {
             // Try to read from current chunk if available
-            if state.current_chunk.is_some() {
-                let chunk_len = state.current_chunk.as_ref().unwrap().len();
-                let available = chunk_len - state.position;
+            if let Some(chunk) = &state.current_chunk {
+                let available = chunk.len() - state.position;
 
                 if available > 0 {
-                    // We have data to read from current chunk
                     let to_read = available.min(buf.remaining());
                     let start = state.position;
                     let end = start + to_read;
 
-                    // Extract the slice, copying it into buf
-                    // We need to get the data out before mutating state
-                    buf.put_slice(&state.current_chunk.as_ref().unwrap()[start..end]);
-
-                    // Now we can mutate state
+                    buf.put_slice(&chunk[start..end]);
                     state.position = end;
 
-                    // If we've consumed the entire chunk, clear it
-                    if state.position >= chunk_len {
+                    if state.position >= chunk.len() {
                         state.current_chunk = None;
                         state.position = 0;
                     }
