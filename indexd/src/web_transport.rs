@@ -305,15 +305,15 @@ impl Client {
     }
 
     fn evict_connection(&self, host_key: &PublicKey) {
-        self.connection_pool.write().unwrap().remove(host_key);
+        self.connection_pool.write().expect("WASM is single-threaded; lock cannot be poisoned").remove(host_key);
     }
 
     fn evict_prices(&self, host_key: &PublicKey) {
-        self.cached_prices.write().unwrap().remove(host_key);
+        self.cached_prices.write().expect("WASM is single-threaded; lock cannot be poisoned").remove(host_key);
     }
 
     fn get_cached_prices(&self, host_key: &PublicKey) -> Option<HostPrices> {
-        let cache = self.cached_prices.read().unwrap();
+        let cache = self.cached_prices.read().expect("WASM is single-threaded; lock cannot be poisoned");
         match cache.get(host_key) {
             Some(prices) if prices.valid_until > Utc::now() => Some(prices.clone()),
             _ => None,
@@ -323,13 +323,13 @@ impl Client {
     fn set_cached_prices(&self, host_key: &PublicKey, prices: HostPrices) {
         self.cached_prices
             .write()
-            .unwrap()
+            .expect("WASM is single-threaded; lock cannot be poisoned")
             .insert(*host_key, prices);
     }
 
     fn account_token(&self, account_key: &PrivateKey, host_key: PublicKey) -> AccountToken {
         let cached = {
-            let cache = self.cached_tokens.read().unwrap();
+            let cache = self.cached_tokens.read().expect("WASM is single-threaded; lock cannot be poisoned");
             cache.get(&host_key).cloned()
         };
         match cached {
@@ -338,7 +338,7 @@ impl Client {
                 let token = AccountToken::new(account_key, host_key);
                 self.cached_tokens
                     .write()
-                    .unwrap()
+                    .expect("WASM is single-threaded; lock cannot be poisoned")
                     .insert(host_key, token.clone());
                 token
             }
@@ -347,7 +347,7 @@ impl Client {
 
     async fn host_connection(&self, host_key: PublicKey) -> Result<Arc<Connection>, Error> {
         // Check pool first
-        if let Some(conn) = self.connection_pool.read().unwrap().get(&host_key).cloned() {
+        if let Some(conn) = self.connection_pool.read().expect("WASM is single-threaded; lock cannot be poisoned").get(&host_key).cloned() {
             return Ok(conn);
         }
 
@@ -368,7 +368,7 @@ impl Client {
                     let conn = Arc::new(conn);
                     self.connection_pool
                         .write()
-                        .unwrap()
+                        .expect("WASM is single-threaded; lock cannot be poisoned")
                         .insert(host_key, conn.clone());
                     return Ok(conn);
                 }
