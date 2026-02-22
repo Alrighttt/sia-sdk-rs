@@ -289,7 +289,6 @@ impl Hosts {
                 .get_priority(b)
                 .cmp(&preferred_hosts.get_priority(a))
         });
-
         HostQueue::new(hosts)
     }
 
