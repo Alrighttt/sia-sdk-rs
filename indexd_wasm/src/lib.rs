@@ -1,6 +1,7 @@
 use std::collections::HashMap;
 use std::io::Cursor;
 use std::pin::Pin;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::task::{Context, Poll};
 
@@ -13,6 +14,9 @@ use std::str::FromStr;
 use std::time::SystemTime;
 use tokio::io::AsyncWrite;
 use wasm_bindgen::prelude::*;
+
+/// Monotonically increasing ID counter for upload sessions and streaming readers
+static NEXT_ID: AtomicUsize = AtomicUsize::new(1);
 
 /// Global storage for chunked upload buffers
 /// Key: session_id (usize), Value: (pre-allocated buffer, current offset)
@@ -636,7 +640,7 @@ impl SDK {
     /// Note: Due to WASM 32-bit limitations, maximum file size is approximately 1.5 GB.
     #[wasm_bindgen(js_name = "startChunkedUpload")]
     pub fn start_chunked_upload(&self, total_size: f64) -> Result<f64, JsError> {
-        let session_id = self as *const _ as usize as f64;
+        let session_id = NEXT_ID.fetch_add(1, Ordering::Relaxed) as f64;
         let size = total_size as usize;
 
         // WASM has a 32-bit address space, so we can't allocate more than ~2GB
@@ -812,7 +816,7 @@ impl SDK {
         use indexd::js_chunked_reader::JsChunkedReader;
 
         // Generate a unique reader ID
-        let reader_id = self as *const _ as usize;
+        let reader_id = NEXT_ID.fetch_add(1, Ordering::Relaxed);
 
         // Create the reader
         let reader = JsChunkedReader::new();
