@@ -57,7 +57,10 @@ impl AsyncRead for JsChunkedReader {
         cx: &mut Context<'_>,
         buf: &mut tokio::io::ReadBuf<'_>,
     ) -> Poll<io::Result<()>> {
-        let mut state = self.state.lock().expect("WASM is single-threaded; mutex cannot be poisoned");
+        let mut state = self
+            .state
+            .lock()
+            .expect("WASM is single-threaded; mutex cannot be poisoned");
 
         // Check for error first
         if let Some(error) = &state.error {
@@ -66,8 +69,10 @@ impl AsyncRead for JsChunkedReader {
 
         loop {
             // Try to read from current chunk if available
-            if let Some(chunk) = &state.current_chunk {
-                let available = chunk.len() - state.position;
+            if state.current_chunk.is_some() {
+                let chunk = state.current_chunk.as_ref().unwrap();
+                let chunk_len = chunk.len();
+                let available = chunk_len - state.position;
 
                 if available > 0 {
                     let to_read = available.min(buf.remaining());
@@ -75,9 +80,10 @@ impl AsyncRead for JsChunkedReader {
                     let end = start + to_read;
 
                     buf.put_slice(&chunk[start..end]);
+                    let _ = chunk; // release immutable borrow
                     state.position = end;
 
-                    if state.position >= chunk.len() {
+                    if state.position >= chunk_len {
                         state.current_chunk = None;
                         state.position = 0;
                     }
