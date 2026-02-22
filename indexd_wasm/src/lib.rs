@@ -536,14 +536,6 @@ impl SDK {
         Ok(Uint8Array::from(buf.as_slice()))
     }
 
-    /// Configures this SDK instance as one of N parallel upload workers.
-    /// The upload host queue is rotated by `workerIndex * (hostCount / numWorkers)`
-    /// so workers pick different hosts and avoid overlap.
-    #[wasm_bindgen(js_name = "setUploadWorker")]
-    pub fn set_upload_worker(&self, worker_index: usize, num_workers: usize) {
-        self.inner.set_upload_worker(worker_index, num_workers);
-    }
-
     /// Returns the slab data size in bytes (data_shards * SECTOR_SIZE).
     /// Used by JS to split files into slab-sized chunks for parallel upload.
     #[wasm_bindgen(js_name = "slabDataSize")]

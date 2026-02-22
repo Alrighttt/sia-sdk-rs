@@ -162,13 +162,6 @@ impl SDK {
         Ok(object)
     }
 
-    /// Configures this SDK instance as one of N parallel upload workers.
-    /// The upload host queue will be rotated so workers are evenly spaced
-    /// across the available hosts, avoiding overlap.
-    pub fn set_upload_worker(&self, worker_index: usize, num_workers: usize) {
-        self.uploader.set_upload_worker(worker_index, num_workers);
-    }
-
     /// Uploads a single slab's worth of raw data with object-level encryption
     /// applied at the given stream offset. Used by parallel upload workers.
     pub async fn upload_slab_raw(

@@ -222,12 +222,6 @@ impl Uploader {
         }
     }
 
-    /// Configures this uploader as one of N parallel workers.
-    /// See [`Hosts::set_upload_worker`].
-    pub fn set_upload_worker(&self, worker_index: usize, num_workers: usize) {
-        self.hosts.set_upload_worker(worker_index, num_workers);
-    }
-
     async fn upload_shard(
         transport: Arc<dyn RHP4Client>,
         hosts: HostQueue,
