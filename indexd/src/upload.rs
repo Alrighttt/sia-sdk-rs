@@ -338,7 +338,6 @@ impl Uploader {
         ));
         let semaphore = permit.semaphore();
         let mut total_failures: usize = 0;
-        let max_total_failures: usize = 30;
 
         loop {
             let active = tasks.len();
@@ -355,13 +354,7 @@ impl Uploader {
                         }
                         Err(e) => {
                             total_failures += 1;
-                            debug!("slab {slab_index} shard {shard_index} upload failed ({total_failures}/{max_total_failures}): {e:?}");
-
-                            if total_failures >= max_total_failures {
-                                return Err(UploadError::Rhp4(crate::rhp4::Error::Transport(
-                                    format!("failed to upload shard after {max_total_failures} attempts")
-                                )));
-                            }
+                            debug!("slab {slab_index} shard {shard_index} upload failed ({total_failures} total): {e:?}");
 
                             if tasks.is_empty() {
                                 let next_host = match hosts.pop_front() {
@@ -390,7 +383,7 @@ impl Uploader {
                             };
                             let (host_key, attempts) = next_host;
                             let write_timeout = Self::upload_timeout(attempts);
-                            Self::upload_shard(transport.clone(), hosts.clone(), host_key, account_key, data, write_timeout).await
+                            Self::upload_shard(transport.clone(), hosts, host_key, account_key, data, write_timeout).await
                         });
                     }
                 }
