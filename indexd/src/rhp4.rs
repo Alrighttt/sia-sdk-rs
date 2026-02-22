@@ -31,10 +31,22 @@ pub enum Error {
     Transport(String),
 }
 
+/// Conditional Send + Sync bound: required on native (for spawning across
+/// threads), trivially satisfied on WASM (single-threaded).
+#[cfg(not(target_arch = "wasm32"))]
+pub(crate) trait MaybeSendSync: Send + Sync {}
+#[cfg(not(target_arch = "wasm32"))]
+impl<T: Send + Sync> MaybeSendSync for T {}
+
+#[cfg(target_arch = "wasm32")]
+pub(crate) trait MaybeSendSync {}
+#[cfg(target_arch = "wasm32")]
+impl<T> MaybeSendSync for T {}
+
 /// Trait defining the operations that can be performed on a host.
 #[cfg_attr(target_arch = "wasm32", async_trait(?Send))]
 #[cfg_attr(not(target_arch = "wasm32"), async_trait)]
-pub(crate) trait RHP4Client: Send + Sync {
+pub(crate) trait RHP4Client: MaybeSendSync {
     async fn host_prices(&self, host_key: PublicKey, refresh: bool) -> Result<HostPrices, Error>;
     async fn write_sector(
         &self,

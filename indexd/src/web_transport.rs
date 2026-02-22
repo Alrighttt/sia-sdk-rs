@@ -1,8 +1,5 @@
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, RwLock};
-static PENDING_SESSIONS: AtomicUsize = AtomicUsize::new(0);
-static ACTIVE_SESSIONS: AtomicUsize = AtomicUsize::new(0);
 
 use async_trait::async_trait;
 use bytes::Bytes;
@@ -27,33 +24,14 @@ use crate::{Hosts, RHP4Client};
 
 /// A WebTransport connection to a host. Supports opening multiple
 /// bidirectional streams for sequential RPCs without reconnecting.
+#[derive(Debug)]
 struct Connection {
     transport: web_sys::WebTransport,
-    /// Whether this connection completed the WebTransport handshake.
-    /// Only active connections decrement ACTIVE_SESSIONS on drop.
-    active: bool,
-}
-
-// SAFETY: WASM is single-threaded; these types are never actually shared across threads.
-unsafe impl Send for Connection {}
-unsafe impl Sync for Connection {}
-
-impl std::fmt::Debug for Connection {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("Connection")
-            .field("active", &self.active)
-            .finish()
-    }
 }
 
 impl Drop for Connection {
     fn drop(&mut self) {
         self.transport.close();
-        if self.active {
-            let active = ACTIVE_SESSIONS.fetch_sub(1, Ordering::Relaxed) - 1;
-            let pending = PENDING_SESSIONS.load(Ordering::Relaxed);
-            debug!("[WT] connection dropped (pending={pending}, active={active})");
-        }
     }
 }
 
@@ -195,45 +173,25 @@ async fn connect(address: &str) -> Result<Connection, Error> {
         // Bare host:port — append the RHP4 path
         format!("https://{address}{RHP4_PATH}")
     };
-    let pending = PENDING_SESSIONS.fetch_add(1, Ordering::Relaxed) + 1;
-    let active = ACTIVE_SESSIONS.load(Ordering::Relaxed);
-    debug!("[WT] connecting to {url} (pending={pending}, active={active})");
+    debug!("[WT] connecting to {url}");
 
     let options = web_sys::WebTransportOptions::new();
     let wt = web_sys::WebTransport::new_with_options(&url, &options).map_err(|e| {
-        let pending = PENDING_SESSIONS.fetch_sub(1, Ordering::Relaxed) - 1;
-        debug!(
-            "[WT] constructor failed (pending={pending}, active={active}): {:?}",
-            e
-        );
         Error::Transport(format!("WebTransport constructor error: {:?}", e))
     })?;
 
     // Wrap immediately so .close() is called if ready() fails or
     // the future is cancelled (e.g. by a timeout in tokio::select!).
-    // active starts false — only set to true after successful handshake,
-    // so Drop won't decrement ACTIVE_SESSIONS for failed connections.
-    let mut conn = Connection {
-        transport: wt,
-        active: false,
-    };
+    let conn = Connection { transport: wt };
     let ready_promise = conn.transport.ready();
 
     match JsFuture::from(ready_promise).await {
         Ok(_) => {
-            conn.active = true;
-            let pending = PENDING_SESSIONS.fetch_sub(1, Ordering::Relaxed) - 1;
-            let active = ACTIVE_SESSIONS.fetch_add(1, Ordering::Relaxed) + 1;
-            debug!("[WT] connected to {url} (pending={pending}, active={active})");
+            debug!("[WT] connected to {url}");
             Ok(conn)
         }
         Err(e) => {
-            // conn.active is false, so Drop won't decrement ACTIVE_SESSIONS
-            let pending = PENDING_SESSIONS.fetch_sub(1, Ordering::Relaxed) - 1;
-            debug!(
-                "[WT] ready failed for {url} (pending={pending}, active={active}): {:?}",
-                e
-            );
+            debug!("[WT] ready failed for {url}: {:?}", e);
             Err(Error::Transport(format!(
                 "WebTransport ready error: {:?}",
                 e
