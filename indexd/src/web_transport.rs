@@ -200,18 +200,6 @@ impl Transport for Stream {
     }
 }
 
-/// Suppresses the unhandled promise rejection from `WebTransport.closed`.
-///
-/// When a WebTransport connection is rejected, both the `ready` and
-/// `closed` promises reject. If nobody catches `closed`, the browser
-/// logs an unhandled rejection warning.
-fn suppress_closed_rejection(wt: &web_sys::WebTransport) {
-    let closed = wt.closed();
-    let handler: Closure<dyn FnMut(JsValue)> = Closure::once(|_: JsValue| {});
-    let _ = closed.catch(&handler);
-    handler.forget(); // leak intentionally — called at most once per connection attempt
-}
-
 /// The WebTransport URL path for the RHP4 protocol.
 const RHP4_PATH: &str = "/sia/rhp/v4";
 
@@ -241,8 +229,6 @@ async fn connect(address: &str) -> Result<Connection, Error> {
         );
         Error::Transport(format!("WebTransport constructor error: {:?}", e))
     })?;
-
-    suppress_closed_rejection(&wt);
 
     // Wrap immediately so .close() is called if ready() fails or
     // the future is cancelled (e.g. by a timeout in tokio::select!).
@@ -305,15 +291,24 @@ impl Client {
     }
 
     fn evict_connection(&self, host_key: &PublicKey) {
-        self.connection_pool.write().expect("WASM is single-threaded; lock cannot be poisoned").remove(host_key);
+        self.connection_pool
+            .write()
+            .expect("WASM is single-threaded; lock cannot be poisoned")
+            .remove(host_key);
     }
 
     fn evict_prices(&self, host_key: &PublicKey) {
-        self.cached_prices.write().expect("WASM is single-threaded; lock cannot be poisoned").remove(host_key);
+        self.cached_prices
+            .write()
+            .expect("WASM is single-threaded; lock cannot be poisoned")
+            .remove(host_key);
     }
 
     fn get_cached_prices(&self, host_key: &PublicKey) -> Option<HostPrices> {
-        let cache = self.cached_prices.read().expect("WASM is single-threaded; lock cannot be poisoned");
+        let cache = self
+            .cached_prices
+            .read()
+            .expect("WASM is single-threaded; lock cannot be poisoned");
         match cache.get(host_key) {
             Some(prices) if prices.valid_until > Utc::now() => Some(prices.clone()),
             _ => None,
@@ -329,7 +324,10 @@ impl Client {
 
     fn account_token(&self, account_key: &PrivateKey, host_key: PublicKey) -> AccountToken {
         let cached = {
-            let cache = self.cached_tokens.read().expect("WASM is single-threaded; lock cannot be poisoned");
+            let cache = self
+                .cached_tokens
+                .read()
+                .expect("WASM is single-threaded; lock cannot be poisoned");
             cache.get(&host_key).cloned()
         };
         match cached {
@@ -347,7 +345,13 @@ impl Client {
 
     async fn host_connection(&self, host_key: PublicKey) -> Result<Arc<Connection>, Error> {
         // Check pool first
-        if let Some(conn) = self.connection_pool.read().expect("WASM is single-threaded; lock cannot be poisoned").get(&host_key).cloned() {
+        if let Some(conn) = self
+            .connection_pool
+            .read()
+            .expect("WASM is single-threaded; lock cannot be poisoned")
+            .get(&host_key)
+            .cloned()
+        {
             return Ok(conn);
         }
 
