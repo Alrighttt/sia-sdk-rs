@@ -7,6 +7,7 @@ use std::task::{Context, Poll};
 
 use indexd::app_client::{RegisterAppRequest, RegisterAppResponse};
 use js_sys::Uint8Array;
+use sia::rhp::SECTOR_SIZE;
 use sia::seed::Seed;
 use sia::signing::{PrivateKey, Signature};
 use sia::types::Hash256;
@@ -17,6 +18,117 @@ use wasm_bindgen::prelude::*;
 
 /// Monotonically increasing ID counter for upload sessions and streaming readers
 static NEXT_ID: AtomicUsize = AtomicUsize::new(1);
+
+/// Upload configuration exposed to JavaScript.
+#[wasm_bindgen]
+pub struct UploadOptions {
+    #[wasm_bindgen(js_name = "dataShards")]
+    pub data_shards: u8,
+    #[wasm_bindgen(js_name = "parityShards")]
+    pub parity_shards: u8,
+    #[wasm_bindgen(js_name = "maxInflight")]
+    pub max_inflight: usize,
+}
+
+#[wasm_bindgen]
+impl UploadOptions {
+    #[wasm_bindgen(constructor)]
+    pub fn new() -> UploadOptions {
+        let defaults = indexd::UploadOptions::default();
+        UploadOptions {
+            data_shards: defaults.data_shards,
+            parity_shards: defaults.parity_shards,
+            max_inflight: defaults.max_inflight,
+        }
+    }
+
+    #[wasm_bindgen(getter, js_name = "totalShardsPerSlab")]
+    pub fn total_shards_per_slab(&self) -> u32 {
+        self.data_shards as u32 + self.parity_shards as u32
+    }
+
+    /// Size in bytes of data per slab (data_shards * SECTOR_SIZE).
+    #[wasm_bindgen(js_name = "slabDataSize")]
+    pub fn slab_data_size(&self) -> f64 {
+        (self.data_shards as usize * SECTOR_SIZE) as f64
+    }
+
+    #[wasm_bindgen(js_name = "clone")]
+    pub fn js_clone(&self) -> UploadOptions {
+        UploadOptions {
+            data_shards: self.data_shards,
+            parity_shards: self.parity_shards,
+            max_inflight: self.max_inflight,
+        }
+    }
+}
+
+impl UploadOptions {
+    fn into_indexd(
+        self,
+        tx: Option<tokio::sync::mpsc::UnboundedSender<()>>,
+    ) -> indexd::UploadOptions {
+        indexd::UploadOptions {
+            data_shards: self.data_shards,
+            parity_shards: self.parity_shards,
+            max_inflight: self.max_inflight,
+            shard_uploaded: tx,
+        }
+    }
+}
+
+/// Download configuration exposed to JavaScript.
+#[wasm_bindgen]
+pub struct DownloadOptions {
+    #[wasm_bindgen(js_name = "maxInflight")]
+    pub max_inflight: usize,
+}
+
+#[wasm_bindgen]
+impl DownloadOptions {
+    #[wasm_bindgen(constructor)]
+    pub fn new() -> DownloadOptions {
+        let defaults = indexd::DownloadOptions::default();
+        DownloadOptions {
+            max_inflight: defaults.max_inflight,
+        }
+    }
+
+    #[wasm_bindgen(js_name = "clone")]
+    pub fn js_clone(&self) -> DownloadOptions {
+        DownloadOptions {
+            max_inflight: self.max_inflight,
+        }
+    }
+}
+
+impl DownloadOptions {
+    fn into_indexd(
+        self,
+        tx: Option<tokio::sync::mpsc::UnboundedSender<()>>,
+    ) -> indexd::DownloadOptions {
+        indexd::DownloadOptions {
+            max_inflight: self.max_inflight,
+            offset: 0,
+            length: None,
+            slab_downloaded: tx,
+        }
+    }
+
+    fn into_indexd_ranged(
+        self,
+        offset: u64,
+        length: u64,
+        tx: Option<tokio::sync::mpsc::UnboundedSender<()>>,
+    ) -> indexd::DownloadOptions {
+        indexd::DownloadOptions {
+            max_inflight: self.max_inflight,
+            offset,
+            length: Some(length),
+            slab_downloaded: tx,
+        }
+    }
+}
 
 /// Global storage for chunked upload buffers
 /// Key: session_id (usize), Value: (pre-allocated buffer, current offset)
@@ -312,24 +424,20 @@ impl SDK {
     pub async fn upload(
         &self,
         data: &[u8],
-        max_inflight: usize,
+        options: UploadOptions,
         on_progress: &js_sys::Function,
     ) -> Result<PinnedObject, JsError> {
         log::info!("upload: starting ({} bytes)", data.len());
-        let slab_data_size = 10usize * 4_194_304; // data_shards(10) * SECTOR_SIZE(4 MiB)
+        let slab_data_size = options.data_shards as usize * SECTOR_SIZE;
         let num_slabs = if data.is_empty() {
             0
         } else {
             data.len().div_ceil(slab_data_size)
         };
-        let total_shards = (num_slabs as u32) * 30; // 30 shards per slab (10 data + 20 parity)
+        let total_shards = (num_slabs as u32) * options.total_shards_per_slab();
 
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
-        let options = indexd::UploadOptions {
-            max_inflight,
-            shard_uploaded: Some(tx),
-            ..Default::default()
-        };
+        let options = options.into_indexd(Some(tx));
 
         let rt = tokio::runtime::Builder::new_current_thread()
             .build()
@@ -367,7 +475,7 @@ impl SDK {
     pub async fn download(
         &self,
         object: &PinnedObject,
-        max_inflight: usize,
+        options: DownloadOptions,
         on_progress: &js_sys::Function,
     ) -> Result<Uint8Array, JsError> {
         let rt = tokio::runtime::Builder::new_current_thread()
@@ -381,11 +489,7 @@ impl SDK {
         let mut buf = vec![0u8; size];
 
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
-        let options = indexd::DownloadOptions {
-            max_inflight,
-            slab_downloaded: Some(tx),
-            ..Default::default()
-        };
+        let options = options.into_indexd(Some(tx));
 
         let on_progress = on_progress.clone();
         local
@@ -416,7 +520,7 @@ impl SDK {
     pub async fn download_streaming(
         &self,
         object: &PinnedObject,
-        max_inflight: usize,
+        options: DownloadOptions,
         on_chunk: &js_sys::Function,
         on_progress: &js_sys::Function,
     ) -> Result<(), JsError> {
@@ -460,11 +564,7 @@ impl SDK {
         let total_slabs = obj.slabs().len() as u32;
 
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
-        let options = indexd::DownloadOptions {
-            max_inflight,
-            slab_downloaded: Some(tx),
-            ..Default::default()
-        };
+        let options = options.into_indexd(Some(tx));
 
         let mut writer = ChunkWriter {
             callback: on_chunk.clone(),
@@ -500,7 +600,7 @@ impl SDK {
         &self,
         object: &PinnedObject,
         slab_index: u32,
-        max_inflight: usize,
+        options: DownloadOptions,
     ) -> Result<Uint8Array, JsError> {
         let obj = object.inner.lock().map_err(to_js_err)?.clone();
         let slabs = obj.slabs();
@@ -517,12 +617,7 @@ impl SDK {
         let length = slabs[idx].length as u64;
         let mut buf = vec![0u8; length as usize];
 
-        let options = indexd::DownloadOptions {
-            max_inflight,
-            offset,
-            length: Some(length),
-            ..Default::default()
-        };
+        let options = options.into_indexd_ranged(offset, length, None);
 
         let rt = tokio::runtime::Builder::new_current_thread()
             .build()
@@ -540,11 +635,11 @@ impl SDK {
         Ok(Uint8Array::from(buf.as_slice()))
     }
 
-    /// Returns the slab data size in bytes (data_shards * SECTOR_SIZE).
-    /// Used by JS to split files into slab-sized chunks for parallel upload.
+    /// Returns the slab data size for default options (data_shards * SECTOR_SIZE).
+    /// Prefer `UploadOptions.slabDataSize()` for custom shard counts.
     #[wasm_bindgen(js_name = "slabDataSize")]
     pub fn slab_data_size(&self) -> f64 {
-        (10usize * 4_194_304) as f64 // data_shards(10) * SECTOR_SIZE(4 MiB)
+        UploadOptions::new().slab_data_size()
     }
 
     /// Generates a random 32-byte encryption key for object-level encryption.
@@ -569,20 +664,16 @@ impl SDK {
         data: &[u8],
         data_key: &[u8],
         stream_offset: f64,
-        max_inflight: usize,
+        options: UploadOptions,
         on_progress: &js_sys::Function,
     ) -> Result<String, JsError> {
         let key = sia::encryption::EncryptionKey::try_from(data_key)
             .map_err(|e| JsError::new(&format!("invalid data key: {e}")))?;
 
-        let total_shards: u32 = 30; // 10 data + 20 parity for one slab
+        let total_shards = options.total_shards_per_slab();
 
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
-        let options = indexd::UploadOptions {
-            max_inflight,
-            shard_uploaded: Some(tx),
-            ..Default::default()
-        };
+        let options = options.into_indexd(Some(tx));
 
         let rt = tokio::runtime::Builder::new_current_thread()
             .build()
@@ -708,7 +799,7 @@ impl SDK {
     pub async fn finalize_chunked_upload(
         &self,
         session_id: f64,
-        max_inflight: usize,
+        options: UploadOptions,
         on_progress: &js_sys::Function,
     ) -> Result<PinnedObject, JsError> {
         // Retrieve and remove the accumulated buffer
@@ -731,20 +822,16 @@ impl SDK {
         log::info!("finalizeChunkedUpload: uploading {} bytes", data.len());
 
         // Calculate progress metadata
-        let slab_data_size = 10usize * 4_194_304; // data_shards(10) * SECTOR_SIZE(4 MiB)
+        let slab_data_size = options.data_shards as usize * SECTOR_SIZE;
         let num_slabs = if data.is_empty() {
             0
         } else {
             data.len().div_ceil(slab_data_size)
         };
-        let total_shards = (num_slabs as u32) * 30; // 30 shards per slab (10 data + 20 parity)
+        let total_shards = (num_slabs as u32) * options.total_shards_per_slab();
 
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
-        let options = indexd::UploadOptions {
-            max_inflight,
-            shard_uploaded: Some(tx),
-            ..Default::default()
-        };
+        let options = options.into_indexd(Some(tx));
 
         let rt = tokio::runtime::Builder::new_current_thread()
             .build()
@@ -810,7 +897,7 @@ impl SDK {
     pub fn streaming_upload(
         &self,
         total_size: f64,
-        max_inflight: usize,
+        options: UploadOptions,
         on_progress: &js_sys::Function,
     ) -> Result<StreamingUpload, JsError> {
         use indexd::js_chunked_reader::JsChunkedReader;
@@ -828,21 +915,17 @@ impl SDK {
         }
 
         // Calculate progress metadata
-        let slab_data_size = 10usize * 4_194_304; // data_shards(10) * SECTOR_SIZE(4 MiB)
+        let slab_data_size = options.data_shards as usize * SECTOR_SIZE;
         let size = total_size as usize;
         let num_slabs = if size == 0 {
             0
         } else {
             size.div_ceil(slab_data_size)
         };
-        let total_shards = (num_slabs as u32) * 30; // 30 shards per slab (10 data + 20 parity)
+        let total_shards = (num_slabs as u32) * options.total_shards_per_slab();
 
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
-        let options = indexd::UploadOptions {
-            max_inflight,
-            shard_uploaded: Some(tx),
-            ..Default::default()
-        };
+        let options = options.into_indexd(Some(tx));
 
         let on_progress = on_progress.clone();
         let inner = self.inner.clone();
