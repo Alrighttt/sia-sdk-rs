@@ -22,17 +22,6 @@ use tokio::time::sleep;
 use crate::rhp4::RHP4Client;
 use crate::{Hosts, Object, Sector};
 
-/// Spawns a task on a [`JoinSet`]. Uses `spawn` on native (requires `Send`)
-/// and `spawn_local` on WASM (runs on the current [`tokio::task::LocalSet`]).
-macro_rules! join_set_spawn {
-    ($set:expr, $fut:expr) => {{
-        #[cfg(not(target_arch = "wasm32"))]
-        $set.spawn($fut);
-        #[cfg(target_arch = "wasm32")]
-        $set.spawn_local($fut);
-    }};
-}
-
 #[derive(Debug, Error)]
 pub enum DownloadError {
     #[error("I/O error: {0}")]

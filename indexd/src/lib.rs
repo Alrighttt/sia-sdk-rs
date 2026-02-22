@@ -31,6 +31,17 @@ macro_rules! maybe_spawn_blocking {
     }};
 }
 
+/// Spawns a future on a [`tokio::task::JoinSet`]. Uses `spawn` on native
+/// and `spawn_local` on WASM.
+macro_rules! join_set_spawn {
+    ($set:expr, $fut:expr) => {{
+        #[cfg(not(target_arch = "wasm32"))]
+        $set.spawn($fut);
+        #[cfg(target_arch = "wasm32")]
+        $set.spawn_local($fut);
+    }};
+}
+
 mod upload;
 pub use upload::*;
 
