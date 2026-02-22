@@ -1,12 +1,10 @@
 use std::collections::HashMap;
-use std::future::Future;
-use std::pin::Pin;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, RwLock};
-use std::task::{Context, Poll};
 static PENDING_SESSIONS: AtomicUsize = AtomicUsize::new(0);
 static ACTIVE_SESSIONS: AtomicUsize = AtomicUsize::new(0);
 
+use async_trait::async_trait;
 use bytes::Bytes;
 use chrono::Utc;
 use js_sys::{Reflect, Uint8Array};
@@ -26,25 +24,6 @@ use sia::rhp::HostSettings;
 
 use crate::rhp4::Error;
 use crate::{Hosts, RHP4Client};
-
-/// Wraps a `!Send` future to satisfy `Send` bounds.
-///
-/// # Safety
-/// Only used on WASM where execution is single-threaded and `Send` is meaningless.
-struct SendFuture<F>(F);
-
-// SAFETY: WASM is single-threaded.
-unsafe impl<F> Send for SendFuture<F> {}
-
-impl<F: Future> Future for SendFuture<F> {
-    type Output = F::Output;
-
-    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
-        // SAFETY: We never move the inner future after pinning. The outer
-        // Pin guarantees structural pinning for the single field.
-        unsafe { self.map_unchecked_mut(|s| &mut s.0).poll(cx) }
-    }
-}
 
 /// A WebTransport connection to a host. Supports opening multiple
 /// bidirectional streams for sequential RPCs without reconnecting.
@@ -417,108 +396,83 @@ impl Client {
     }
 }
 
-/// Manual `RHP4Client` implementation that wraps `!Send` WASM futures in
-/// [`SendFuture`] so they satisfy the `Send` bound required by `#[async_trait]`.
+#[async_trait(?Send)]
 impl RHP4Client for Client {
-    fn host_prices<'life0, 'async_trait>(
-        &'life0 self,
-        host_key: PublicKey,
-        refresh: bool,
-    ) -> Pin<Box<dyn Future<Output = Result<HostPrices, Error>> + Send + 'async_trait>>
-    where
-        'life0: 'async_trait,
-        Self: 'async_trait,
-    {
-        Box::pin(SendFuture(async move {
-            if !refresh {
-                if let Some(prices) = self.get_cached_prices(&host_key) {
-                    debug!("host_prices: using cached prices for {host_key}");
-                    return Ok(prices);
-                }
+    async fn host_prices(&self, host_key: PublicKey, refresh: bool) -> Result<HostPrices, Error> {
+        if !refresh {
+            if let Some(prices) = self.get_cached_prices(&host_key) {
+                debug!("host_prices: using cached prices for {host_key}");
+                return Ok(prices);
             }
+        }
 
-            debug!("host_prices: fetching prices from {host_key}");
-            let conn = self.host_connection(host_key).await?;
-            let result: Result<HostPrices, Error> = async {
-                let stream = conn.open_stream().await?;
-                let resp = RPCSettings::send_request(stream).await?.complete().await?;
-                debug!("host_prices: got prices from {host_key}");
-                self.set_cached_prices(&host_key, resp.settings.prices.clone());
-                Ok(resp.settings.prices)
-            }
-            .await;
-            if result.is_err() {
-                self.evict_connection(&host_key);
-            }
-            result
-        }))
+        debug!("host_prices: fetching prices from {host_key}");
+        let conn = self.host_connection(host_key).await?;
+        let result: Result<HostPrices, Error> = async {
+            let stream = conn.open_stream().await?;
+            let resp = RPCSettings::send_request(stream).await?.complete().await?;
+            debug!("host_prices: got prices from {host_key}");
+            self.set_cached_prices(&host_key, resp.settings.prices.clone());
+            Ok(resp.settings.prices)
+        }
+        .await;
+        if result.is_err() {
+            self.evict_connection(&host_key);
+        }
+        result
     }
 
-    fn write_sector<'life0, 'life1, 'async_trait>(
-        &'life0 self,
+    async fn write_sector(
+        &self,
         host_key: PublicKey,
-        account_key: &'life1 PrivateKey,
+        account_key: &PrivateKey,
         sector: Bytes,
-    ) -> Pin<Box<dyn Future<Output = Result<Hash256, Error>> + Send + 'async_trait>>
-    where
-        'life0: 'async_trait,
-        'life1: 'async_trait,
-        Self: 'async_trait,
-    {
-        Box::pin(SendFuture(async move {
-            let conn = self.host_connection(host_key).await?;
-            let result: Result<Hash256, Error> = async {
-                let prices = self.get_or_fetch_prices(&host_key, &conn, false).await?;
-                let stream = conn.open_stream().await?;
-                let token = self.account_token(account_key, host_key);
-                debug!("write_sector: sending {} bytes to {host_key}", sector.len());
-                let resp = RPCWriteSector::send_request(stream, prices, token, sector)
-                    .await?
-                    .complete()
-                    .await?;
-                debug!("write_sector: completed for {host_key}");
-                Ok(resp.root)
-            }
-            .await;
-            if result.is_err() {
-                self.evict_connection(&host_key);
-                self.evict_prices(&host_key);
-            }
-            result
-        }))
+    ) -> Result<Hash256, Error> {
+        let conn = self.host_connection(host_key).await?;
+        let result: Result<Hash256, Error> = async {
+            let prices = self.get_or_fetch_prices(&host_key, &conn, false).await?;
+            let stream = conn.open_stream().await?;
+            let token = self.account_token(account_key, host_key);
+            debug!("write_sector: sending {} bytes to {host_key}", sector.len());
+            let resp = RPCWriteSector::send_request(stream, prices, token, sector)
+                .await?
+                .complete()
+                .await?;
+            debug!("write_sector: completed for {host_key}");
+            Ok(resp.root)
+        }
+        .await;
+        if result.is_err() {
+            self.evict_connection(&host_key);
+            self.evict_prices(&host_key);
+        }
+        result
     }
 
-    fn read_sector<'life0, 'life1, 'async_trait>(
-        &'life0 self,
+    async fn read_sector(
+        &self,
         host_key: PublicKey,
-        account_key: &'life1 PrivateKey,
+        account_key: &PrivateKey,
         root: Hash256,
         offset: usize,
         length: usize,
-    ) -> Pin<Box<dyn Future<Output = Result<Bytes, Error>> + Send + 'async_trait>>
-    where
-        'life0: 'async_trait,
-        'life1: 'async_trait,
-        Self: 'async_trait,
-    {
-        Box::pin(SendFuture(async move {
-            let conn = self.host_connection(host_key).await?;
-            let result: Result<Bytes, Error> = async {
-                let prices = self.get_or_fetch_prices(&host_key, &conn, false).await?;
-                let stream = conn.open_stream().await?;
-                let token = self.account_token(account_key, host_key);
-                let resp = RPCReadSector::send_request(stream, prices, token, root, offset, length)
-                    .await?
-                    .complete()
-                    .await?;
-                Ok(resp.data)
-            }
-            .await;
-            if result.is_err() {
-                self.evict_connection(&host_key);
-                self.evict_prices(&host_key);
-            }
-            result
-        }))
+    ) -> Result<Bytes, Error> {
+        let conn = self.host_connection(host_key).await?;
+        let result: Result<Bytes, Error> = async {
+            let prices = self.get_or_fetch_prices(&host_key, &conn, false).await?;
+            let stream = conn.open_stream().await?;
+            let token = self.account_token(account_key, host_key);
+            let resp = RPCReadSector::send_request(stream, prices, token, root, offset, length)
+                .await?
+                .complete()
+                .await?;
+            Ok(resp.data)
+        }
+        .await;
+        if result.is_err() {
+            self.evict_connection(&host_key);
+            self.evict_prices(&host_key);
+        }
+        result
     }
 }

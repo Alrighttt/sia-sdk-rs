@@ -32,7 +32,8 @@ pub enum Error {
 }
 
 /// Trait defining the operations that can be performed on a host.
-#[async_trait]
+#[cfg_attr(target_arch = "wasm32", async_trait(?Send))]
+#[cfg_attr(not(target_arch = "wasm32"), async_trait)]
 pub(crate) trait RHP4Client: Send + Sync {
     async fn host_prices(&self, host_key: PublicKey, refresh: bool) -> Result<HostPrices, Error>;
     async fn write_sector(
