@@ -263,6 +263,7 @@ impl Uploader {
         data: Bytes,
         write_timeout: Duration,
     ) -> Result<Sector, UploadError> {
+        debug!("upload_shard: START host={host_key} timeout={write_timeout:?}");
         let now = Instant::now();
         #[cfg(not(target_arch = "wasm32"))]
         let root = timeout(
@@ -306,6 +307,7 @@ impl Uploader {
                 )));
             }
         };
+        debug!("upload_shard: SUCCESS host={host_key} elapsed={:?}", now.elapsed());
         Ok(Sector { root, host_key })
     }
 
@@ -328,6 +330,7 @@ impl Uploader {
         let (host_key, attempts) = initial_host;
         let mut write_timeout = Self::upload_timeout(attempts); // mutable so that it can be adjusted on retries
         let mut tasks = JoinSet::new();
+        debug!("upload_slab_shard: slab {slab_index} shard {shard_index} START host={host_key} queue_remaining={}", hosts.len());
         join_set_spawn!(tasks, Self::upload_shard(
             transport.clone(),
             hosts.clone(),
@@ -347,6 +350,12 @@ impl Uploader {
                 Some(res) = tasks.join_next() => {
                     match res.unwrap() {
                         Ok(sector) => {
+                            let dropped = tasks.len();
+                            if dropped > 0 {
+                                debug!("upload_slab_shard: slab {slab_index} shard {shard_index} SUCCESS, dropping {dropped} racing task(s)");
+                            } else {
+                                debug!("upload_slab_shard: slab {slab_index} shard {shard_index} SUCCESS");
+                            }
                             if let Some(progress_tx) = progress_tx {
                                 let _ = progress_tx.send(());
                             }
@@ -354,14 +363,18 @@ impl Uploader {
                         }
                         Err(e) => {
                             total_failures += 1;
-                            debug!("slab {slab_index} shard {shard_index} upload failed ({total_failures} total): {e:?}");
+                            debug!("upload_slab_shard: slab {slab_index} shard {shard_index} FAILED ({total_failures} total, queue_remaining={}): {e:?}", hosts.len());
 
                             if tasks.is_empty() {
                                 let next_host = match hosts.pop_front() {
                                     Ok(h) => h,
-                                    Err(e) => return Err(e.into()),
+                                    Err(e) => {
+                                        debug!("upload_slab_shard: slab {slab_index} shard {shard_index} NO MORE HOSTS after {total_failures} failures");
+                                        return Err(e.into());
+                                    }
                                 };
                                 let (host_key, attempts) = next_host;
+                                debug!("upload_slab_shard: slab {slab_index} shard {shard_index} RETRY host={host_key} attempt={attempts} queue_remaining={}", hosts.len());
                                 write_timeout = Self::upload_timeout(attempts);
                                 join_set_spawn!(tasks, Self::upload_shard(transport.clone(), hosts.clone(), host_key, account_key.clone(), data.clone(), write_timeout));
                             }
@@ -376,12 +389,15 @@ impl Uploader {
                         let account_key = account_key.clone();
                         join_set_spawn!(tasks, async move {
                             let _racer = racer; // hold the permit until the task completes
-                            debug!("slab {slab_index} shard {shard_index} racing slow host");
                             let next_host = match hosts.pop_front() {
                                 Ok(h) => h,
-                                Err(e) => return Err(e.into()),
+                                Err(e) => {
+                                    debug!("upload_slab_shard: slab {slab_index} shard {shard_index} RACE failed to pop host: queue empty");
+                                    return Err(e.into());
+                                }
                             };
                             let (host_key, attempts) = next_host;
+                            debug!("upload_slab_shard: slab {slab_index} shard {shard_index} RACE host={host_key} attempt={attempts} queue_remaining={}", hosts.len());
                             let write_timeout = Self::upload_timeout(attempts);
                             Self::upload_shard(transport.clone(), hosts, host_key, account_key, data, write_timeout).await
                         });
@@ -483,8 +499,10 @@ impl Uploader {
                 let slab_key: EncryptionKey = rand::random::<[u8; 32]>().into();
 
                 let host_queue = hosts.upload_queue();
+                debug!("slab {slab_index}: upload_queue has {} hosts", host_queue.len());
                 // reserve one host per shard upfront to guarantee each shard has at least one host
                 let reserved_hosts = host_queue.pop_n(shards.len())?;
+                debug!("slab {slab_index}: reserved {} hosts, {} remaining in queue", reserved_hosts.len(), host_queue.len());
                 let owned_slab_key = Arc::new(slab_key.clone());
                 let start_time = Instant::now();
                 let mut shard_upload_tasks = JoinSet::new();

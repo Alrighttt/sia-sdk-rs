@@ -1,9 +1,13 @@
 use std::collections::HashMap;
 use std::future::Future;
 use std::pin::Pin;
-use std::sync::RwLock;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Arc, RwLock};
 use std::task::{Context, Poll};
 use tokio::sync::Semaphore;
+
+static PENDING_SESSIONS: AtomicUsize = AtomicUsize::new(0);
+static ACTIVE_SESSIONS: AtomicUsize = AtomicUsize::new(0);
 
 use bytes::Bytes;
 use chrono::Utc;
@@ -48,11 +52,31 @@ impl<F: Future> Future for SendFuture<F> {
 /// bidirectional streams for sequential RPCs without reconnecting.
 struct Connection {
     transport: web_sys::WebTransport,
+    /// Whether this connection completed the WebTransport handshake.
+    /// Only active connections decrement ACTIVE_SESSIONS on drop.
+    active: bool,
+}
+
+// SAFETY: WASM is single-threaded; these types are never actually shared across threads.
+unsafe impl Send for Connection {}
+unsafe impl Sync for Connection {}
+
+impl std::fmt::Debug for Connection {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Connection")
+            .field("active", &self.active)
+            .finish()
+    }
 }
 
 impl Drop for Connection {
     fn drop(&mut self) {
         self.transport.close();
+        if self.active {
+            let active = ACTIVE_SESSIONS.fetch_sub(1, Ordering::Relaxed) - 1;
+            let pending = PENDING_SESSIONS.load(Ordering::Relaxed);
+            debug!("[WT] connection dropped (pending={pending}, active={active})");
+        }
     }
 }
 
@@ -206,24 +230,53 @@ async fn connect(address: &str) -> Result<Connection, Error> {
         // Bare host:port — append the RHP4 path
         format!("https://{address}{RHP4_PATH}")
     };
-    debug!("connecting via WebTransport at {url}");
+    let pending = PENDING_SESSIONS.fetch_add(1, Ordering::Relaxed) + 1;
+    let active = ACTIVE_SESSIONS.load(Ordering::Relaxed);
+    debug!("[WT] connecting to {url} (pending={pending}, active={active})");
 
     let options = web_sys::WebTransportOptions::new();
-    let wt = web_sys::WebTransport::new_with_options(&url, &options)
-        .map_err(|e| Error::Transport(format!("WebTransport constructor error: {:?}", e)))?;
+    let wt = web_sys::WebTransport::new_with_options(&url, &options).map_err(|e| {
+        let pending = PENDING_SESSIONS.fetch_sub(1, Ordering::Relaxed) - 1;
+        debug!(
+            "[WT] constructor failed (pending={pending}, active={active}): {:?}",
+            e
+        );
+        Error::Transport(format!("WebTransport constructor error: {:?}", e))
+    })?;
 
     suppress_closed_rejection(&wt);
 
     // Wrap immediately so .close() is called if ready() fails or
     // the future is cancelled (e.g. by a timeout in tokio::select!).
-    let conn = Connection { transport: wt };
+    // active starts false — only set to true after successful handshake,
+    // so Drop won't decrement ACTIVE_SESSIONS for failed connections.
+    let mut conn = Connection {
+        transport: wt,
+        active: false,
+    };
+    let ready_promise = conn.transport.ready();
 
-    JsFuture::from(conn.transport.ready())
-        .await
-        .map_err(|e| Error::Transport(format!("WebTransport ready error: {:?}", e)))?;
-
-    debug!("WebTransport connected to {url}");
-    Ok(conn)
+    match JsFuture::from(ready_promise).await {
+        Ok(_) => {
+            conn.active = true;
+            let pending = PENDING_SESSIONS.fetch_sub(1, Ordering::Relaxed) - 1;
+            let active = ACTIVE_SESSIONS.fetch_add(1, Ordering::Relaxed) + 1;
+            debug!("[WT] connected to {url} (pending={pending}, active={active})");
+            Ok(conn)
+        }
+        Err(e) => {
+            // conn.active is false, so Drop won't decrement ACTIVE_SESSIONS
+            let pending = PENDING_SESSIONS.fetch_sub(1, Ordering::Relaxed) - 1;
+            debug!(
+                "[WT] ready failed for {url} (pending={pending}, active={active}): {:?}",
+                e
+            );
+            Err(Error::Transport(format!(
+                "WebTransport ready error: {:?}",
+                e
+            )))
+        }
+    }
 }
 
 /// Connects to a host at the given address via WebTransport and fetches
@@ -238,19 +291,25 @@ pub async fn fetch_host_settings(address: &str) -> Result<HostSettings, Error> {
 #[derive(Clone, Debug)]
 pub struct Client {
     hosts: Hosts,
-    cached_prices: std::sync::Arc<RwLock<HashMap<PublicKey, HostPrices>>>,
-    cached_tokens: std::sync::Arc<RwLock<HashMap<PublicKey, AccountToken>>>,
-    price_fetch_semaphore: std::sync::Arc<Semaphore>,
+    cached_prices: Arc<RwLock<HashMap<PublicKey, HostPrices>>>,
+    cached_tokens: Arc<RwLock<HashMap<PublicKey, AccountToken>>>,
+    price_fetch_semaphore: Arc<Semaphore>,
+    connection_pool: Arc<RwLock<HashMap<PublicKey, Arc<Connection>>>>,
 }
 
 impl Client {
     pub fn new(hosts: Hosts, max_price_fetches: usize) -> Client {
         Client {
             hosts,
-            cached_prices: std::sync::Arc::new(RwLock::new(HashMap::new())),
-            cached_tokens: std::sync::Arc::new(RwLock::new(HashMap::new())),
-            price_fetch_semaphore: std::sync::Arc::new(Semaphore::new(max_price_fetches)),
+            cached_prices: Arc::new(RwLock::new(HashMap::new())),
+            cached_tokens: Arc::new(RwLock::new(HashMap::new())),
+            price_fetch_semaphore: Arc::new(Semaphore::new(max_price_fetches)),
+            connection_pool: Arc::new(RwLock::new(HashMap::new())),
         }
+    }
+
+    fn evict_connection(&self, host_key: &PublicKey) {
+        self.connection_pool.write().unwrap().remove(host_key);
     }
 
     fn get_cached_prices(&self, host_key: &PublicKey) -> Option<HostPrices> {
@@ -286,7 +345,13 @@ impl Client {
         }
     }
 
-    async fn host_connection(&self, host_key: PublicKey) -> Result<Connection, Error> {
+    async fn host_connection(&self, host_key: PublicKey) -> Result<Arc<Connection>, Error> {
+        // Check pool first
+        if let Some(conn) = self.connection_pool.read().unwrap().get(&host_key).cloned() {
+            return Ok(conn);
+        }
+
+        // No pooled connection — create new one
         let addresses = self
             .hosts
             .addresses(&host_key)
@@ -299,7 +364,14 @@ impl Client {
             }
 
             match connect(&addr.address).await {
-                Ok(conn) => return Ok(conn),
+                Ok(conn) => {
+                    let conn = Arc::new(conn);
+                    self.connection_pool
+                        .write()
+                        .unwrap()
+                        .insert(host_key, conn.clone());
+                    return Ok(conn);
+                }
                 Err(e) => {
                     debug!(
                         "host_connection({host_key}): connect to {} failed: {e}",
@@ -380,12 +452,18 @@ impl RHP4Client for Client {
 
             debug!("host_prices: fetching prices from {host_key}");
             let conn = self.host_connection(host_key).await?;
-            let stream = conn.open_stream().await?;
-            let resp = RPCSettings::send_request(stream).await?.complete().await?;
-
-            debug!("host_prices: got prices from {host_key}");
-            self.set_cached_prices(&host_key, resp.settings.prices.clone());
-            Ok(resp.settings.prices)
+            let result: Result<HostPrices, Error> = async {
+                let stream = conn.open_stream().await?;
+                let resp = RPCSettings::send_request(stream).await?.complete().await?;
+                debug!("host_prices: got prices from {host_key}");
+                self.set_cached_prices(&host_key, resp.settings.prices.clone());
+                Ok(resp.settings.prices)
+            }
+            .await;
+            if result.is_err() {
+                self.evict_connection(&host_key);
+            }
+            result
         }))
     }
 
@@ -402,16 +480,23 @@ impl RHP4Client for Client {
     {
         Box::pin(SendFuture(async move {
             let conn = self.host_connection(host_key).await?;
-            let prices = self.get_or_fetch_prices(&host_key, &conn, false).await?;
-            let stream = conn.open_stream().await?;
-            let token = self.account_token(account_key, host_key);
-            debug!("write_sector: sending {} bytes to {host_key}", sector.len());
-            let resp = RPCWriteSector::send_request(stream, prices, token, sector)
-                .await?
-                .complete()
-                .await?;
-            debug!("write_sector: completed for {host_key}");
-            Ok(resp.root)
+            let result: Result<Hash256, Error> = async {
+                let prices = self.get_or_fetch_prices(&host_key, &conn, false).await?;
+                let stream = conn.open_stream().await?;
+                let token = self.account_token(account_key, host_key);
+                debug!("write_sector: sending {} bytes to {host_key}", sector.len());
+                let resp = RPCWriteSector::send_request(stream, prices, token, sector)
+                    .await?
+                    .complete()
+                    .await?;
+                debug!("write_sector: completed for {host_key}");
+                Ok(resp.root)
+            }
+            .await;
+            if result.is_err() {
+                self.evict_connection(&host_key);
+            }
+            result
         }))
     }
 
@@ -430,14 +515,21 @@ impl RHP4Client for Client {
     {
         Box::pin(SendFuture(async move {
             let conn = self.host_connection(host_key).await?;
-            let prices = self.get_or_fetch_prices(&host_key, &conn, false).await?;
-            let stream = conn.open_stream().await?;
-            let token = self.account_token(account_key, host_key);
-            let resp = RPCReadSector::send_request(stream, prices, token, root, offset, length)
-                .await?
-                .complete()
-                .await?;
-            Ok(resp.data)
+            let result: Result<Bytes, Error> = async {
+                let prices = self.get_or_fetch_prices(&host_key, &conn, false).await?;
+                let stream = conn.open_stream().await?;
+                let token = self.account_token(account_key, host_key);
+                let resp = RPCReadSector::send_request(stream, prices, token, root, offset, length)
+                    .await?
+                    .complete()
+                    .await?;
+                Ok(resp.data)
+            }
+            .await;
+            if result.is_err() {
+                self.evict_connection(&host_key);
+            }
+            result
         }))
     }
 }
