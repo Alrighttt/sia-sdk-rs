@@ -218,12 +218,10 @@ impl Downloader {
                         let permit = semaphore.clone().acquire_owned().await?;
                         let transport = self.transport.clone();
                         let account_key = self.account_key.clone();
-                        join_set_spawn!(download_tasks, Self::try_download_sector(
-                            permit,
-                            transport,
-                            account_key,
-                            task,
-                        ));
+                        join_set_spawn!(
+                            download_tasks,
+                            Self::try_download_sector(permit, transport, account_key, task,)
+                        );
                     } else {
                         break;
                     }
