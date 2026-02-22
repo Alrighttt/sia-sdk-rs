@@ -308,6 +308,10 @@ impl Client {
         self.connection_pool.write().unwrap().remove(host_key);
     }
 
+    fn evict_prices(&self, host_key: &PublicKey) {
+        self.cached_prices.write().unwrap().remove(host_key);
+    }
+
     fn get_cached_prices(&self, host_key: &PublicKey) -> Option<HostPrices> {
         let cache = self.cached_prices.read().unwrap();
         match cache.get(host_key) {
@@ -474,6 +478,7 @@ impl RHP4Client for Client {
             .await;
             if result.is_err() {
                 self.evict_connection(&host_key);
+                self.evict_prices(&host_key);
             }
             result
         }))
@@ -507,6 +512,7 @@ impl RHP4Client for Client {
             .await;
             if result.is_err() {
                 self.evict_connection(&host_key);
+                self.evict_prices(&host_key);
             }
             result
         }))

@@ -2,17 +2,12 @@
 ///
 /// This module provides a bridge between JavaScript's File API and Rust's AsyncRead trait,
 /// allowing large files to be uploaded without loading the entire file into WASM memory.
-
 use std::collections::VecDeque;
 use std::io;
 use std::pin::Pin;
 use std::sync::{Arc, Mutex};
 use std::task::{Context, Poll, Waker};
 use tokio::io::AsyncRead;
-
-/// Maximum number of chunks to queue before applying backpressure
-/// 3 chunks × 128 MB = 384 MB maximum memory overhead
-const MAX_QUEUED_CHUNKS: usize = 3;
 
 /// State shared between the reader and the WASM binding layer
 pub struct ReaderState {
@@ -26,32 +21,25 @@ pub struct ReaderState {
     pub eof: bool,
     /// Waker to notify when new data arrives (for the upload pipeline)
     pub waker: Option<Waker>,
-    /// Waker to notify JavaScript when queue space is available (for backpressure)
-    pub backpressure_waker: Option<Waker>,
     /// Error from JavaScript side
     pub error: Option<String>,
 }
 
 /// A reader that receives chunks from JavaScript on-demand
 pub struct JsChunkedReader {
-    /// Unique ID for this reader session
-    pub(crate) reader_id: usize,
     /// Shared state for this reader
     state: Arc<Mutex<ReaderState>>,
 }
 
 impl JsChunkedReader {
-    /// Creates a new JsChunkedReader with the given ID
-    pub fn new(reader_id: usize) -> Self {
+    pub fn new() -> Self {
         Self {
-            reader_id,
             state: Arc::new(Mutex::new(ReaderState {
                 chunks: VecDeque::new(),
                 current_chunk: None,
                 position: 0,
                 eof: false,
                 waker: None,
-                backpressure_waker: None,
                 error: None,
             })),
         }
@@ -60,39 +48,6 @@ impl JsChunkedReader {
     /// Returns a reference to the reader state for external access
     pub fn state(&self) -> &Arc<Mutex<ReaderState>> {
         &self.state
-    }
-
-    /// Pushes a new chunk of data from JavaScript
-    pub(crate) fn push_chunk(&self, chunk: Vec<u8>) {
-        let mut state = self.state.lock().unwrap();
-        state.chunks.push_back(chunk);
-
-        // Wake the reader if it's waiting
-        if let Some(waker) = state.waker.take() {
-            waker.wake();
-        }
-    }
-
-    /// Signals EOF from JavaScript
-    pub(crate) fn push_eof(&self) {
-        let mut state = self.state.lock().unwrap();
-        state.eof = true;
-
-        // Wake the reader if it's waiting
-        if let Some(waker) = state.waker.take() {
-            waker.wake();
-        }
-    }
-
-    /// Sets an error from the JavaScript side
-    pub(crate) fn set_error(&self, error: String) {
-        let mut state = self.state.lock().unwrap();
-        state.error = Some(error);
-
-        // Wake the reader if it's waiting
-        if let Some(waker) = state.waker.take() {
-            waker.wake();
-        }
     }
 }
 
@@ -106,10 +61,7 @@ impl AsyncRead for JsChunkedReader {
 
         // Check for error first
         if let Some(error) = &state.error {
-            return Poll::Ready(Err(io::Error::new(
-                io::ErrorKind::Other,
-                error.clone(),
-            )));
+            return Poll::Ready(Err(io::Error::new(io::ErrorKind::Other, error.clone())));
         }
 
         loop {
@@ -126,8 +78,7 @@ impl AsyncRead for JsChunkedReader {
 
                     // Extract the slice, copying it into buf
                     // We need to get the data out before mutating state
-                    let data = state.current_chunk.as_ref().unwrap()[start..end].to_vec();
-                    buf.put_slice(&data);
+                    buf.put_slice(&state.current_chunk.as_ref().unwrap()[start..end]);
 
                     // Now we can mutate state
                     state.position = end;
@@ -146,13 +97,6 @@ impl AsyncRead for JsChunkedReader {
             if let Some(next_chunk) = state.chunks.pop_front() {
                 state.current_chunk = Some(next_chunk);
                 state.position = 0;
-
-                // Wake JavaScript if it's waiting due to backpressure
-                if let Some(waker) = state.backpressure_waker.take() {
-                    waker.wake();
-                }
-
-                // Continue the loop to read from this new chunk
                 continue;
             }
 

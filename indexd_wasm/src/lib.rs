@@ -823,7 +823,7 @@ impl SDK {
         let reader_id = self as *const _ as usize;
 
         // Create the reader
-        let reader = JsChunkedReader::new(reader_id);
+        let reader = JsChunkedReader::new();
 
         // Register the reader state globally so pushChunk can access it
         {
