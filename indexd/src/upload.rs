@@ -96,7 +96,7 @@ impl Default for UploadOptions {
             data_shards: 10,
             parity_shards: 20,
             #[cfg(target_arch = "wasm32")]
-            max_inflight: 3, // Browsers can't handle many concurrent WebTransport connections
+            max_inflight: 8, // Browsers can't handle many concurrent WebTransport connections
             #[cfg(not(target_arch = "wasm32"))]
             max_inflight: 16,
             shard_uploaded: None,

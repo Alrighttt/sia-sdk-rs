@@ -84,7 +84,7 @@ impl Default for DownloadOptions {
     fn default() -> Self {
         Self {
             #[cfg(target_arch = "wasm32")]
-            max_inflight: 2, // Browsers can't handle many concurrent WebTransport connections (no connection pooling)
+            max_inflight: 8, // Browsers can't handle many concurrent WebTransport connections
             #[cfg(not(target_arch = "wasm32"))]
             max_inflight: 20,
             offset: 0,
