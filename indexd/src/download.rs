@@ -15,8 +15,6 @@ use tokio::io::AsyncWriteExt;
 use tokio::sync::{OwnedSemaphorePermit, Semaphore, mpsc};
 use tokio::task::JoinSet;
 #[cfg(not(target_arch = "wasm32"))]
-use tokio::task::spawn_blocking;
-#[cfg(not(target_arch = "wasm32"))]
 use tokio::time::error::Elapsed;
 #[cfg(not(target_arch = "wasm32"))]
 use tokio::time::sleep;
@@ -240,16 +238,10 @@ impl Downloader {
                     match res? { // safe because tasks are never cancelled
                         Ok((index, mut data)) => {
                             let encryption_key = encryption_key.clone();
-                            #[cfg(not(target_arch = "wasm32"))]
-                            let data = spawn_blocking(move || {
+                            let data = maybe_spawn_blocking!({
                                 encrypt_shard(&encryption_key, index as u8, offset as usize, &mut data);
                                 data
-                            }).await?;
-                            #[cfg(target_arch = "wasm32")]
-                            let data = {
-                                encrypt_shard(&encryption_key, index as u8, offset as usize, &mut data);
-                                data
-                            };
+                            });
                             shards[index] = Some(data);
                             successful += 1;
                             if successful >= min_shards {
@@ -355,19 +347,11 @@ impl Downloader {
                 .await?;
             let data_shards = slab.min_shards as usize;
             let parity_shards = slab.sectors.len() - slab.min_shards as usize;
-            #[cfg(not(target_arch = "wasm32"))]
-            let shards = spawn_blocking(move || -> Result<Vec<Option<Vec<u8>>>, DownloadError> {
+            let shards = maybe_spawn_blocking!({
                 let rs = ErasureCoder::new(data_shards, parity_shards)?;
                 rs.reconstruct_data_shards(&mut shards)?;
-                Ok(shards)
-            })
-            .await??;
-            #[cfg(target_arch = "wasm32")]
-            let shards = {
-                let rs = ErasureCoder::new(data_shards, parity_shards)?;
-                rs.reconstruct_data_shards(&mut shards)?;
-                shards
-            };
+                Ok::<_, erasure_coding::Error>(shards)
+            })?;
             ErasureCoder::write_data_shards(
                 &mut w,
                 &shards[..data_shards],

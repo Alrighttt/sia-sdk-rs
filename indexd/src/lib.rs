@@ -20,6 +20,17 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 pub use reqwest::{IntoUrl, Url};
 
 mod rhp4;
+
+/// Offloads a `move` closure to a blocking thread on native; runs inline on WASM.
+macro_rules! maybe_spawn_blocking {
+    ($body:expr) => {{
+        #[cfg(not(target_arch = "wasm32"))]
+        { tokio::task::spawn_blocking(move || $body).await? }
+        #[cfg(target_arch = "wasm32")]
+        { $body }
+    }};
+}
+
 mod upload;
 pub use upload::*;
 
