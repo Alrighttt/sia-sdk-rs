@@ -237,9 +237,15 @@ impl StreamingUpload {
 
                         // Wait 50ms for space to become available
                         let promise = js_sys::Promise::new(&mut |resolve, _reject| {
-                            let window = web_sys::window().expect("no window");
-                            let _ = window.set_timeout_with_callback_and_timeout_and_arguments_0(
-                                &resolve, 50,
+                            let global = js_sys::global();
+                            let set_timeout: js_sys::Function =
+                                js_sys::Reflect::get(&global, &"setTimeout".into())
+                                    .unwrap()
+                                    .into();
+                            let _ = set_timeout.call2(
+                                &wasm_bindgen::JsValue::NULL,
+                                &resolve,
+                                &wasm_bindgen::JsValue::from_f64(50.0),
                             );
                         });
                         let _ = wasm_bindgen_futures::JsFuture::from(promise).await;
@@ -746,13 +752,7 @@ impl SDK {
 
         let mut buffers = get_chunk_buffers().lock().map_err(to_js_err)?;
 
-        // Pre-allocate the buffer with the exact size needed
-        let mut buffer = Vec::with_capacity(size);
-        // SAFETY: We're creating uninitialized memory, but we'll fill it chunk by chunk
-        // This is safe because we track the offset and only read initialized portions
-        unsafe {
-            buffer.set_len(size);
-        }
+        let buffer = vec![0u8; size];
 
         buffers.insert(session_id as usize, (buffer, 0)); // (buffer, current_offset)
 
