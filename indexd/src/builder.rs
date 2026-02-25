@@ -10,9 +10,18 @@ use sia::types::Hash256;
 use thiserror::Error;
 use url::Url;
 
-use crate::app_client::{self, AppClient, Client, RegisterAppRequest};
+use crate::app_client::{self, AppClient, Client, HostQuery, RegisterAppRequest};
 use crate::object_encryption::derive;
-use crate::{SDK, quic};
+use crate::rhp4::RHP4Client;
+use crate::{Hosts, SDK, mux_transport, quic};
+
+/// Configuration for the transport layer used to communicate with Sia hosts.
+pub enum TransportConfig {
+    /// Use QUIC transport (requires TLS configuration).
+    QUIC(Box<rustls::ClientConfig>),
+    /// Use SiaMux transport (TCP + multiplexed encrypted streams).
+    SiaMux,
+}
 
 /// The initial state of the SDK builder, before connecting to the indexd service.
 pub struct DisconnectedState;
@@ -58,6 +67,25 @@ pub enum BuilderError {
     RequestExpired,
 }
 
+/// Fetches hosts from the indexer and constructs the appropriate transport.
+async fn build_transport(
+    api_client: &Arc<dyn AppClient>,
+    app_key: &PrivateKey,
+    config: TransportConfig,
+) -> Result<(Arc<dyn RHP4Client>, Hosts), BuilderError> {
+    let usable_hosts = api_client.hosts(app_key, HostQuery::default()).await?;
+    let hosts = Hosts::new();
+    hosts.update(usable_hosts);
+
+    let transport: Arc<dyn RHP4Client> = match config {
+        TransportConfig::QUIC(tls_config) => {
+            Arc::new(quic::Client::new(*tls_config, hosts.clone())?)
+        }
+        TransportConfig::SiaMux => Arc::new(mux_transport::Client::new(hosts.clone())),
+    };
+    Ok((transport, hosts))
+}
+
 impl Builder<DisconnectedState> {
     /// Creates a new SDK builder with the provided indexer URL.
     ///
@@ -76,24 +104,31 @@ impl Builder<DisconnectedState> {
         })
     }
 
-    /// Attempts to connect using the provided app key and TLS configuration.
+    /// Attempts to connect using the provided app key and transport configuration.
     /// If the app key is valid, returns Some([SDK]), otherwise returns None.
     ///
     /// If you receive None, call [Builder::request_connection] to request a new connection.
     ///
     /// # Arguments
     /// * `app_key` - The application key used for authentication.
-    /// * `tls_config` - The TLS configuration for secure communication.
+    /// * `transport_config` - The transport configuration to use.
     pub async fn connected(
         &self,
         app_key: &PrivateKey,
-        tls_config: rustls::ClientConfig,
+        transport_config: TransportConfig,
     ) -> Result<Option<SDK>, BuilderError> {
         let connected = self.client.check_app_authenticated(app_key).await?;
         if !connected {
             return Ok(None);
         }
-        let sdk = SDK::new(self.client.clone(), Arc::new(app_key.clone()), tls_config).await?;
+        let (transport, hosts) = build_transport(&self.client, app_key, transport_config).await?;
+        let sdk = SDK::new(
+            self.client.clone(),
+            Arc::new(app_key.clone()),
+            transport,
+            hosts,
+        )
+        .await;
         Ok(Some(sdk))
     }
 
@@ -163,20 +198,21 @@ impl Builder<ApprovedState> {
     ///
     /// # Arguments
     /// * `mnemonic` - The user's mnemonic phrase used to derive the application key.
-    /// * `tls_config` - The TLS configuration for secure communication.
+    /// * `transport_config` - The transport configuration to use.
     ///
     /// # Errors
     /// Returns [BuilderError] if the registration fails or the SDK cannot be created.
     pub async fn register(
         self,
         mnemonic: &str,
-        tls_config: rustls::ClientConfig,
+        transport_config: TransportConfig,
     ) -> Result<SDK, BuilderError> {
         let app_key = derive_app_key(mnemonic, &self.state.app_id, &self.state.user_secret)?;
         self.client
             .register_app(&app_key, self.state.register_url.clone())
             .await?;
-        SDK::new(self.client, Arc::new(app_key), tls_config).await
+        let (transport, hosts) = build_transport(&self.client, &app_key, transport_config).await?;
+        Ok(SDK::new(self.client, Arc::new(app_key), transport, hosts).await)
     }
 }
 
