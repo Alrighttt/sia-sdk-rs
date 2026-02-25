@@ -887,8 +887,7 @@ impl<T: Transport> RPCReadSector<T, RPCComplete> {
                 .data
                 .verify(&self.root, start, end)
                 .map_err(Error::ProofValidation);
-            // rx never goes out of scope and never sends more than once, so this can't fail
-            tx.send(res).unwrap();
+            let _ = tx.send(res);
         });
 
         let data = rx.await.unwrap()?;
