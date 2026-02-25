@@ -1,7 +1,7 @@
 use std::sync::{Arc, Mutex};
 
 use indexd::app_client::RegisterAppRequest;
-use indexd::{self, Url};
+use indexd::{self, TransportConfig, Url};
 use sia::seed::{self, Seed};
 use sia::signing::{PrivateKey, Signature};
 use thiserror::Error;
@@ -230,7 +230,13 @@ impl Builder {
                     }
                     let rustls_config = tls::tls_config();
 
-                    match builder.connected(&app_key.0, rustls_config).await? {
+                    match builder
+                        .connected(
+                            &app_key.0,
+                            TransportConfig::QUIC(Box::new(rustls_config)),
+                        )
+                        .await?
+                    {
                         Some(sdk) => {
                             Ok((BuilderState::Finalized, Some(Arc::new(SDK { inner: sdk }))))
                         }
@@ -341,7 +347,12 @@ impl Builder {
                             .map_err(|e| BuilderError::Crypto(format!("{:?}", e)))?;
                     }
                     let rustls_config = tls::tls_config();
-                    let sdk = builder.register(&mnemonic, rustls_config).await?;
+                    let sdk = builder
+                        .register(
+                            &mnemonic,
+                            TransportConfig::QUIC(Box::new(rustls_config)),
+                        )
+                        .await?;
                     Ok((BuilderState::Finalized, Arc::new(SDK { inner: sdk })))
                 }
                 _ => Err(BuilderError::InvalidState),
