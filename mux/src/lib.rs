@@ -10,10 +10,10 @@ use ed25519_dalek::{SigningKey, VerifyingKey};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
 use crate::handshake::{ConnSettings, HandshakeError, accept_handshake, initiate_handshake};
-use crate::mux::{Mux, new_mux};
+use crate::mux::new_mux;
 
 // Re-export key public types.
-pub use crate::mux::{MuxError, Stream};
+pub use crate::mux::{Mux, MuxError, Stream};
 
 const OUR_VERSION: u8 = 3;
 
