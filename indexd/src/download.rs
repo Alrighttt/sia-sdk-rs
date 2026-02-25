@@ -300,6 +300,9 @@ impl Downloader {
             )
             .await?;
             length -= slab_length;
+            if let Some(ref tx) = options.slab_downloaded {
+                let _ = tx.send(());
+            }
         }
         w.flush().await?;
         Ok(())
