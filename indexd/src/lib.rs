@@ -32,6 +32,7 @@ mod object_encryption;
 mod slabs;
 
 pub mod app_client;
+pub mod mux_transport;
 pub mod quic;
 
 mod builder;
@@ -64,27 +65,21 @@ pub struct SDK {
 }
 
 impl SDK {
-    /// Creates a new SDK instance.
+    /// Creates a new SDK instance with the given transport.
     async fn new(
         api_client: Arc<dyn AppClient>,
         app_key: Arc<PrivateKey>,
-        tls_config: rustls::ClientConfig,
-    ) -> Result<Self, BuilderError> {
-        let usable_hosts = api_client.hosts(&app_key, HostQuery::default()).await?;
-        let hosts = Hosts::new();
-        hosts.update(usable_hosts);
-
-        let transport = quic::Client::new(tls_config, hosts.clone())?;
-
-        let downloader =
-            Downloader::new(hosts.clone(), Arc::new(transport.clone()), app_key.clone());
-        let uploader = Uploader::new(hosts.clone(), Arc::new(transport), app_key.clone());
-        Ok(Self {
+        transport: Arc<dyn RHP4Client>,
+        hosts: Hosts,
+    ) -> Self {
+        let downloader = Downloader::new(hosts.clone(), transport.clone(), app_key.clone());
+        let uploader = Uploader::new(hosts, transport, app_key.clone());
+        Self {
             app_key,
             api_client,
             downloader,
             uploader,
-        })
+        }
     }
 
     /// Returns the application key used by the SDK.
