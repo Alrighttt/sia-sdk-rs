@@ -2630,6 +2630,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "sia_syncer"
+version = "0.1.0"
+dependencies = [
+ "sia_sdk",
+ "thiserror 2.0.18",
+]
+
+[[package]]
 name = "signature"
 version = "2.2.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2736,6 +2744,26 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "0bf256ce5efdfa370213c1dabab5935a12e49f2c58d15e9eac2870d3b4f27263"
 dependencies = [
  "futures-core",
+]
+
+[[package]]
+name = "syncer_wasm"
+version = "0.1.0"
+dependencies = [
+ "blake2b_simd",
+ "console_error_panic_hook",
+ "getrandom 0.2.16",
+ "getrandom 0.4.1",
+ "hex",
+ "js-sys",
+ "serde",
+ "serde_json",
+ "sia_sdk",
+ "sia_syncer",
+ "siphasher 1.0.1",
+ "wasm-bindgen",
+ "wasm-bindgen-futures",
+ "web-sys",
 ]
 
 [[package]]

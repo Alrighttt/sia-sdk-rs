@@ -61,6 +61,7 @@ impl fmt::Display for Specifier {
     }
 }
 
+#[macro_export]
 macro_rules! specifier {
     ($text:expr) => {{
         let src = $text.as_bytes();
@@ -75,7 +76,7 @@ macro_rules! specifier {
         $crate::types::Specifier::new(buf)
     }};
 }
-pub(crate) use specifier;
+pub use specifier;
 
 #[cfg(test)]
 mod tests {
