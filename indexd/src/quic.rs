@@ -19,10 +19,11 @@ use crate::rhp4::Error as RHP4Error;
 use quinn::{ClientConfig, Connection, Endpoint, RecvStream, SendStream, VarInt};
 use sia::encoding_async::AsyncDecoder;
 use sia::rhp::{
-    self, AccountToken, HostPrices, RPCReadSector, RPCSettings, RPCWriteSector, Transport,
+    self, AccountToken, HostPrices, RPCAccountBalance, RPCReadSector, RPCSettings, RPCWriteSector,
+    Transport,
 };
 use sia::signing::{PrivateKey, PublicKey};
-use sia::types::Hash256;
+use sia::types::{Currency, Hash256};
 use sia::types::v2::Protocol;
 
 use crate::{Hosts, RHP4Client};
@@ -372,6 +373,22 @@ impl ClientInner {
         Ok(resp.data)
     }
 
+    async fn account_balance(
+        &self,
+        host_key: PublicKey,
+        account_key: &PrivateKey,
+    ) -> Result<Currency, RHP4Error> {
+        let stream = self
+            .host_stream(host_key)
+            .await
+            .map_err(|e| RHP4Error::Transport(e.to_string()))?;
+        let resp = RPCAccountBalance::send_request(stream, account_key.public_key())
+            .await?
+            .complete()
+            .await?;
+        Ok(resp.balance)
+    }
+
     fn init_quic_endpoints(&self) -> Result<(), ConnectError> {
         let endpoint_v4 = match quinn::Endpoint::client((Ipv4Addr::UNSPECIFIED, 0).into()) {
             Ok(mut endpoint) => {
@@ -513,6 +530,17 @@ impl RHP4Client for Client {
             .inspect_err(|_| self.inner.hosts.add_failure(&host_key))?;
         self.inner.hosts.add_read_sample(&host_key, start.elapsed());
         Ok(data)
+    }
+
+    async fn account_balance(
+        &self,
+        host_key: PublicKey,
+        account_key: &PrivateKey,
+    ) -> Result<Currency, RHP4Error> {
+        self.inner
+            .account_balance(host_key, account_key)
+            .await
+            .inspect_err(|_| self.inner.hosts.add_failure(&host_key))
     }
 }
 

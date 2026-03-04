@@ -117,6 +117,14 @@ impl RHP4Client for MockRHP4Client {
         sleep(Duration::from_nanos(sector.len() as u64 * 8 / 10)).await; // simulate network latency ~ 10Gbps
         Ok(sector)
     }
+
+    async fn account_balance(
+        &self,
+        _host_key: PublicKey,
+        _account_key: &PrivateKey,
+    ) -> Result<Currency, rhp4::Error> {
+        Ok(Currency::zero())
+    }
 }
 
 pub struct MockUploader {
