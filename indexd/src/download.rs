@@ -4,7 +4,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use crate::sleep;
-use log::warn;
+use log::debug;
 use sia::encryption::{EncryptionKey, encrypt_shard};
 use sia::erasure_coding::{self, ErasureCoder};
 use sia::rhp::{HostPrices, SEGMENT_SIZE};
@@ -310,7 +310,7 @@ impl Downloader {
                         Err(e) => {
                             self.hosts.add_failure(&host_key);
                             total_failures += 1;
-                            warn!("sector download from {} failed ({total_failures}/{MAX_TOTAL_FAILURES}): {:?}", host_key, e);
+                            debug!("sector download from {} failed ({total_failures}/{MAX_TOTAL_FAILURES}): {:?}", host_key, e);
 
                             if total_failures >= MAX_TOTAL_FAILURES {
                                 return Err(DownloadError::NotEnoughShards(successful, min_shards));
