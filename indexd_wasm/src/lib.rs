@@ -1047,14 +1047,7 @@ impl SDK {
     #[wasm_bindgen(js_name = "hostAccountInfo")]
     pub async fn host_account_info(&self, host_key: &str) -> Result<JsValue, JsError> {
         let pk = sia::signing::PublicKey::from_str(host_key).map_err(to_js_err)?;
-        let rt = tokio::runtime::Builder::new_current_thread()
-            .build()
-            .map_err(to_js_err)?;
-        let _guard = rt.enter();
-        let local = tokio::task::LocalSet::new();
-        let info = local
-            .run_until(async { self.inner.host_account_info(pk).await })
-            .await;
+        let info = self.inner.host_account_info(pk).await;
 
         let obj = js_sys::Object::new();
         js_sys::Reflect::set(&obj, &"hostKey".into(), &host_key.into()).unwrap();
