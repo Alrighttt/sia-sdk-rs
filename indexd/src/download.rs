@@ -7,14 +7,18 @@ use crate::sleep;
 use log::debug;
 use sia::encryption::{EncryptionKey, encrypt_shard};
 use sia::erasure_coding::{self, ErasureCoder};
-use sia::rhp::SEGMENT_SIZE;
+use sia::rhp::{HostPrices, SEGMENT_SIZE};
 use sia::signing::PrivateKey;
+use sia::types::Currency;
 use thiserror::Error;
 use tokio::io::{AsyncWrite, AsyncWriteExt};
 use tokio::sync::{OwnedSemaphorePermit, Semaphore, mpsc};
 use tokio::task::JoinSet;
 #[cfg(not(target_arch = "wasm32"))]
 use tokio::time::error::Elapsed;
+
+use sia::rhp::Host;
+use sia::signing::PublicKey;
 
 use crate::rhp4::RHP4Client;
 use crate::{Hosts, Object, Sector};
@@ -60,8 +64,13 @@ pub struct DownloadOptions {
     pub length: Option<u64>,
 
     /// Optional channel to notify when each slab is downloaded.
-    /// This can be used to implement progress reporting.
-    pub slab_downloaded: Option<mpsc::UnboundedSender<()>>,
+    /// Sends the number of bytes written for the slab, enabling
+    /// accurate progress tracking and download speed calculation.
+    pub slab_downloaded: Option<mpsc::UnboundedSender<u64>>,
+
+    /// Optional channel to report which host is being actively downloaded from.
+    /// Sends the full Host each time a sector download is initiated.
+    pub host_active: Option<mpsc::UnboundedSender<Host>>,
 }
 
 impl Default for DownloadOptions {
@@ -74,8 +83,16 @@ impl Default for DownloadOptions {
             offset: 0,
             length: None,
             slab_downloaded: None,
+            host_active: None,
         }
     }
+}
+
+/// Per-host account balance and pricing information.
+pub struct HostAccountInfo {
+    pub host_key: PublicKey,
+    pub balance: Result<Currency, DownloadError>,
+    pub prices: Result<HostPrices, DownloadError>,
 }
 
 #[derive(Clone)]
@@ -101,17 +118,20 @@ impl Downloader {
         transport: Arc<dyn RHP4Client>,
         account_key: Arc<PrivateKey>,
         task: SectorDownloadTask,
-    ) -> Result<(usize, Vec<u8>), DownloadError> {
-        let data = transport
+    ) -> (PublicKey, Result<(usize, Vec<u8>), DownloadError>) {
+        let host_key = task.sector.host_key;
+        let result = transport
             .read_sector(
-                task.sector.host_key,
+                host_key,
                 &account_key,
                 task.sector.root,
                 task.offset as usize,
                 task.length as usize,
             )
-            .await?;
-        Ok((task.index, data.to_vec()))
+            .await
+            .map(|data| (task.index, data.to_vec()))
+            .map_err(DownloadError::from);
+        (host_key, result)
     }
 
     pub fn new(hosts: Hosts, transport: Arc<dyn RHP4Client>, account_key: Arc<PrivateKey>) -> Self {
@@ -122,12 +142,38 @@ impl Downloader {
         }
     }
 
-    /// Downloads the shards of an erasure-coded slab.
-    /// Successful shards will be decrypted using the
-    /// encryption_key.
-    ///
-    /// offset and limit are the byte range to download
-    /// from each sector.
+    /// Returns the public keys of all known hosts.
+    pub(crate) fn known_hosts(&self) -> Vec<PublicKey> {
+        self.hosts.hosts()
+    }
+
+    /// Queries a single host for account balance and prices.
+    pub(crate) async fn host_account_info(&self, host_key: PublicKey) -> HostAccountInfo {
+        let balance = self
+            .transport
+            .account_balance(host_key, &self.account_key)
+            .await;
+        let prices = self.transport.host_prices(host_key, false).await;
+        HostAccountInfo {
+            host_key,
+            balance: balance.map_err(DownloadError::from),
+            prices: prices.map_err(DownloadError::from),
+        }
+    }
+
+    /// Sends a host-active notification if the channel is present.
+    fn notify_host_active(
+        &self,
+        host_active: &Option<mpsc::UnboundedSender<Host>>,
+        host_key: &PublicKey,
+    ) {
+        if let Some(tx) = host_active {
+            if let Some(host) = self.hosts.host(host_key) {
+                let _ = tx.send(host);
+            }
+        }
+    }
+
     async fn download_slab_shards(
         &self,
         encryption_key: &EncryptionKey,
@@ -136,19 +182,18 @@ impl Downloader {
         offset: u64,
         length: u64,
         max_inflight: usize,
+        host_active: &Option<mpsc::UnboundedSender<Host>>,
     ) -> Result<Vec<Option<Vec<u8>>>, DownloadError> {
-        if sectors.len() < min_shards as usize {
-            return Err(DownloadError::InvalidSlab(format!(
-                "not enough sectors: have {}, need at least {}",
-                sectors.len(),
-                min_shards
-            )));
-        }
+        let total_shards = sectors.len();
+        let zero_key = PublicKey::new([0u8; 32]);
 
+        // Filter out unassigned sectors (zero host key),
+        // preserving original indices for erasure coding
         let semaphore = Arc::new(Semaphore::new(max_inflight));
         let mut sectors = sectors
             .iter()
             .enumerate()
+            .filter(|(_, s)| s.host_key != zero_key)
             .map(|(index, s)| SectorDownloadTask {
                 sector: s.clone(),
                 offset,
@@ -156,15 +201,19 @@ impl Downloader {
                 index,
             })
             .collect::<Vec<_>>();
+
+        if sectors.len() < min_shards as usize {
+            return Err(DownloadError::NotEnoughShards(0, min_shards));
+        }
         self.hosts
             .prioritize(&mut sectors, |task| &task.sector.host_key);
-        let total_shards = sectors.len();
         let mut sectors = VecDeque::from(sectors);
         let mut download_tasks = JoinSet::new();
         for _ in 0..min_shards {
             match sectors.pop_front() {
                 Some(task) => {
                     let permit = semaphore.clone().acquire_owned().await?;
+                    self.notify_host_active(host_active, &task.sector.host_key);
                     let transport = self.transport.clone();
                     let account_key = self.account_key.clone();
                     join_set_spawn!(
@@ -202,6 +251,7 @@ impl Downloader {
                 while download_tasks.len() < rem as usize {
                     if let Some(task) = sectors.pop_front() {
                         let permit = semaphore.clone().acquire_owned().await?;
+                        self.notify_host_active(host_active, &task.sector.host_key);
                         let transport = self.transport.clone();
                         let account_key = self.account_key.clone();
                         join_set_spawn!(
@@ -217,7 +267,8 @@ impl Downloader {
             tokio::select! {
                 biased;
                 Some(res) = download_tasks.join_next() => {
-                    match res? { // safe because tasks are never cancelled
+                    let (host_key, result) = res?; // safe because tasks are never cancelled
+                    match result {
                         Ok((index, mut data)) => {
                             let encryption_key = encryption_key.clone();
                             let data = maybe_spawn_blocking!({
@@ -231,8 +282,9 @@ impl Downloader {
                             }
                         }
                         Err(e) => {
+                            self.hosts.add_failure(&host_key);
                             total_failures += 1;
-                            debug!("sector download failed ({total_failures}/{MAX_TOTAL_FAILURES}): {:?}", e);
+                            debug!("sector download from {} failed ({total_failures}/{MAX_TOTAL_FAILURES}): {:?}", host_key, e);
 
                             if total_failures >= MAX_TOTAL_FAILURES {
                                 return Err(DownloadError::NotEnoughShards(successful, min_shards));
@@ -247,6 +299,7 @@ impl Downloader {
                                 let transport = self.transport.clone();
                                 let account_key = self.account_key.clone();
                                 let permit = semaphore.clone().acquire_owned().await?;
+                                self.notify_host_active(host_active, &task.sector.host_key);
                                 // only spawn additional download tasks if there
                                 // are not enough to satisfy the required number
                                 // of shards. The sleep arm will handle slow
@@ -264,6 +317,7 @@ impl Downloader {
                 _ = sleep(Duration::from_secs(1)) => {
                     if let Ok(racer_permit) = semaphore.clone().try_acquire_owned()
                         && let Some(task) = sectors.pop_front() {
+                            self.notify_host_active(host_active, &task.sector.host_key);
                             let transport = self.transport.clone();
                             let account_key = self.account_key.clone();
                             join_set_spawn!(download_tasks, Self::try_download_sector(
@@ -325,6 +379,7 @@ impl Downloader {
                     shard_offset,
                     shard_length,
                     options.max_inflight,
+                    &options.host_active,
                 )
                 .await?;
             let data_shards = slab.min_shards as usize;
@@ -343,7 +398,7 @@ impl Downloader {
             .await?;
             length -= slab_length;
             if let Some(ref tx) = options.slab_downloaded {
-                let _ = tx.send(());
+                let _ = tx.send(slab_length);
             }
         }
         w.flush().await?;

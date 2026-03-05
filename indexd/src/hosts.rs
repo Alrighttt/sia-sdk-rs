@@ -167,14 +167,8 @@ impl PartialOrd for HostMetric {
 }
 
 #[derive(Debug)]
-struct HostInfo {
-    addresses: Vec<NetAddress>,
-    good_for_upload: bool,
-}
-
-#[derive(Debug)]
 struct HostsInner {
-    hosts: HashMap<PublicKey, HostInfo>,
+    hosts: HashMap<PublicKey, Host>,
     preferred_hosts: PriorityQueue<PublicKey, HostMetric>,
 }
 
@@ -210,6 +204,12 @@ impl Hosts {
         inner.hosts.get(host_key).map(|h| h.addresses.clone())
     }
 
+    /// Returns a clone of the full Host data for the given public key.
+    pub fn host(&self, host_key: &PublicKey) -> Option<Host> {
+        let inner = self.inner.read().unwrap();
+        inner.hosts.get(host_key).cloned()
+    }
+
     /// Sorts a list of hosts according to their priority in the client's
     /// preferred hosts queue. The function `f` is used to extract the
     /// public key from each item.
@@ -234,17 +234,10 @@ impl Hosts {
         let mut inner = self.inner.write().unwrap();
         inner.hosts.clear();
         for host in hosts {
-            inner.hosts.insert(
-                host.public_key,
-                HostInfo {
-                    addresses: host.addresses,
-                    good_for_upload: host.good_for_upload,
-                },
-            );
-            if !inner.preferred_hosts.contains(&host.public_key) {
-                inner
-                    .preferred_hosts
-                    .push(host.public_key, HostMetric::default());
+            let pk = host.public_key;
+            inner.hosts.insert(pk, host);
+            if !inner.preferred_hosts.contains(&pk) {
+                inner.preferred_hosts.push(pk, HostMetric::default());
             }
         }
     }

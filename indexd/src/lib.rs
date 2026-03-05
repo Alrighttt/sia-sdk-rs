@@ -25,9 +25,13 @@ mod rhp4;
 macro_rules! maybe_spawn_blocking {
     ($body:expr) => {{
         #[cfg(not(target_arch = "wasm32"))]
-        { tokio::task::spawn_blocking(move || $body).await? }
+        {
+            tokio::task::spawn_blocking(move || $body).await?
+        }
         #[cfg(target_arch = "wasm32")]
-        { $body }
+        {
+            $body
+        }
     }};
 }
 
@@ -67,9 +71,9 @@ pub(crate) mod wasm_time;
 
 // Unified re-exports so consumers don't need cfg-gated imports.
 #[cfg(not(target_arch = "wasm32"))]
-pub(crate) use tokio::time::{sleep, Instant};
+pub(crate) use tokio::time::{Instant, sleep};
 #[cfg(target_arch = "wasm32")]
-pub(crate) use wasm_time::{sleep, Instant};
+pub(crate) use wasm_time::{Instant, sleep};
 
 #[cfg(target_arch = "wasm32")]
 pub mod js_chunked_reader;
@@ -111,7 +115,7 @@ impl SDK {
         app_key: Arc<PrivateKey>,
         tls_config: rustls::ClientConfig,
     ) -> Result<Self, BuilderError> {
-        let usable_hosts = api_client.hosts(&app_key, HostQuery::default()).await?;
+        let usable_hosts = Self::fetch_all_hosts(&api_client, &app_key).await?;
         let hosts = Hosts::new();
         hosts.update(usable_hosts);
 
@@ -134,32 +138,56 @@ impl SDK {
         api_client: Arc<dyn AppClient>,
         app_key: Arc<PrivateKey>,
     ) -> Result<Self, BuilderError> {
-        // Fetch only QUIC hosts — WASM uses WebTransport which requires QUIC.
-        let usable_hosts = api_client.hosts(&app_key, HostQuery {
-            protocol: Some(sia::types::v2::Protocol::QUIC),
-            ..Default::default()
-        }).await?;
+        // Fetch all usable hosts (no protocol filter). The WebTransport client
+        // filters for QUIC addresses at connection time, but loading all hosts
+        // ensures we don't miss any that have data we need for downloads.
+        let usable_hosts = Self::fetch_all_hosts(&api_client, &app_key).await?;
         let hosts = Hosts::new();
         hosts.update(usable_hosts);
 
         let transport = web_transport::Client::new(hosts.clone());
 
-        let downloader = Downloader::new(
-            hosts.clone(),
-            Arc::new(transport.clone()),
-            app_key.clone(),
-        );
-        let uploader = Uploader::new(
-            hosts.clone(),
-            Arc::new(transport),
-            app_key.clone(),
-        );
+        let downloader =
+            Downloader::new(hosts.clone(), Arc::new(transport.clone()), app_key.clone());
+        let uploader = Uploader::new(hosts.clone(), Arc::new(transport), app_key.clone());
         Ok(Self {
             app_key,
             api_client,
             downloader,
             uploader,
         })
+    }
+
+    /// Paginates through the /hosts endpoint to fetch all usable hosts.
+    /// The server caps responses at 500 hosts, so this makes multiple
+    /// requests with increasing offsets until all hosts are retrieved.
+    async fn fetch_all_hosts(
+        api_client: &Arc<dyn AppClient>,
+        app_key: &Arc<PrivateKey>,
+    ) -> Result<Vec<Host>, crate::app_client::Error> {
+        const PAGE_SIZE: u64 = 500;
+        let mut all_hosts = Vec::new();
+        let mut offset = 0u64;
+        loop {
+            let page = api_client
+                .hosts(
+                    app_key,
+                    HostQuery {
+                        offset: Some(offset),
+                        limit: Some(PAGE_SIZE),
+                        ..Default::default()
+                    },
+                )
+                .await?;
+            let count = page.len() as u64;
+            all_hosts.extend(page);
+            if count < PAGE_SIZE {
+                break;
+            }
+            offset += count;
+        }
+        log::info!("loaded {} usable hosts", all_hosts.len());
+        Ok(all_hosts)
     }
 
     /// Returns the application key used by the SDK.
@@ -214,6 +242,16 @@ impl SDK {
     /// A [PackedUpload] that can be used to add objects and finalize the upload.
     pub fn upload_packed(&self, options: UploadOptions) -> PackedUpload {
         self.uploader.upload_packed(options)
+    }
+
+    /// Returns the public keys of all known hosts.
+    pub fn known_hosts(&self) -> Vec<sia::signing::PublicKey> {
+        self.downloader.known_hosts()
+    }
+
+    /// Queries a single host for account balance and prices.
+    pub async fn host_account_info(&self, host_key: sia::signing::PublicKey) -> HostAccountInfo {
+        self.downloader.host_account_info(host_key).await
     }
 
     /// Downloads an object using the provided writer and options.

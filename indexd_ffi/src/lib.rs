@@ -859,6 +859,7 @@ impl SDK {
                         length: Some(max_length.min(CHUNK_SIZE as u64)),
                         max_inflight: max_inflight as usize,
                         slab_downloaded: None,
+                        host_active: None,
                     },
                 )
                 .await?;

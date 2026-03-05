@@ -3,7 +3,7 @@ use bytes::Bytes;
 use sia::encoding;
 use sia::rhp::{self, HostPrices};
 use sia::signing::{PrivateKey, PublicKey};
-use sia::types::Hash256;
+use sia::types::{Currency, Hash256};
 use thiserror::Error;
 
 #[derive(Debug, Error)]
@@ -62,4 +62,9 @@ pub(crate) trait RHP4Client: MaybeSendSync {
         offset: usize,
         length: usize,
     ) -> Result<Bytes, Error>;
+    async fn account_balance(
+        &self,
+        host_key: PublicKey,
+        account_key: &PrivateKey,
+    ) -> Result<Currency, Error>;
 }

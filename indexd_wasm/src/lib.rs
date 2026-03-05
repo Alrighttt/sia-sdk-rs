@@ -7,7 +7,7 @@ use std::task::{Context, Poll};
 
 use indexd::app_client::{RegisterAppRequest, RegisterAppResponse};
 use js_sys::Uint8Array;
-use sia::rhp::SECTOR_SIZE;
+use sia::rhp::{Host, SECTOR_SIZE};
 use sia::seed::Seed;
 use sia::signing::{PrivateKey, Signature};
 use sia::types::Hash256;
@@ -105,13 +105,15 @@ impl DownloadOptions {
 impl DownloadOptions {
     fn into_indexd(
         self,
-        tx: Option<tokio::sync::mpsc::UnboundedSender<()>>,
+        tx: Option<tokio::sync::mpsc::UnboundedSender<u64>>,
+        host_active: Option<tokio::sync::mpsc::UnboundedSender<Host>>,
     ) -> indexd::DownloadOptions {
         indexd::DownloadOptions {
             max_inflight: self.max_inflight,
             offset: 0,
             length: None,
             slab_downloaded: tx,
+            host_active,
         }
     }
 
@@ -119,13 +121,15 @@ impl DownloadOptions {
         self,
         offset: u64,
         length: u64,
-        tx: Option<tokio::sync::mpsc::UnboundedSender<()>>,
+        tx: Option<tokio::sync::mpsc::UnboundedSender<u64>>,
+        host_active: Option<tokio::sync::mpsc::UnboundedSender<Host>>,
     ) -> indexd::DownloadOptions {
         indexd::DownloadOptions {
             max_inflight: self.max_inflight,
             offset,
             length: Some(length),
             slab_downloaded: tx,
+            host_active,
         }
     }
 }
@@ -174,6 +178,26 @@ pub fn set_log_level(level: &str) {
 /// Converts a JsValue error context into a JsError.
 fn to_js_err(e: impl std::fmt::Display) -> JsError {
     JsError::new(&e.to_string())
+}
+
+/// Converts a Rust `Host` into a JS object with fields:
+/// `{ publicKey, addresses: [{protocol, address}], countryCode, latitude, longitude, goodForUpload }`
+fn host_to_js(host: &Host) -> JsValue {
+    let obj = js_sys::Object::new();
+    js_sys::Reflect::set(&obj, &"publicKey".into(), &host.public_key.to_string().into()).unwrap();
+    let addrs = js_sys::Array::new();
+    for addr in &host.addresses {
+        let a = js_sys::Object::new();
+        js_sys::Reflect::set(&a, &"protocol".into(), &addr.protocol.as_str().into()).unwrap();
+        js_sys::Reflect::set(&a, &"address".into(), &addr.address.clone().into()).unwrap();
+        addrs.push(&a);
+    }
+    js_sys::Reflect::set(&obj, &"addresses".into(), &addrs).unwrap();
+    js_sys::Reflect::set(&obj, &"countryCode".into(), &host.country_code.clone().into()).unwrap();
+    js_sys::Reflect::set(&obj, &"latitude".into(), &host.latitude.into()).unwrap();
+    js_sys::Reflect::set(&obj, &"longitude".into(), &host.longitude.into()).unwrap();
+    js_sys::Reflect::set(&obj, &"goodForUpload".into(), &host.good_for_upload.into()).unwrap();
+    obj.into()
 }
 
 // ── StreamingUpload ─────────────────────────────────────────────────────
@@ -495,7 +519,7 @@ impl SDK {
         let mut buf = vec![0u8; size];
 
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
-        let options = options.into_indexd(Some(tx));
+        let options = options.into_indexd(Some(tx), None);
 
         let on_progress = on_progress.clone();
         local
@@ -521,7 +545,7 @@ impl SDK {
     }
 
     /// Downloads an object with streaming chunks.
-    /// Fires `on_chunk(bytes)` after each slab is decoded and `on_progress(current, total)` for progress.
+    /// Fires `on_chunk(bytes)` after each slab is decoded and `on_progress(bytesDownloaded, totalBytes)` for progress.
     #[wasm_bindgen(js_name = "downloadStreaming")]
     pub async fn download_streaming(
         &self,
@@ -567,10 +591,10 @@ impl SDK {
         let _guard = rt.enter();
         let local = tokio::task::LocalSet::new();
         let obj = object.inner.lock().map_err(to_js_err)?.clone();
-        let total_slabs = obj.slabs().len() as u32;
+        let total_bytes = obj.size() as f64;
 
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
-        let options = options.into_indexd(Some(tx));
+        let options = options.into_indexd(Some(tx), None);
 
         let mut writer = ChunkWriter {
             callback: on_chunk.clone(),
@@ -580,13 +604,13 @@ impl SDK {
         local
             .run_until(async {
                 tokio::task::spawn_local(async move {
-                    let mut count: u32 = 0;
-                    while rx.recv().await.is_some() {
-                        count += 1;
+                    let mut bytes_downloaded: u64 = 0;
+                    while let Some(slab_bytes) = rx.recv().await {
+                        bytes_downloaded += slab_bytes;
                         let _ = on_progress.call2(
                             &JsValue::NULL,
-                            &JsValue::from(count),
-                            &JsValue::from(total_slabs),
+                            &JsValue::from(bytes_downloaded as f64),
+                            &JsValue::from(total_bytes),
                         );
                     }
                 });
@@ -601,12 +625,20 @@ impl SDK {
     ///
     /// Used by slab download workers to enable parallel slab downloads across
     /// multiple Web Workers, each with their own SDK instance and thread.
+    ///
+    /// The optional `on_host_active` callback is called with a Host object
+    /// each time a sector download is initiated, enabling the caller to display
+    /// which host is currently being downloaded from.
+    ///
+    /// The callback receives a JS object with fields:
+    /// `{ publicKey, addresses: [{protocol, address}], countryCode, latitude, longitude, goodForUpload }`
     #[wasm_bindgen(js_name = "downloadSlabByIndex")]
     pub async fn download_slab_by_index(
         &self,
         object: &PinnedObject,
         slab_index: u32,
         options: DownloadOptions,
+        on_host_active: Option<js_sys::Function>,
     ) -> Result<Uint8Array, JsError> {
         let obj = object.inner.lock().map_err(to_js_err)?.clone();
         let slabs = obj.slabs();
@@ -623,8 +655,6 @@ impl SDK {
         let length = slabs[idx].length as u64;
         let mut buf = vec![0u8; length as usize];
 
-        let options = options.into_indexd_ranged(offset, length, None);
-
         let rt = tokio::runtime::Builder::new_current_thread()
             .build()
             .map_err(to_js_err)?;
@@ -632,6 +662,19 @@ impl SDK {
         let local = tokio::task::LocalSet::new();
         local
             .run_until(async {
+                let host_tx = on_host_active.as_ref().map(|cb| {
+                    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<Host>();
+                    let cb = cb.clone();
+                    tokio::task::spawn_local(async move {
+                        while let Some(host) = rx.recv().await {
+                            let js_host = host_to_js(&host);
+                            let _ = cb.call1(&JsValue::NULL, &js_host);
+                        }
+                    });
+                    tx
+                });
+
+                let options = options.into_indexd_ranged(offset, length, None, host_tx);
                 self.inner
                     .download(&mut Cursor::new(&mut buf), &obj, options)
                     .await
@@ -1003,6 +1046,63 @@ impl SDK {
             "lastUsed": a.last_used.timestamp_millis(),
         });
         serde_wasm_bindgen::to_value(&obj).map_err(to_js_err)
+    }
+
+    /// Returns the public keys of all known hosts as a JS string array.
+    #[wasm_bindgen(js_name = "knownHosts")]
+    pub fn known_hosts(&self) -> JsValue {
+        let keys = self.inner.known_hosts();
+        let arr = js_sys::Array::new();
+        for k in keys {
+            arr.push(&k.to_string().into());
+        }
+        arr.into()
+    }
+
+    /// Queries a single host for account balance and prices.
+    /// Returns `{hostKey, balance, egressPrice, ingressPrice, storagePrice}`
+    /// or error fields `balanceError` / `pricesError`.
+    #[wasm_bindgen(js_name = "hostAccountInfo")]
+    pub async fn host_account_info(&self, host_key: &str) -> Result<JsValue, JsError> {
+        let pk = sia::signing::PublicKey::from_str(host_key).map_err(to_js_err)?;
+        let info = self.inner.host_account_info(pk).await;
+
+        let obj = js_sys::Object::new();
+        js_sys::Reflect::set(&obj, &"hostKey".into(), &host_key.into()).unwrap();
+        match info.balance {
+            Ok(balance) => {
+                js_sys::Reflect::set(&obj, &"balance".into(), &balance.to_string().into()).unwrap();
+            }
+            Err(e) => {
+                js_sys::Reflect::set(&obj, &"balanceError".into(), &format!("{e}").into()).unwrap();
+            }
+        }
+        match info.prices {
+            Ok(prices) => {
+                js_sys::Reflect::set(
+                    &obj,
+                    &"egressPrice".into(),
+                    &prices.egress_price.to_string().into(),
+                )
+                .unwrap();
+                js_sys::Reflect::set(
+                    &obj,
+                    &"ingressPrice".into(),
+                    &prices.ingress_price.to_string().into(),
+                )
+                .unwrap();
+                js_sys::Reflect::set(
+                    &obj,
+                    &"storagePrice".into(),
+                    &prices.storage_price.to_string().into(),
+                )
+                .unwrap();
+            }
+            Err(e) => {
+                js_sys::Reflect::set(&obj, &"pricesError".into(), &format!("{e}").into()).unwrap();
+            }
+        }
+        Ok(obj.into())
     }
 
     /// Retrieves a pinned object by its hex-encoded key.

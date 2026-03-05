@@ -8,11 +8,12 @@ use js_sys::{Reflect, Uint8Array};
 use log::debug;
 use sia::encoding_async::{AsyncDecoder, AsyncEncoder};
 use sia::rhp::{
-    self, AccountToken, HostPrices, RPCReadSector, RPCSettings, RPCWriteSector, Transport,
+    self, AccountToken, HostPrices, RPCAccountBalance, RPCReadSector, RPCSettings, RPCWriteSector,
+    Transport,
 };
 use sia::signing::{PrivateKey, PublicKey};
-use sia::types::Hash256;
 use sia::types::v2::Protocol;
+use sia::types::{Currency, Hash256};
 use wasm_bindgen::prelude::*;
 use wasm_bindgen_futures::JsFuture;
 use web_sys::{ReadableStreamDefaultReader, WritableStreamDefaultWriter};
@@ -176,9 +177,8 @@ async fn connect(address: &str) -> Result<Connection, Error> {
     debug!("[WT] connecting to {url}");
 
     let options = web_sys::WebTransportOptions::new();
-    let wt = web_sys::WebTransport::new_with_options(&url, &options).map_err(|e| {
-        Error::Transport(format!("WebTransport constructor error: {:?}", e))
-    })?;
+    let wt = web_sys::WebTransport::new_with_options(&url, &options)
+        .map_err(|e| Error::Transport(format!("WebTransport constructor error: {:?}", e)))?;
 
     // Wrap immediately so .close() is called if ready() fails or
     // the future is cancelled (e.g. by a timeout in tokio::select!).
@@ -430,6 +430,27 @@ impl RHP4Client for Client {
         if result.is_err() {
             self.evict_connection(&host_key);
             self.evict_prices(&host_key);
+        }
+        result
+    }
+
+    async fn account_balance(
+        &self,
+        host_key: PublicKey,
+        account_key: &PrivateKey,
+    ) -> Result<Currency, Error> {
+        let conn = self.host_connection(host_key).await?;
+        let result: Result<Currency, Error> = async {
+            let stream = conn.open_stream().await?;
+            let resp = RPCAccountBalance::send_request(stream, account_key.public_key())
+                .await?
+                .complete()
+                .await?;
+            Ok(resp.balance)
+        }
+        .await;
+        if result.is_err() {
+            self.evict_connection(&host_key);
         }
         result
     }
