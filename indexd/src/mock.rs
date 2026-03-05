@@ -132,7 +132,7 @@ impl RHP4Client for Arc<MockRHP4Client> {
 }
 
 pub struct MockUploader {
-    uploader: Uploader<Arc<MockRHP4Client>>,
+    uploader: Uploader,
 }
 
 impl MockUploader {
@@ -156,7 +156,7 @@ impl MockUploader {
 }
 
 pub struct MockDownloader {
-    downloader: Downloader<Arc<MockRHP4Client>>,
+    downloader: Downloader,
 }
 
 impl MockDownloader {
