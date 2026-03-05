@@ -186,6 +186,99 @@ const { txid, blockHeight, timestamp, block } = JSON.parse(resultJson);
 5. **SendV2Blocks** — fetches full blocks by height for decoding transactions, miner payouts, and contract data
 6. **IndexedDB caching** — synced header IDs and fetched blocks are cached in the browser's IndexedDB, enabling incremental sync across page reloads
 
+## Binary Formats
+
+The syncer WASM crate defines two compact binary formats for client-side blockchain data. Light clients can retrieve these from peers via a planned Syncer RPC command, generate them locally from downloaded blocks for stronger trust guarantees, or load them from static files. Once obtained, they are cached in IndexedDB for offline use.
+
+### SCBF — Sia Compact Block Filters
+
+SCBF files enable light clients to find blocks relevant to their addresses without downloading the full chain. Each block gets a Golomb-Coded Set (GCS) filter encoding the set of addresses that appear in that block's transactions. A client tests each filter locally and only fetches the few blocks that actually match — reducing bandwidth by orders of magnitude compared to a full chain scan.
+
+**GCS Construction**
+
+- Each address is a 32-byte Sia address (Blake2b-256 hash)
+- SipHash-2-4 key derived from block ID: `k0 = LE64(blockID[0:8])`, `k1 = LE64(blockID[8:16])`
+- Each address is hashed to `[0, N*M)` via SipHash + fast\_reduce, where `N` = address count, `M = 2^P`
+- Sorted hashed values are delta-encoded with Golomb-Rice coding at parameter `P` (typically 19)
+- Golomb-Rice: for each delta `d`, write `(d >> P)` zeros + one 1-bit (unary quotient), then the low `P` bits MSB-first
+- False positive rate ≈ `1/M` per block (≈ 1 in 524,288 at P=19)
+
+**Version 1 Wire Format**
+
+All integers are unsigned little-endian.
+
+```
+Header (24 bytes):
+  [0:4]    magic       "SCBF" (0x53 0x43 0x42 0x46)
+  [4:8]    version     uint32 = 1
+  [8:12]   count       uint32, number of block entries
+  [12:16]  P           uint32, Golomb-Rice parameter
+  [16:24]  tipHeight   uint64, chain height at time of generation
+
+Entries (repeated `count` times, variable length):
+  [0:8]    height      uint64, block height
+  [8:40]   blockID     [32]byte, block ID (hash)
+  [40:42]  addrCount   uint16, number of addresses in the filter
+  [42:46]  dataLen     uint32, byte length of the GCS filter data
+  [46:46+dataLen]      GCS filter bitstream (Golomb-Rice encoded)
+```
+
+**Version 2 Wire Format (compact)**
+
+Designed for contiguous block ranges (e.g. V2-only sync from a known activation height). Heights are implicit: entry `i` has height = `startHeight + i`. Data lengths use uint16 (individual block filters are well under 64 KB).
+
+```
+Header (32 bytes):
+  [0:4]    magic       "SCBF"
+  [4:8]    version     uint32 = 2
+  [8:12]   count       uint32, number of block entries
+  [12:16]  P           uint32, Golomb-Rice parameter
+  [16:24]  tipHeight   uint64, chain height at time of generation
+  [24:32]  startHeight uint64, height of the first entry
+
+Entries (repeated `count` times, variable length):
+  [0:32]   blockID     [32]byte, block ID
+  [32:34]  addrCount   uint16, number of addresses
+  [34:36]  dataLen     uint16, byte length of GCS data
+  [36:36+dataLen]      GCS filter bitstream
+```
+
+**Workflow**
+
+1. **Generate** — sync chain blocks, extract addresses per block, build GCS filter for each, serialize to SCBF. Can be hosted as a static file (Brotli-compressed) or stored in IndexedDB.
+2. **Scan** — load SCBF, test each block's filter against target addresses. Collect matching block heights.
+3. **Fetch** — download only matching blocks from a peer and extract transaction details.
+
+### STXI — Sia Transaction Index
+
+STXI files provide compact transaction lookup by ID. The index maps 8-byte transaction ID prefixes to block heights, sorted for binary search. A client searches the index to find which block contains a transaction, then fetches only that block.
+
+The 8-byte prefix is sufficient for practical uniqueness — with ~1M transactions, the probability of a prefix collision is roughly 1 in 10^13 (birthday bound at 2^64). On a collision, the client fetches the small number of candidate blocks and checks full transaction IDs.
+
+**Version 1 Wire Format**
+
+All integers are unsigned little-endian. Entries MUST be sorted by prefix in ascending lexicographic (byte) order to enable binary search.
+
+```
+Header (16 bytes):
+  [0:4]    magic       "STXI" (0x53 0x54 0x58 0x49)
+  [4:8]    version     uint32 = 1
+  [8:12]   count       uint32, number of entries
+  [12:16]  tipHeight   uint32, chain height at time of generation
+
+Entries (repeated `count` times, fixed 12 bytes each):
+  [0:8]    prefix      [8]byte, first 8 bytes of the transaction ID
+  [8:12]   height      uint32, block height containing this transaction
+```
+
+Total size: `16 + (count * 12)` bytes. ~1M transactions ≈ 12 MB.
+
+**Workflow**
+
+1. **Generate** — sync chain blocks, collect `(txid_prefix, height)` for each V2 transaction, sort by prefix, serialize.
+2. **Lookup** — binary search for the target txid prefix. Multiple matches are possible (prefix collisions) — collect all candidate heights.
+3. **Fetch** — download candidate blocks from a peer, scan for the full transaction ID.
+
 ## Core Types (`sia_sdk`)
 
 - BIP-39 seed generation and key derivation
