@@ -25,9 +25,13 @@ mod rhp4;
 macro_rules! maybe_spawn_blocking {
     ($body:expr) => {{
         #[cfg(not(target_arch = "wasm32"))]
-        { tokio::task::spawn_blocking(move || $body).await? }
+        {
+            tokio::task::spawn_blocking(move || $body).await?
+        }
         #[cfg(target_arch = "wasm32")]
-        { $body }
+        {
+            $body
+        }
     }};
 }
 
@@ -67,9 +71,9 @@ pub(crate) mod wasm_time;
 
 // Unified re-exports so consumers don't need cfg-gated imports.
 #[cfg(not(target_arch = "wasm32"))]
-pub(crate) use tokio::time::{sleep, Instant};
+pub(crate) use tokio::time::{Instant, sleep};
 #[cfg(target_arch = "wasm32")]
-pub(crate) use wasm_time::{sleep, Instant};
+pub(crate) use wasm_time::{Instant, sleep};
 
 #[cfg(target_arch = "wasm32")]
 pub mod js_chunked_reader;
@@ -143,16 +147,9 @@ impl SDK {
 
         let transport = web_transport::Client::new(hosts.clone());
 
-        let downloader = Downloader::new(
-            hosts.clone(),
-            Arc::new(transport.clone()),
-            app_key.clone(),
-        );
-        let uploader = Uploader::new(
-            hosts.clone(),
-            Arc::new(transport),
-            app_key.clone(),
-        );
+        let downloader =
+            Downloader::new(hosts.clone(), Arc::new(transport.clone()), app_key.clone());
+        let uploader = Uploader::new(hosts.clone(), Arc::new(transport), app_key.clone());
         Ok(Self {
             app_key,
             api_client,

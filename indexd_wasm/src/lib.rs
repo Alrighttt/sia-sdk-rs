@@ -411,7 +411,6 @@ impl PinnedObject {
         }
         Ok(arr)
     }
-
 }
 
 // ── SDK ─────────────────────────────────────────────────────────────────
@@ -641,22 +640,17 @@ impl SDK {
         local
             .run_until(async {
                 let host_tx = on_host_active.as_ref().map(|cb| {
-                    let (tx, mut rx) =
-                        tokio::sync::mpsc::unbounded_channel::<String>();
+                    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<String>();
                     let cb = cb.clone();
                     tokio::task::spawn_local(async move {
                         while let Some(addr) = rx.recv().await {
-                            let _ = cb.call1(
-                                &JsValue::NULL,
-                                &JsValue::from_str(&addr),
-                            );
+                            let _ = cb.call1(&JsValue::NULL, &JsValue::from_str(&addr));
                         }
                     });
                     tx
                 });
 
-                let options =
-                    options.into_indexd_ranged(offset, length, None, host_tx);
+                let options = options.into_indexd_ranged(offset, length, None, host_tx);
                 self.inner
                     .download(&mut Cursor::new(&mut buf), &obj, options)
                     .await
@@ -1053,12 +1047,10 @@ impl SDK {
         js_sys::Reflect::set(&obj, &"hostKey".into(), &host_key.into()).unwrap();
         match info.balance {
             Ok(balance) => {
-                js_sys::Reflect::set(&obj, &"balance".into(), &balance.to_string().into())
-                    .unwrap();
+                js_sys::Reflect::set(&obj, &"balance".into(), &balance.to_string().into()).unwrap();
             }
             Err(e) => {
-                js_sys::Reflect::set(&obj, &"balanceError".into(), &format!("{e}").into())
-                    .unwrap();
+                js_sys::Reflect::set(&obj, &"balanceError".into(), &format!("{e}").into()).unwrap();
             }
         }
         match info.prices {
@@ -1083,8 +1075,7 @@ impl SDK {
                 .unwrap();
             }
             Err(e) => {
-                js_sys::Reflect::set(&obj, &"pricesError".into(), &format!("{e}").into())
-                    .unwrap();
+                js_sys::Reflect::set(&obj, &"pricesError".into(), &format!("{e}").into()).unwrap();
             }
         }
         Ok(obj.into())

@@ -10,15 +10,14 @@ use sia::types::Hash256;
 use thiserror::Error;
 use url::Url;
 
+use crate::SDK;
 use crate::app_client::{self, AppClient, Client, RegisterAppRequest, RegisterAppResponse};
 use crate::object_encryption::derive;
-use crate::SDK;
 
 #[cfg(not(target_arch = "wasm32"))]
 use crate::quic;
 
 use crate::sleep;
-
 
 /// The initial state of the SDK builder, before connecting to the indexd service.
 pub struct DisconnectedState;
@@ -106,10 +105,7 @@ impl Builder<DisconnectedState> {
         Ok(Some(sdk))
     }
     #[cfg(target_arch = "wasm32")]
-    pub async fn connected(
-        &self,
-        app_key: &PrivateKey,
-    ) -> Result<Option<SDK>, BuilderError> {
+    pub async fn connected(&self, app_key: &PrivateKey) -> Result<Option<SDK>, BuilderError> {
         let connected = self.client.check_app_authenticated(app_key).await?;
         if !connected {
             return Ok(None);
@@ -222,10 +218,7 @@ impl Builder<ApprovedState> {
     /// # Errors
     /// Returns [BuilderError] if the registration fails or the SDK cannot be created.
     #[cfg(target_arch = "wasm32")]
-    pub async fn register(
-        self,
-        mnemonic: &str,
-    ) -> Result<SDK, BuilderError> {
+    pub async fn register(self, mnemonic: &str) -> Result<SDK, BuilderError> {
         let app_key = derive_app_key(mnemonic, &self.state.app_id, &self.state.user_secret)?;
         self.client
             .register_app(&app_key, self.state.register_url.clone())

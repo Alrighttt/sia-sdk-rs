@@ -12,8 +12,8 @@ use sia::rhp::{
     Transport,
 };
 use sia::signing::{PrivateKey, PublicKey};
-use sia::types::{Currency, Hash256};
 use sia::types::v2::Protocol;
+use sia::types::{Currency, Hash256};
 use wasm_bindgen::prelude::*;
 use wasm_bindgen_futures::JsFuture;
 use web_sys::{ReadableStreamDefaultReader, WritableStreamDefaultWriter};
@@ -177,9 +177,8 @@ async fn connect(address: &str) -> Result<Connection, Error> {
     debug!("[WT] connecting to {url}");
 
     let options = web_sys::WebTransportOptions::new();
-    let wt = web_sys::WebTransport::new_with_options(&url, &options).map_err(|e| {
-        Error::Transport(format!("WebTransport constructor error: {:?}", e))
-    })?;
+    let wt = web_sys::WebTransport::new_with_options(&url, &options)
+        .map_err(|e| Error::Transport(format!("WebTransport constructor error: {:?}", e)))?;
 
     // Wrap immediately so .close() is called if ready() fails or
     // the future is cancelled (e.g. by a timeout in tokio::select!).

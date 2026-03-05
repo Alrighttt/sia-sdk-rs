@@ -23,8 +23,8 @@ use sia::rhp::{
     Transport,
 };
 use sia::signing::{PrivateKey, PublicKey};
-use sia::types::{Currency, Hash256};
 use sia::types::v2::Protocol;
+use sia::types::{Currency, Hash256};
 
 use crate::{Hosts, RHP4Client};
 

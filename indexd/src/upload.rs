@@ -2,6 +2,7 @@ use std::io::{self, Cursor};
 use std::sync::Arc;
 use std::time::Duration;
 
+use crate::{Instant, sleep};
 use bytes::Bytes;
 use log::debug;
 use sia::encryption::{CipherReader, EncryptionKey, encrypt_shard};
@@ -12,11 +13,10 @@ use thiserror::Error;
 use tokio::io::{AsyncReadExt, AsyncWriteExt, BufReader, SimplexStream, WriteHalf, copy, simplex};
 use tokio::sync::{OwnedSemaphorePermit, Semaphore, mpsc};
 use tokio::task::JoinSet;
-use crate::{Instant, sleep};
-#[cfg(not(target_arch = "wasm32"))]
-use tokio::time::timeout;
 #[cfg(not(target_arch = "wasm32"))]
 use tokio::time::error::Elapsed;
+#[cfg(not(target_arch = "wasm32"))]
+use tokio::time::timeout;
 use tokio_util::task::AbortOnDropHandle;
 
 use crate::hosts::{HostQueue, QueueError};
@@ -73,7 +73,6 @@ pub struct UploadOptions {
     /// Optional channel to notify when each shard is uploaded.
     /// This can be used to implement progress reporting.
     pub shard_uploaded: Option<mpsc::UnboundedSender<()>>,
-
 }
 
 impl Default for UploadOptions {
@@ -260,7 +259,10 @@ impl Uploader {
                 )));
             }
         };
-        debug!("upload_shard: SUCCESS host={host_key} elapsed={:?}", now.elapsed());
+        debug!(
+            "upload_shard: SUCCESS host={host_key} elapsed={:?}",
+            now.elapsed()
+        );
         Ok(Sector { root, host_key })
     }
 
@@ -283,15 +285,21 @@ impl Uploader {
         let (host_key, attempts) = initial_host;
         let mut write_timeout = Self::upload_timeout(attempts); // mutable so that it can be adjusted on retries
         let mut tasks = JoinSet::new();
-        debug!("upload_slab_shard: slab {slab_index} shard {shard_index} START host={host_key} queue_remaining={}", hosts.len());
-        join_set_spawn!(tasks, Self::upload_shard(
-            transport.clone(),
-            hosts.clone(),
-            host_key,
-            account_key.clone(),
-            data.clone(),
-            write_timeout,
-        ));
+        debug!(
+            "upload_slab_shard: slab {slab_index} shard {shard_index} START host={host_key} queue_remaining={}",
+            hosts.len()
+        );
+        join_set_spawn!(
+            tasks,
+            Self::upload_shard(
+                transport.clone(),
+                hosts.clone(),
+                host_key,
+                account_key.clone(),
+                data.clone(),
+                write_timeout,
+            )
+        );
         let semaphore = permit.semaphore();
         let mut total_failures: usize = 0;
 
@@ -404,7 +412,10 @@ impl Uploader {
         let mut slab_upload_tasks = JoinSet::new();
         let rs = Arc::new(ErasureCoder::new(data_shards, parity_shards).unwrap());
         let mut slab_index: usize = 0;
-        debug!("upload_slabs: starting upload ({data_shards} data + {parity_shards} parity shards, max_inflight={})", options.max_inflight);
+        debug!(
+            "upload_slabs: starting upload ({data_shards} data + {parity_shards} parity shards, max_inflight={})",
+            options.max_inflight
+        );
         loop {
             let slab_permit = slab_sema.clone().acquire_owned().await?;
             let mut shards = vec![vec![0u8; SECTOR_SIZE]; total_shards];
@@ -412,7 +423,10 @@ impl Uploader {
             let length =
                 ErasureCoder::read_slab_shards(&mut r, options.data_shards as usize, &mut shards)
                     .await?;
-            debug!("slab {slab_index}: read_slab_shards took {:?} ({length} bytes)", read_start.elapsed());
+            debug!(
+                "slab {slab_index}: read_slab_shards took {:?} ({length} bytes)",
+                read_start.elapsed()
+            );
             if length == 0 {
                 break; // EoF
             }
@@ -439,16 +453,26 @@ impl Uploader {
                     rs.encode_shards(&mut shards)?;
                     Ok::<_, erasure_coding::Error>(shards)
                 })?;
-                debug!("slab {slab_index}: erasure encode took {:?}", encode_start.elapsed());
+                debug!(
+                    "slab {slab_index}: erasure encode took {:?}",
+                    encode_start.elapsed()
+                );
 
                 // generate a unique encryption key for the slab
                 let slab_key: EncryptionKey = rand::random::<[u8; 32]>().into();
 
                 let host_queue = hosts.upload_queue();
-                debug!("slab {slab_index}: upload_queue has {} hosts", host_queue.len());
+                debug!(
+                    "slab {slab_index}: upload_queue has {} hosts",
+                    host_queue.len()
+                );
                 // reserve one host per shard upfront to guarantee each shard has at least one host
                 let reserved_hosts = host_queue.pop_n(shards.len())?;
-                debug!("slab {slab_index}: reserved {} hosts, {} remaining in queue", reserved_hosts.len(), host_queue.len());
+                debug!(
+                    "slab {slab_index}: reserved {} hosts, {} remaining in queue",
+                    reserved_hosts.len(),
+                    host_queue.len()
+                );
                 let owned_slab_key = Arc::new(slab_key.clone());
                 let start_time = Instant::now();
                 let mut shard_upload_tasks = JoinSet::new();
@@ -467,7 +491,10 @@ impl Uploader {
                             encrypt_shard(&owned_slab_key, shard_index as u8, 0, &mut shard);
                             shard
                         });
-                        debug!("slab {slab_index} shard {shard_index}: encrypt took {:?}", encrypt_start.elapsed());
+                        debug!(
+                            "slab {slab_index} shard {shard_index}: encrypt took {:?}",
+                            encrypt_start.elapsed()
+                        );
                         Self::upload_slab_shard(
                             permit,
                             transport,
@@ -490,8 +517,10 @@ impl Uploader {
                         Ok(Ok((shard_index, sector))) => {
                             slab_sectors[shard_index] = Some(sector);
                             remaining_shards -= 1;
-                            debug!("slab {slab_index} shard {shard_index} uploaded ({remaining_shards} remaining)");
-                        },
+                            debug!(
+                                "slab {slab_index} shard {shard_index} uploaded ({remaining_shards} remaining)"
+                            );
+                        }
                         Ok(Err(e)) => {
                             return Err(e);
                         }
@@ -500,14 +529,20 @@ impl Uploader {
                         }
                     };
                 }
-                debug!("slab {slab_index} uploaded in {:?}", Instant::now().duration_since(start_time));
-                Ok((slab_index, Slab {
-                    sectors: slab_sectors.into_iter().map(|s| s.unwrap()).collect(),
-                    encryption_key: slab_key,
-                    offset: 0,
-                    length: length as u32,
-                    min_shards: options.data_shards,
-                }))
+                debug!(
+                    "slab {slab_index} uploaded in {:?}",
+                    Instant::now().duration_since(start_time)
+                );
+                Ok((
+                    slab_index,
+                    Slab {
+                        sectors: slab_sectors.into_iter().map(|s| s.unwrap()).collect(),
+                        encryption_key: slab_key,
+                        offset: 0,
+                        length: length as u32,
+                        min_shards: options.data_shards,
+                    },
+                ))
             });
             slab_index += 1;
         }
@@ -543,7 +578,11 @@ impl Uploader {
         stream_offset: u64,
         options: UploadOptions,
     ) -> Result<Slab, UploadError> {
-        let reader = CipherReader::new(Cursor::new(data.to_vec()), data_key.clone(), stream_offset as usize);
+        let reader = CipherReader::new(
+            Cursor::new(data.to_vec()),
+            data_key.clone(),
+            stream_offset as usize,
+        );
         let mut slabs = Self::upload_slabs(
             self.transport.clone(),
             self.hosts.clone(),
@@ -552,7 +591,9 @@ impl Uploader {
             options,
         )
         .await?;
-        slabs.pop().ok_or_else(|| UploadError::Io(io::Error::other("no slabs produced")))
+        slabs
+            .pop()
+            .ok_or_else(|| UploadError::Io(io::Error::other("no slabs produced")))
     }
 
     /// Reads until EOF and uploads all slabs.
@@ -607,15 +648,21 @@ impl Uploader {
             objects: Vec::new(),
             upload_handle: AbortOnDropHandle::new({
                 #[cfg(not(target_arch = "wasm32"))]
-                { tokio::spawn(async move {
-                    let slabs = Self::upload_slabs(transport, hosts, app_key, reader, options).await?;
-                    Ok(slabs)
-                }) }
+                {
+                    tokio::spawn(async move {
+                        let slabs =
+                            Self::upload_slabs(transport, hosts, app_key, reader, options).await?;
+                        Ok(slabs)
+                    })
+                }
                 #[cfg(target_arch = "wasm32")]
-                { tokio::task::spawn_local(async move {
-                    let slabs = Self::upload_slabs(transport, hosts, app_key, reader, options).await?;
-                    Ok(slabs)
-                }) }
+                {
+                    tokio::task::spawn_local(async move {
+                        let slabs =
+                            Self::upload_slabs(transport, hosts, app_key, reader, options).await?;
+                        Ok(slabs)
+                    })
+                }
             }),
         }
     }

@@ -26,10 +26,9 @@ impl Instant {
 pub async fn sleep(duration: Duration) {
     wasm_bindgen_futures::JsFuture::from(js_sys::Promise::new(&mut |resolve, _| {
         let global = js_sys::global();
-        let set_timeout: js_sys::Function =
-            js_sys::Reflect::get(&global, &"setTimeout".into())
-                .unwrap()
-                .into();
+        let set_timeout: js_sys::Function = js_sys::Reflect::get(&global, &"setTimeout".into())
+            .unwrap()
+            .into();
         let _ = set_timeout.call2(
             &wasm_bindgen::JsValue::NULL,
             &resolve,
