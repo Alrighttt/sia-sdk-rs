@@ -102,19 +102,89 @@ The `prioritize()` method sorts download/upload task lists so the best hosts are
 
 ## Syncer
 
-The `syncer` crate implements the Sia syncer protocol for blockchain synchronization:
+The `syncer` and `syncer_wasm` crates implement the Sia syncer protocol, enabling a browser to act as a trustless blockchain client — connecting directly to Sia nodes via WebTransport with no intermediary server.
 
-- Handshake with version negotiation and genesis ID validation
-- V1-framed message encoding (length-prefixed)
-- RPC types: `SendHeaders`, `SendV2Blocks`, `SendTransactions`, `SendCheckpoint`, `DiscoverIP`
+### Building
 
-The `syncer_wasm` crate adds browser support with:
+```bash
+cd syncer_wasm
+RUSTFLAGS='--cfg=web_sys_unstable_apis' wasm-pack build --target web
+```
 
-- WebTransport streaming for syncer connections
-- IndexedDB persistence for block headers and caches
-- Proof-of-work verification for received headers
-- V2 block decoding (miner payouts, V1/V2 transactions, file contracts)
-- Golomb-Rice coded compact block filters (GCS) for lightweight filtering
+### Connecting to a Node
+
+All functions connect to a Sia node via WebTransport using the syncer protocol URL (e.g. `https://host:9984/sia/syncer`). Connection involves a version-negotiated handshake with genesis ID validation to ensure both sides are on the same network.
+
+```javascript
+import init, { connect_and_discover_ip, sync_chain, scan_balance_filtered, generate_filters, lookup_txid } from './pkg/syncer_wasm.js';
+
+await init();
+
+const url = 'https://your-sia-node:9984/sia/syncer';
+const genesisHex = '25f6e3b9295a61f69fcb956aca9f0076234ecf2e02d399db5448b6e22f26e81c'; // mainnet
+```
+
+### API
+
+**Quick Connect** — handshake + IP discovery:
+```javascript
+const resultJson = await connect_and_discover_ip(url, genesisHex);
+const { version, addr, ip } = JSON.parse(resultJson);
+```
+
+**Chain Sync** — sync all block headers from genesis to tip, verify PoW chain linkage, and fetch the tip block:
+```javascript
+const resultJson = await sync_chain(url, genesisHex, (msg, cls) => {
+  console.log(`[${cls}] ${msg}`);
+});
+const { tipHeight, tipBlockID, tipTimestamp, totalHeaders, block } = JSON.parse(resultJson);
+```
+
+Headers are persisted in IndexedDB and reused on subsequent syncs, so only new headers need to be fetched. The tip block is fully decoded with miner payouts, V1/V2 transactions, and file contracts.
+
+**Generate Compact Block Filters** — download all blocks from a peer and build Golomb-Rice coded (GCS) filters:
+```javascript
+const filterBytes = await generate_filters(url, genesisHex, (msg, cls) => {
+  console.log(`[${cls}] ${msg}`);
+});
+// filterBytes is a Uint8Array — save as filters.bin
+```
+
+This produces a compact filter file that enables address scanning without downloading the full blockchain. The file can be pre-generated and served statically (with Brotli compression for efficient delivery).
+
+**Address Explorer** — scan filters locally, fetch only matching blocks from the peer:
+```javascript
+const resultJson = await scan_balance_filtered(url, genesisHex, address, filterUrl, (msg, cls) => {
+  console.log(`[${cls}] ${msg}`);
+});
+const { balance, received, sent, transactions } = JSON.parse(resultJson);
+```
+
+The filter scan runs entirely in the browser. Only blocks that match the filter are fetched from the peer, minimizing bandwidth. False positives are detected and discarded after block decoding.
+
+**Transaction Lookup** — binary search a sorted transaction index file:
+```javascript
+const resultJson = await lookup_txid(url, genesisHex, txidHex, txindexUrl, (msg, cls) => {
+  console.log(`[${cls}] ${msg}`);
+});
+const { txid, blockHeight, timestamp, block } = JSON.parse(resultJson);
+```
+
+### Network IDs
+
+| Network | Genesis ID |
+|---------|-----------|
+| Mainnet | `25f6e3b9295a61f69fcb956aca9f0076234ecf2e02d399db5448b6e22f26e81c` |
+| Zen Testnet | `172fb3d508c86ac628f93c3362ba60312251466c77d63a8c99ea87717e4112c3` |
+
+### How It Works
+
+1. **WebTransport connection** — the browser opens a WebTransport session to the node's `/sia/syncer` endpoint
+2. **Handshake** — version strings and headers (genesis ID, unique ID, address) are exchanged using V1 framing (length-prefixed messages). Both sides validate the genesis ID matches
+3. **DiscoverIP** — a single RPC that returns the browser's public IP as seen by the node
+4. **SendHeaders** — requests block headers in batches of 2000. Each batch is verified: every header's `parent_id` must equal the previous header's computed `id()` (Blake2b-256 hash), forming a valid proof-of-work chain
+5. **SendV2Blocks** — fetches full blocks by height for decoding transactions, miner payouts, and contract data
+6. **IndexedDB caching** — synced header IDs and fetched blocks are cached in the browser's IndexedDB, enabling incremental sync across page reloads
 
 ## Core Types (`sia_sdk`)
 
