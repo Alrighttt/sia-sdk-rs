@@ -188,6 +188,7 @@ dependencies = [
  "bitcoin_hashes",
  "serde",
  "unicode-normalization",
+ "zeroize",
 ]
 
 [[package]]
@@ -2558,6 +2559,7 @@ dependencies = [
  "criterion",
  "ed25519-dalek",
  "hex",
+ "hmac",
  "num-bigint",
  "num-rational",
  "num-traits",

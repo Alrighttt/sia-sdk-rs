@@ -1,4 +1,5 @@
 pub mod blake2;
+pub mod hd;
 pub mod consensus;
 pub mod encoding;
 pub mod encoding_async;
