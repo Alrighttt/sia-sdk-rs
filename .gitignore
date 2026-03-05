@@ -1,4 +1,5 @@
 /target
 indexd_wasm/target
+syncer_wasm/target/
 .vscode
 .DS_Store
