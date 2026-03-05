@@ -332,7 +332,7 @@ mod test {
                 .map(|_| Host {
                     public_key: PrivateKey::from_seed(&rand::random()).public_key(),
                     addresses: vec![NetAddress {
-                        protocol: sia::types::v2::Protocol::QUIC,
+                        protocol: "quic".to_string(),
                         address: "localhost:1234".to_string(),
                     }],
                     country_code: "US".to_string(),
@@ -417,7 +417,7 @@ mod test {
                 .map(|_| Host {
                     public_key: PrivateKey::from_seed(&rand::random()).public_key(),
                     addresses: vec![NetAddress {
-                        protocol: sia::types::v2::Protocol::QUIC,
+                        protocol: "quic".to_string(),
                         address: "localhost:1234".to_string(),
                     }],
                     country_code: "US".to_string(),
@@ -503,7 +503,7 @@ mod test {
                 .map(|_| Host {
                     public_key: PrivateKey::from_seed(&rand::random()).public_key(),
                     addresses: vec![NetAddress {
-                        protocol: sia::types::v2::Protocol::QUIC,
+                        protocol: "quic".to_string(),
                         address: "localhost:1234".to_string(),
                     }],
                     country_code: "US".to_string(),
@@ -561,7 +561,7 @@ mod test {
                 .map(|_| Host {
                     public_key: PrivateKey::from_seed(&rand::random()).public_key(),
                     addresses: vec![NetAddress {
-                        protocol: sia::types::v2::Protocol::QUIC,
+                        protocol: "quic".to_string(),
                         address: "localhost:1234".to_string(),
                     }],
                     country_code: "US".to_string(),
@@ -630,7 +630,7 @@ mod test {
                 .map(|_| Host {
                     public_key: PrivateKey::from_seed(&rand::random()).public_key(),
                     addresses: vec![NetAddress {
-                        protocol: sia::types::v2::Protocol::QUIC,
+                        protocol: "quic".to_string(),
                         address: "localhost:1234".to_string(),
                     }],
                     country_code: "US".to_string(),
@@ -719,7 +719,7 @@ mod test {
                 .map(|pk| Host {
                     public_key: *pk,
                     addresses: vec![NetAddress {
-                        protocol: sia::types::v2::Protocol::QUIC,
+                        protocol: "quic".to_string(),
                         address: "localhost:1234".to_string(),
                     }],
                     country_code: "US".to_string(),
@@ -800,7 +800,7 @@ mod test {
                 .map(|pk| Host {
                     public_key: *pk,
                     addresses: vec![NetAddress {
-                        protocol: sia::types::v2::Protocol::QUIC,
+                        protocol: "quic".to_string(),
                         address: "localhost:1234".to_string(),
                     }],
                     country_code: "US".to_string(),
@@ -847,7 +847,7 @@ mod test {
                 .map(|pk| Host {
                     public_key: *pk,
                     addresses: vec![NetAddress {
-                        protocol: sia::types::v2::Protocol::QUIC,
+                        protocol: "quic".to_string(),
                         address: "localhost:1234".to_string(),
                     }],
                     country_code: "US".to_string(),
@@ -889,7 +889,7 @@ mod test {
                 .map(|(i, pk)| Host {
                     public_key: *pk,
                     addresses: vec![NetAddress {
-                        protocol: sia::types::v2::Protocol::QUIC,
+                        protocol: "quic".to_string(),
                         address: "localhost:1234".to_string(),
                     }],
                     country_code: "US".to_string(),

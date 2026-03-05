@@ -120,17 +120,10 @@ pub struct AppMeta {
     pub callback_url: Option<String>,
 }
 
-/// The protocol used in a network address.
-#[derive(uniffi::Enum)]
-pub enum AddressProtocol {
-    SiaMux,
-    Quic,
-}
-
 /// A network address of a storage provider on the Sia network.
 #[derive(uniffi::Record)]
 pub struct NetAddress {
-    pub protocol: AddressProtocol,
+    pub protocol: String,
     pub address: String,
 }
 
@@ -381,10 +374,7 @@ impl From<sia::rhp::Host> for Host {
                 .addresses
                 .iter()
                 .map(|a| NetAddress {
-                    protocol: match a.protocol {
-                        types::v2::Protocol::SiaMux => AddressProtocol::SiaMux,
-                        types::v2::Protocol::QUIC => AddressProtocol::Quic,
-                    },
+                    protocol: a.protocol.clone(),
                     address: a.address.clone(),
                 })
                 .collect(),
@@ -405,16 +395,11 @@ impl TryInto<sia::rhp::Host> for Host {
             addresses: self
                 .addresses
                 .into_iter()
-                .map(|a| {
-                    Ok(types::v2::NetAddress {
-                        protocol: match a.protocol {
-                            AddressProtocol::SiaMux => types::v2::Protocol::SiaMux,
-                            AddressProtocol::Quic => types::v2::Protocol::QUIC,
-                        },
-                        address: a.address,
-                    })
+                .map(|a| types::v2::NetAddress {
+                    protocol: a.protocol,
+                    address: a.address,
                 })
-                .collect::<Result<Vec<types::v2::NetAddress>, HexParseError>>()?,
+                .collect(),
             country_code: self.country_code,
             latitude: self.latitude,
             longitude: self.longitude,

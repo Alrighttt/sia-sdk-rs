@@ -53,7 +53,7 @@ impl MockRHP4Client {
 }
 
 #[async_trait]
-impl RHP4Client for Arc<MockRHP4Client> {
+impl RHP4Client for MockRHP4Client {
     async fn host_prices(&self, _: PublicKey, _: bool) -> Result<HostPrices, rhp4::Error> {
         Ok(HostPrices {
             contract_price: Currency::zero(),

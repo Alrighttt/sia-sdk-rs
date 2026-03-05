@@ -23,8 +23,6 @@ use crate::slabs::Sector;
 use crate::{Object, PinnedSlab, SealedObject, Slab};
 use sia::signing::{PrivateKey, PublicKey};
 use sia::types::Hash256;
-use sia::types::v2::Protocol;
-
 pub use reqwest::{IntoUrl, Url};
 
 const QUERY_PARAM_VALID_UNTIL: &str = "sv";
@@ -159,7 +157,7 @@ pub struct HostQuery {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub limit: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub protocol: Option<Protocol>,
+    pub protocol: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub country: Option<String>,
 }
@@ -892,7 +890,7 @@ mod tests {
                 HostQuery {
                     offset: Some(5),
                     limit: Some(25),
-                    protocol: Some(Protocol::QUIC),
+                    protocol: Some("quic".to_string()),
                     country: Some("us".into()),
                     ..Default::default()
                 },

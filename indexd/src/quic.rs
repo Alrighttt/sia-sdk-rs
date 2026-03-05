@@ -23,8 +23,7 @@ use sia::rhp::{
 };
 use sia::signing::{PrivateKey, PublicKey};
 use sia::types::Hash256;
-use sia::types::v2::Protocol;
-
+use crate::rhp4::RHP4Transport;
 use crate::{Hosts, RHP4Client};
 
 struct Stream {
@@ -273,7 +272,7 @@ impl ClientInner {
             .addresses(&host)
             .ok_or(ConnectError::UnknownHost(host))?;
         for addr in addresses {
-            if addr.protocol != Protocol::QUIC {
+            if addr.protocol != "quic" {
                 continue;
             }
             let (addr, port_str) = addr
@@ -516,6 +515,12 @@ impl RHP4Client for Client {
     }
 }
 
+impl RHP4Transport for Client {
+    fn supported_protocols(&self) -> &[&str] {
+        &["quic"]
+    }
+}
+
 #[cfg(test)]
 mod test {
     use std::time::Duration;
@@ -544,7 +549,7 @@ mod test {
         hosts.update(vec![Host {
             public_key: host_key,
             addresses: vec![NetAddress {
-                protocol: Protocol::QUIC,
+                protocol: "quic".to_string(),
                 address: "6r4b0vj1ai55fobdvauvpg3to5bpeijl045b2q268fcj7q1vkuog.sia.host:9984"
                     .into(),
             }],

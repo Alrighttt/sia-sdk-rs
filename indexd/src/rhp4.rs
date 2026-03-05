@@ -50,3 +50,11 @@ pub(crate) trait RHP4Client: Send + Sync {
         length: usize,
     ) -> Result<Bytes, Error>;
 }
+
+/// A transport is an RHP4Client that declares which protocol(s) it supports.
+/// This allows the SDK to route host connections to the appropriate transport
+/// based on the host's advertised addresses.
+#[allow(dead_code)]
+pub(crate) trait RHP4Transport: RHP4Client {
+    fn supported_protocols(&self) -> &[&str];
+}
