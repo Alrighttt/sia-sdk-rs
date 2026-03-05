@@ -1,3 +1,4 @@
 /target
+indexd_wasm/target
 .vscode
 .DS_Store
