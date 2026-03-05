@@ -32,7 +32,7 @@ mod object_encryption;
 mod slabs;
 
 pub mod app_client;
-pub mod quic;
+mod transport;
 
 mod builder;
 pub use builder::*;
