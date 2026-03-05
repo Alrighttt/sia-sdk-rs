@@ -11,7 +11,6 @@ use serde::de::{Error, MapAccess, Visitor};
 use serde::ser::SerializeStruct;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
-use thiserror::Error;
 
 use crate::signing::{PublicKey, Signature};
 use crate::types::common::BlockID;
@@ -23,86 +22,6 @@ use super::{
 
 // expose spend policies
 pub use super::spendpolicy::*;
-
-#[derive(Debug, PartialEq, Eq, Clone, Copy)]
-pub enum Protocol {
-    SiaMux,
-    QUIC,
-}
-
-#[derive(Debug, Error)]
-pub enum ProtocolParseError {
-    #[error("invalid protocol {0}")]
-    InvalidProtocol(String),
-}
-
-impl Protocol {
-    pub const fn as_str(&self) -> &'static str {
-        match self {
-            Protocol::SiaMux => "siamux",
-            Protocol::QUIC => "quic",
-        }
-    }
-}
-
-impl TryFrom<String> for Protocol {
-    type Error = ProtocolParseError;
-
-    fn try_from(value: String) -> Result<Self, Self::Error> {
-        match value.as_str() {
-            "siamux" => Ok(Protocol::SiaMux),
-            "quic" => Ok(Protocol::QUIC),
-            _ => Err(ProtocolParseError::InvalidProtocol(value)),
-        }
-    }
-}
-
-impl Serialize for Protocol {
-    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
-    where
-        S: serde::Serializer,
-    {
-        serializer.serialize_str(self.as_str())
-    }
-}
-
-impl<'de> Deserialize<'de> for Protocol {
-    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
-    where
-        D: serde::Deserializer<'de>,
-    {
-        let s = String::deserialize(deserializer)?;
-        Protocol::try_from(s).map_err(|e| D::Error::custom(format!("{e:?}")))
-    }
-}
-
-impl SiaEncodable for Protocol {
-    fn encode<W: io::Write>(&self, w: &mut W) -> encoding::Result<()> {
-        self.as_str().as_bytes().encode(w)
-    }
-}
-
-impl SiaDecodable for Protocol {
-    fn decode<R: io::Read>(r: &mut R) -> encoding::Result<Self> {
-        let s = String::decode(r)?;
-        let v = Protocol::try_from(s).map_err(|e| encoding::Error::InvalidValue(e.to_string()))?;
-        Ok(v)
-    }
-}
-
-impl AsyncSiaEncodable for Protocol {
-    async fn encode_async<E: AsyncEncoder>(&self, e: &mut E) -> Result<(), E::Error> {
-        self.as_str().as_bytes().encode_async(e).await
-    }
-}
-
-impl AsyncSiaDecodable for Protocol {
-    async fn decode_async<D: AsyncDecoder>(d: &mut D) -> Result<Self, D::Error> {
-        let s = String::decode_async(d).await?;
-        let v = Protocol::try_from(s).map_err(|e| encoding::Error::InvalidValue(e.to_string()))?;
-        Ok(v)
-    }
-}
 
 #[derive(
     Debug,
@@ -117,7 +36,7 @@ impl AsyncSiaDecodable for Protocol {
 )]
 #[serde(rename_all = "camelCase")]
 pub struct NetAddress {
-    pub protocol: Protocol,
+    pub protocol: String,
     pub address: String,
 }
 
