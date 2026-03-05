@@ -7,7 +7,7 @@ use chrono::Utc;
 use sia::rhp::{self, HostPrices};
 use sia::signing::{PrivateKey, PublicKey, Signature};
 use sia::types::{Currency, Hash256};
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::time::sleep;
 
 use async_trait::async_trait;
@@ -104,6 +104,19 @@ impl RHP4Client for MockRHP4Client {
         offset: usize,
         length: usize,
     ) -> Result<Bytes, rhp4::Error> {
+        // Check if this host is configured as slow
+        let slow_delay = {
+            let slow_hosts = self.slow_hosts.read().unwrap();
+            if slow_hosts.contains(&host_key) {
+                Some(*self.slow_delay.read().unwrap())
+            } else {
+                None
+            }
+        };
+        if let Some(delay) = slow_delay {
+            sleep(delay).await;
+        }
+
         let sector = {
             let sectors = self.sectors.read().unwrap();
             let host_sectors = sectors
@@ -138,7 +151,7 @@ impl MockUploader {
         }
     }
 
-    pub async fn upload<R: AsyncReadExt + Send + Sync + Unpin + 'static>(
+    pub async fn upload<R: AsyncRead + Send + Sync + Unpin + 'static>(
         &self,
         r: R,
         options: UploadOptions,
@@ -162,7 +175,7 @@ impl MockDownloader {
         }
     }
 
-    pub async fn download<W: AsyncWriteExt + Send + Sync + Unpin>(
+    pub async fn download<W: AsyncWrite + Send + Sync + Unpin>(
         &self,
         w: &mut W,
         object: &Object,

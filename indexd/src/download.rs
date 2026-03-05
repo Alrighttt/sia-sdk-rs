@@ -11,7 +11,7 @@ use sia::rhp::{HostPrices, SEGMENT_SIZE};
 use sia::signing::PrivateKey;
 use sia::types::Currency;
 use thiserror::Error;
-use tokio::io::AsyncWriteExt;
+use tokio::io::{AsyncWrite, AsyncWriteExt};
 use tokio::sync::{OwnedSemaphorePermit, Semaphore, mpsc};
 use tokio::task::JoinSet;
 #[cfg(not(target_arch = "wasm32"))]
@@ -334,7 +334,7 @@ impl Downloader {
 
     /// Downloads the provided slabs and writes the decrypted data to the
     /// provided writer.
-    pub async fn download<W: AsyncWriteExt + Unpin>(
+    pub async fn download<W: AsyncWrite + Unpin>(
         &self,
         w: &mut W,
         object: &Object,

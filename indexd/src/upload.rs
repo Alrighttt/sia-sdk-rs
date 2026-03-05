@@ -10,7 +10,7 @@ use sia::erasure_coding::{self, ErasureCoder};
 use sia::rhp::{self, SECTOR_SIZE};
 use sia::signing::{PrivateKey, PublicKey};
 use thiserror::Error;
-use tokio::io::{AsyncReadExt, AsyncWriteExt, BufReader, SimplexStream, WriteHalf, copy, simplex};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWriteExt, BufReader, SimplexStream, WriteHalf, copy, simplex};
 use tokio::sync::{OwnedSemaphorePermit, Semaphore, mpsc};
 use tokio::task::JoinSet;
 #[cfg(not(target_arch = "wasm32"))]
@@ -175,7 +175,7 @@ impl PackedUpload {
     /// Adds a new object to the upload. The data will be read until EOF and packed into
     /// the upload. The resulting object will contain the metadata needed to download the object. The caller
     /// must call [finalize](Self::finalize) to get the resulting objects after all objects have been added.
-    pub async fn add<R: AsyncReadExt + Unpin>(&mut self, r: R) -> io::Result<u64> {
+    pub async fn add<R: AsyncRead + Unpin>(&mut self, r: R) -> io::Result<u64> {
         if self.upload_handle.is_finished() {
             // should only happen if the upload errored; callers can get the error by calling finalize
             return Err(io::Error::other("cannot add object to finalized upload"));
@@ -607,7 +607,7 @@ impl Uploader {
     /// # Returns
     /// A new object containing the metadata needed to download the object. The caller
     /// must pin the object to an indexer after uploading.
-    pub async fn upload<R: AsyncReadExt + Unpin + Send + 'static>(
+    pub async fn upload<R: AsyncRead + Unpin + Send + 'static>(
         &self,
         r: R,
         options: UploadOptions,

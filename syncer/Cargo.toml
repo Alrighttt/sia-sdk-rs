@@ -1,0 +1,10 @@
+[package]
+name = "sia_syncer"
+version = "0.1.0"
+edition = "2024"
+description = "Sia syncer protocol types and encoding"
+license = "MIT"
+
+[dependencies]
+sia_sdk = { path = "../sia_sdk" }
+thiserror = "2.0"
