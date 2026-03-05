@@ -148,8 +148,8 @@ impl Network {
                 ),
             },
             hardfork_v2: HardforkV2 {
-                allow_height: 1000000,
-                require_height: 1025000,
+                allow_height: 526000,
+                require_height: 530000,
             },
         }
     }
@@ -194,8 +194,8 @@ impl Network {
                 failsafe_address: Address::new([0u8; 32]),
             },
             hardfork_v2: HardforkV2 {
-                allow_height: 100000,
-                require_height: 102000,
+                allow_height: 40,
+                require_height: 50,
             },
         }
     }
