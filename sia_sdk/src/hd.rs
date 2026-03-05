@@ -1,10 +1,11 @@
 use std::fmt;
 
 use bip39::{Language, Mnemonic};
+use ed25519_dalek::SigningKey;
 use hmac::{Hmac, Mac};
 use sha2::Sha512;
 use thiserror::Error;
-use zeroize::ZeroizeOnDrop;
+use zeroize::{ZeroizeOnDrop, Zeroizing};
 
 use crate::signing::{PrivateKey, PublicKey};
 
@@ -47,7 +48,7 @@ impl HdMnemonic {
             return Err(HdError::InvalidWordCount(word_count));
         }
         let entropy_bytes = (word_count / 3) * 4;
-        let mut entropy = vec![0u8; entropy_bytes];
+        let mut entropy = Zeroizing::new(vec![0u8; entropy_bytes]);
         rand::fill(&mut entropy[..]);
         let mnemonic = Mnemonic::from_entropy(&entropy)?;
         Ok(Self { mnemonic })
@@ -68,7 +69,7 @@ impl HdMnemonic {
 
     /// Derive a SLIP-0010 master extended private key for ed25519.
     pub fn to_extended_key(&self, passphrase: &str) -> ExtendedPrivateKey {
-        let seed = self.to_seed(passphrase);
+        let seed = Zeroizing::new(self.to_seed(passphrase));
         ExtendedPrivateKey::from_bip39_seed(&seed)
     }
 
@@ -107,7 +108,9 @@ impl ExtendedPrivateKey {
         let mut mac =
             HmacSha512::new_from_slice(b"ed25519 seed").expect("HMAC can take key of any size");
         mac.update(seed);
-        let result = mac.finalize().into_bytes();
+        let ga = mac.finalize().into_bytes();
+        let mut result = Zeroizing::new([0u8; 64]);
+        result.copy_from_slice(&ga);
 
         let mut private_key = [0u8; 32];
         let mut chain_code = [0u8; 32];
@@ -142,7 +145,9 @@ impl ExtendedPrivateKey {
         mac.update(&[0x00]);
         mac.update(&self.private_key);
         mac.update(&hardened_index.to_be_bytes());
-        let result = mac.finalize().into_bytes();
+        let ga = mac.finalize().into_bytes();
+        let mut result = Zeroizing::new([0u8; 64]);
+        result.copy_from_slice(&ga);
 
         let mut private_key = [0u8; 32];
         let mut chain_code = [0u8; 32];
@@ -161,11 +166,8 @@ impl ExtendedPrivateKey {
     /// The `"m/"` prefix is optional.
     pub fn derive_path(&self, path: &str) -> Result<Self, HdError> {
         let path = path.strip_prefix("m/").unwrap_or(path);
-        if path.is_empty() {
-            return Ok(self.clone());
-        }
 
-        let mut current = self.clone();
+        let mut current: Option<Self> = None;
         for segment in path.split('/') {
             let segment = segment.trim();
             if segment.is_empty() {
@@ -188,10 +190,11 @@ impl ExtendedPrivateKey {
                 return Err(HdError::UnhardenedDerivation(index));
             }
 
-            current = current.derive_child(index)?;
+            let parent = current.as_ref().unwrap_or(self);
+            current = Some(parent.derive_child(index)?);
         }
 
-        Ok(current)
+        Ok(current.unwrap_or_else(|| self.clone()))
     }
 
     /// Convert to a [`PrivateKey`] for signing.
@@ -200,8 +203,12 @@ impl ExtendedPrivateKey {
     }
 
     /// Get the ed25519 public key.
+    ///
+    /// Uses `SigningKey` directly to avoid creating a full 64-byte `PrivateKey`
+    /// keypair just to extract the 32-byte public key.
     pub fn public_key(&self) -> PublicKey {
-        self.private_key().public_key()
+        let sk = SigningKey::from_bytes(&self.private_key);
+        PublicKey::new(sk.verifying_key().to_bytes())
     }
 
     /// Get the raw 32-byte private key (ed25519 seed).
