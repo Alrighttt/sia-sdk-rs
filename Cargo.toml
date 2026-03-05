@@ -1,6 +1,8 @@
 [workspace]
 resolver = "2"
-members = ["sia_sdk", "sia_derive", "indexd", "indexd_ffi", "mux"]
+members = ["sia_sdk", "sia_derive", "indexd", "indexd_ffi", "syncer"]
+# indexd_wasm and syncer_wasm require wasm32 target + RUSTFLAGS='--cfg=web_sys_unstable_apis'
+exclude = ["indexd_wasm", "syncer_wasm"]
 
 # CPU-intensive operations (erasure coding, hashing, encryption) are
 # ~100x slower without optimizations. Some tests will be extremely

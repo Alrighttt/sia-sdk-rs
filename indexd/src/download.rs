@@ -3,6 +3,7 @@ use std::fmt::Debug;
 use std::sync::Arc;
 use std::time::Duration;
 
+use crate::sleep;
 use log::debug;
 use sia::encryption::{EncryptionKey, encrypt_shard};
 use sia::erasure_coding::{self, ErasureCoder};
@@ -10,10 +11,10 @@ use sia::rhp::SEGMENT_SIZE;
 use sia::signing::PrivateKey;
 use thiserror::Error;
 use tokio::io::{AsyncWrite, AsyncWriteExt};
-use tokio::sync::{OwnedSemaphorePermit, Semaphore};
-use tokio::task::{JoinSet, spawn_blocking};
+use tokio::sync::{OwnedSemaphorePermit, Semaphore, mpsc};
+use tokio::task::JoinSet;
+#[cfg(not(target_arch = "wasm32"))]
 use tokio::time::error::Elapsed;
-use tokio::time::sleep;
 
 use crate::rhp4::RHP4Client;
 use crate::{Hosts, Object, Sector};
@@ -32,6 +33,7 @@ pub enum DownloadError {
     #[error("invalid range: {0}-{1}")]
     OutOfRange(usize, usize),
 
+    #[cfg(not(target_arch = "wasm32"))]
     #[error("timeout error: {0}")]
     Timeout(#[from] Elapsed),
 
@@ -56,23 +58,31 @@ pub struct DownloadOptions {
     pub max_inflight: usize,
     pub offset: u64,
     pub length: Option<u64>,
+
+    /// Optional channel to notify when each slab is downloaded.
+    /// This can be used to implement progress reporting.
+    pub slab_downloaded: Option<mpsc::UnboundedSender<()>>,
 }
 
 impl Default for DownloadOptions {
     fn default() -> Self {
         Self {
+            #[cfg(target_arch = "wasm32")]
+            max_inflight: 8, // Browsers can't handle many concurrent WebTransport connections
+            #[cfg(not(target_arch = "wasm32"))]
             max_inflight: 20,
             offset: 0,
             length: None,
+            slab_downloaded: None,
         }
     }
 }
 
 #[derive(Clone)]
-pub(crate) struct Downloader<T: RHP4Client> {
+pub(crate) struct Downloader {
     account_key: Arc<PrivateKey>,
     hosts: Hosts,
-    transport: T,
+    transport: Arc<dyn RHP4Client>,
 }
 
 struct SectorDownloadTask {
@@ -82,16 +92,13 @@ struct SectorDownloadTask {
     index: usize,
 }
 
-impl<T: RHP4Client> Downloader<T>
-where
-    T: Send + Sync + Clone + 'static,
-{
+impl Downloader {
     // helper to pair a sector with its erasure-coded index.
     // Required because [FuturesUnordered.push] does not
     // preserve ordering and doesn't play nice with closures.
     async fn try_download_sector(
         _permit: OwnedSemaphorePermit,
-        transport: T,
+        transport: Arc<dyn RHP4Client>,
         account_key: Arc<PrivateKey>,
         task: SectorDownloadTask,
     ) -> Result<(usize, Vec<u8>), DownloadError> {
@@ -107,7 +114,7 @@ where
         Ok((task.index, data.to_vec()))
     }
 
-    pub fn new(hosts: Hosts, transport: T, account_key: Arc<PrivateKey>) -> Self {
+    pub fn new(hosts: Hosts, transport: Arc<dyn RHP4Client>, account_key: Arc<PrivateKey>) -> Self {
         Self {
             account_key,
             hosts,
@@ -160,30 +167,63 @@ where
                     let permit = semaphore.clone().acquire_owned().await?;
                     let transport = self.transport.clone();
                     let account_key = self.account_key.clone();
-                    download_tasks.spawn(Self::try_download_sector(
-                        permit,
-                        transport,
-                        account_key,
-                        task,
-                    ));
+                    join_set_spawn!(
+                        download_tasks,
+                        Self::try_download_sector(permit, transport, account_key, task,)
+                    );
                 }
-                None => panic!("not enough sectors to satisfy min_shards"), // should be unreachable
+                None => {
+                    return Err(DownloadError::InvalidSlab(format!(
+                        "not enough sectors to satisfy min_shards: have {}, need {}",
+                        total_shards, min_shards
+                    )));
+                }
             };
         }
 
         let mut successful: u8 = 0;
         let mut shards = vec![None; total_shards];
+        let mut total_failures: usize = 0;
+        const MAX_TOTAL_FAILURES: usize = 30; // Give up after 30 failed attempts total
+
         loop {
+            // If no tasks are in-flight and we still need more shards, give up.
+            // This prevents an infinite loop when all tasks have completed but
+            // min_shards was not reached.
+            if download_tasks.is_empty() {
+                let rem = min_shards.saturating_sub(successful);
+                if rem == 0 {
+                    return Ok(shards);
+                }
+                if sectors.is_empty() {
+                    return Err(DownloadError::NotEnoughShards(successful, min_shards));
+                }
+                // Still have sectors to try — spawn them
+                while download_tasks.len() < rem as usize {
+                    if let Some(task) = sectors.pop_front() {
+                        let permit = semaphore.clone().acquire_owned().await?;
+                        let transport = self.transport.clone();
+                        let account_key = self.account_key.clone();
+                        join_set_spawn!(
+                            download_tasks,
+                            Self::try_download_sector(permit, transport, account_key, task,)
+                        );
+                    } else {
+                        break;
+                    }
+                }
+            }
+
             tokio::select! {
                 biased;
                 Some(res) = download_tasks.join_next() => {
                     match res? { // safe because tasks are never cancelled
                         Ok((index, mut data)) => {
                             let encryption_key = encryption_key.clone();
-                            let data = spawn_blocking(move || {
+                            let data = maybe_spawn_blocking!({
                                 encrypt_shard(&encryption_key, index as u8, offset as usize, &mut data);
                                 data
-                            }).await?;
+                            });
                             shards[index] = Some(data);
                             successful += 1;
                             if successful >= min_shards {
@@ -191,7 +231,13 @@ where
                             }
                         }
                         Err(e) => {
-                            debug!("sector download failed {:?}", e);
+                            total_failures += 1;
+                            debug!("sector download failed ({total_failures}/{MAX_TOTAL_FAILURES}): {:?}", e);
+
+                            if total_failures >= MAX_TOTAL_FAILURES {
+                                return Err(DownloadError::NotEnoughShards(successful, min_shards));
+                            }
+
                             let rem = min_shards.saturating_sub(successful);
                             if rem == 0 {
                                 return Ok(shards); // sanity check
@@ -205,7 +251,7 @@ where
                                 // are not enough to satisfy the required number
                                 // of shards. The sleep arm will handle slow
                                 // hosts.
-                                download_tasks.spawn(Self::try_download_sector(
+                                join_set_spawn!(download_tasks, Self::try_download_sector(
                                     permit,
                                     transport,
                                     account_key,
@@ -220,7 +266,7 @@ where
                         && let Some(task) = sectors.pop_front() {
                             let transport = self.transport.clone();
                             let account_key = self.account_key.clone();
-                            download_tasks.spawn(Self::try_download_sector(
+                            join_set_spawn!(download_tasks, Self::try_download_sector(
                                 racer_permit,
                                 transport,
                                 account_key,
@@ -283,12 +329,11 @@ where
                 .await?;
             let data_shards = slab.min_shards as usize;
             let parity_shards = slab.sectors.len() - slab.min_shards as usize;
-            let shards = spawn_blocking(move || -> Result<Vec<Option<Vec<u8>>>, DownloadError> {
+            let shards = maybe_spawn_blocking!({
                 let rs = ErasureCoder::new(data_shards, parity_shards)?;
                 rs.reconstruct_data_shards(&mut shards)?;
-                Ok(shards)
-            })
-            .await??;
+                Ok::<_, erasure_coding::Error>(shards)
+            })?;
             ErasureCoder::write_data_shards(
                 &mut w,
                 &shards[..data_shards],
@@ -297,6 +342,9 @@ where
             )
             .await?;
             length -= slab_length;
+            if let Some(ref tx) = options.slab_downloaded {
+                let _ = tx.send(());
+            }
         }
         w.flush().await?;
         Ok(())

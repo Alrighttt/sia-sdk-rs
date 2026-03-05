@@ -769,16 +769,26 @@ impl<T: Transport> RPCWriteSector<T, RPCInit> {
             data_len: data.len(),
         };
 
-        let (tx, rx) = oneshot::channel();
-        let root_data = data.clone();
-        rayon::spawn(move || {
-            let root = merkle::sector_root(root_data.as_ref());
-            let _ = tx.send(root);
-        });
+        #[cfg(not(target_arch = "wasm32"))]
+        let root_rx = {
+            let (tx, rx) = oneshot::channel();
+            let root_data = data.clone();
+            rayon::spawn(move || {
+                let root = merkle::sector_root(root_data.as_ref());
+                let _ = tx.send(root);
+            });
+            Some(rx)
+        };
+        #[cfg(target_arch = "wasm32")]
+        let root_rx: Option<oneshot::Receiver<crate::types::Hash256>> = None;
 
         transport.write_request(&request).await?;
-        transport.write_bytes(data).await?;
-        let root = rx.await.unwrap();
+        transport.write_bytes(data.clone()).await?;
+
+        let root = match root_rx {
+            Some(rx) => rx.await.unwrap(),
+            None => merkle::sector_root(data.as_ref()),
+        };
 
         Ok(RPCWriteSector {
             root,
@@ -881,17 +891,24 @@ impl<T: Transport> RPCReadSector<T, RPCComplete> {
         // verify proof
         let start = self.offset / SEGMENT_SIZE;
         let end = (self.offset + self.length).div_ceil(SEGMENT_SIZE);
-        let (tx, rx) = oneshot::channel();
-        rayon::spawn(move || {
-            let res = response
-                .data
-                .verify(&self.root, start, end)
-                .map_err(Error::ProofValidation);
-            // rx never goes out of scope and never sends more than once, so this can't fail
-            tx.send(res).unwrap();
-        });
-
-        let data = rx.await.unwrap()?;
+        #[cfg(not(target_arch = "wasm32"))]
+        let data = {
+            let (tx, rx) = oneshot::channel();
+            let root = self.root;
+            rayon::spawn(move || {
+                let res = response
+                    .data
+                    .verify(&root, start, end)
+                    .map_err(Error::ProofValidation);
+                tx.send(res).unwrap();
+            });
+            rx.await.unwrap()?
+        };
+        #[cfg(target_arch = "wasm32")]
+        let data = response
+            .data
+            .verify(&self.root, start, end)
+            .map_err(Error::ProofValidation)?;
         Ok(RPCReadSectorResult {
             usage: self.usage,
             data,

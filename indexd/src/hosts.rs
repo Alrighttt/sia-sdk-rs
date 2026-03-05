@@ -379,6 +379,10 @@ impl HostQueue {
         Ok(result)
     }
 
+    pub fn len(&self) -> usize {
+        self.inner.lock().map(|i| i.hosts.len()).unwrap_or(0)
+    }
+
     pub fn retry(&self, host: PublicKey) -> Result<(), QueueError> {
         let mut inner = self.inner.lock().map_err(|_| QueueError::MutexError)?;
         inner.hosts.push_back(host);

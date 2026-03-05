@@ -10,9 +10,15 @@ use sia::types::Hash256;
 use thiserror::Error;
 use url::Url;
 
-use crate::app_client::{self, Client, RegisterAppRequest};
+use crate::app_client::{self, AppClient, Client, RegisterAppRequest, RegisterAppResponse};
 use crate::object_encryption::derive;
-use crate::{SDK, quic};
+use crate::SDK;
+
+#[cfg(not(target_arch = "wasm32"))]
+use crate::quic;
+
+use crate::sleep;
+
 
 /// The initial state of the SDK builder, before connecting to the indexd service.
 pub struct DisconnectedState;
@@ -36,7 +42,7 @@ pub struct ApprovedState {
 /// A builder for creating an SDK instance.
 pub struct Builder<S> {
     state: S,
-    client: Client,
+    client: Arc<dyn AppClient>,
 }
 
 /// Errors that can occur during the SDK building process.
@@ -48,6 +54,7 @@ pub enum BuilderError {
     #[error("client error: {0}")]
     Client(#[from] app_client::Error),
 
+    #[cfg(not(target_arch = "wasm32"))]
     #[error("quic error: {0}")]
     QUIC(#[from] quic::ConnectError),
 
@@ -72,7 +79,7 @@ impl Builder<DisconnectedState> {
         let client = Client::new(indexer_url)?;
         Ok(Self {
             state: DisconnectedState,
-            client,
+            client: Arc::new(client),
         })
     }
 
@@ -84,6 +91,7 @@ impl Builder<DisconnectedState> {
     /// # Arguments
     /// * `app_key` - The application key used for authentication.
     /// * `tls_config` - The TLS configuration for secure communication.
+    #[cfg(not(target_arch = "wasm32"))]
     pub async fn connected(
         &self,
         app_key: &PrivateKey,
@@ -93,7 +101,21 @@ impl Builder<DisconnectedState> {
         if !connected {
             return Ok(None);
         }
+
         let sdk = SDK::new(self.client.clone(), Arc::new(app_key.clone()), tls_config).await?;
+        Ok(Some(sdk))
+    }
+    #[cfg(target_arch = "wasm32")]
+    pub async fn connected(
+        &self,
+        app_key: &PrivateKey,
+    ) -> Result<Option<SDK>, BuilderError> {
+        let connected = self.client.check_app_authenticated(app_key).await?;
+        if !connected {
+            return Ok(None);
+        }
+
+        let sdk = SDK::new(self.client.clone(), Arc::new(app_key.clone())).await?;
         Ok(Some(sdk))
     }
 
@@ -106,13 +128,24 @@ impl Builder<DisconnectedState> {
         app: &RegisterAppRequest,
     ) -> Result<Builder<RequestingApprovalState>, BuilderError> {
         let resp = self.client.request_app_connection(app).await?;
+        self.with_connection_response(app.app_id, resp)
+    }
+
+    /// Transitions to [RequestingApprovalState] using a pre-fetched
+    /// connection response. This is useful when the HTTP call to
+    /// `POST /auth/connect` was made out-of-band (e.g. via curl).
+    pub fn with_connection_response(
+        self,
+        app_id: Hash256,
+        response: RegisterAppResponse,
+    ) -> Result<Builder<RequestingApprovalState>, BuilderError> {
         Ok(Builder {
             state: RequestingApprovalState {
-                app_id: app.app_id,
-                response_url: Url::parse(&resp.response_url)?,
-                register_url: Url::parse(&resp.register_url)?,
-                status_url: Url::parse(&resp.status_url)?,
-                expiration: resp.expiration,
+                app_id,
+                response_url: Url::parse(&response.response_url)?,
+                register_url: Url::parse(&response.register_url)?,
+                status_url: Url::parse(&response.status_url)?,
+                expiration: response.expiration,
             },
             client: self.client,
         })
@@ -153,7 +186,7 @@ impl Builder<RequestingApprovalState> {
                     client: self.client,
                 });
             }
-            tokio::time::sleep(Duration::from_secs(5)).await;
+            sleep(Duration::from_secs(5)).await;
         }
     }
 }
@@ -167,6 +200,7 @@ impl Builder<ApprovedState> {
     ///
     /// # Errors
     /// Returns [BuilderError] if the registration fails or the SDK cannot be created.
+    #[cfg(not(target_arch = "wasm32"))]
     pub async fn register(
         self,
         mnemonic: &str,
@@ -177,6 +211,26 @@ impl Builder<ApprovedState> {
             .register_app(&app_key, self.state.register_url.clone())
             .await?;
         SDK::new(self.client, Arc::new(app_key), tls_config).await
+    }
+
+    /// Completes the registration process and returns an SDK instance.
+    ///
+    /// # Arguments
+    /// * `mnemonic` - The user's mnemonic phrase used to derive the application key.
+    /// * `tls_config` - The TLS configuration for secure communication.
+    ///
+    /// # Errors
+    /// Returns [BuilderError] if the registration fails or the SDK cannot be created.
+    #[cfg(target_arch = "wasm32")]
+    pub async fn register(
+        self,
+        mnemonic: &str,
+    ) -> Result<SDK, BuilderError> {
+        let app_key = derive_app_key(mnemonic, &self.state.app_id, &self.state.user_secret)?;
+        self.client
+            .register_app(&app_key, self.state.register_url.clone())
+            .await?;
+        SDK::new(self.client, Arc::new(app_key)).await
     }
 }
 

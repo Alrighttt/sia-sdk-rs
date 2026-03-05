@@ -4,13 +4,14 @@ use crate::app_client::{HostQuery, SlabPinParams};
 use crate::rhp4::RHP4Client;
 
 use chrono::{DateTime, Utc};
+use sia::encryption::EncryptionKey;
 use sia::signing::PrivateKey;
 pub use slabs::*;
 
 mod hosts;
 pub use hosts::*;
 
-use crate::app_client::{Account, ObjectsCursor};
+use crate::app_client::{Account, AppClient, ObjectsCursor};
 use sia::rhp::Host;
 use sia::types::Hash256;
 use thiserror::Error;
@@ -19,6 +20,28 @@ use tokio::io::{AsyncRead, AsyncWrite};
 pub use reqwest::{IntoUrl, Url};
 
 mod rhp4;
+
+/// Offloads a `move` closure to a blocking thread on native; runs inline on WASM.
+macro_rules! maybe_spawn_blocking {
+    ($body:expr) => {{
+        #[cfg(not(target_arch = "wasm32"))]
+        { tokio::task::spawn_blocking(move || $body).await? }
+        #[cfg(target_arch = "wasm32")]
+        { $body }
+    }};
+}
+
+/// Spawns a future on a [`tokio::task::JoinSet`]. Uses `spawn` on native
+/// and `spawn_local` on WASM.
+macro_rules! join_set_spawn {
+    ($set:expr, $fut:expr) => {{
+        #[cfg(not(target_arch = "wasm32"))]
+        $set.spawn($fut);
+        #[cfg(target_arch = "wasm32")]
+        $set.spawn_local($fut);
+    }};
+}
+
 mod upload;
 pub use upload::*;
 
@@ -32,7 +55,24 @@ mod object_encryption;
 mod slabs;
 
 pub mod app_client;
+
+#[cfg(not(target_arch = "wasm32"))]
 pub mod quic;
+
+#[cfg(target_arch = "wasm32")]
+pub mod web_transport;
+
+#[cfg(target_arch = "wasm32")]
+pub(crate) mod wasm_time;
+
+// Unified re-exports so consumers don't need cfg-gated imports.
+#[cfg(not(target_arch = "wasm32"))]
+pub(crate) use tokio::time::{sleep, Instant};
+#[cfg(target_arch = "wasm32")]
+pub(crate) use wasm_time::{sleep, Instant};
+
+#[cfg(target_arch = "wasm32")]
+pub mod js_chunked_reader;
 
 mod builder;
 pub use builder::*;
@@ -58,15 +98,16 @@ pub enum Error {
 #[derive(Clone)]
 pub struct SDK {
     app_key: Arc<PrivateKey>,
-    api_client: app_client::Client,
-    downloader: Downloader<quic::Client>,
-    uploader: Uploader<quic::Client>,
+    api_client: Arc<dyn AppClient>,
+    downloader: Downloader,
+    uploader: Uploader,
 }
 
 impl SDK {
     /// Creates a new SDK instance.
+    #[cfg(not(target_arch = "wasm32"))]
     async fn new(
-        api_client: app_client::Client,
+        api_client: Arc<dyn AppClient>,
         app_key: Arc<PrivateKey>,
         tls_config: rustls::ClientConfig,
     ) -> Result<Self, BuilderError> {
@@ -76,8 +117,43 @@ impl SDK {
 
         let transport = quic::Client::new(tls_config, hosts.clone())?;
 
-        let downloader = Downloader::new(hosts.clone(), transport.clone(), app_key.clone());
-        let uploader = Uploader::new(hosts.clone(), transport.clone(), app_key.clone());
+        let downloader =
+            Downloader::new(hosts.clone(), Arc::new(transport.clone()), app_key.clone());
+        let uploader = Uploader::new(hosts.clone(), Arc::new(transport), app_key.clone());
+        Ok(Self {
+            app_key,
+            api_client,
+            downloader,
+            uploader,
+        })
+    }
+
+    /// Creates a new SDK instance.
+    #[cfg(target_arch = "wasm32")]
+    async fn new(
+        api_client: Arc<dyn AppClient>,
+        app_key: Arc<PrivateKey>,
+    ) -> Result<Self, BuilderError> {
+        // Fetch only QUIC hosts — WASM uses WebTransport which requires QUIC.
+        let usable_hosts = api_client.hosts(&app_key, HostQuery {
+            protocol: Some(sia::types::v2::Protocol::QUIC),
+            ..Default::default()
+        }).await?;
+        let hosts = Hosts::new();
+        hosts.update(usable_hosts);
+
+        let transport = web_transport::Client::new(hosts.clone());
+
+        let downloader = Downloader::new(
+            hosts.clone(),
+            Arc::new(transport.clone()),
+            app_key.clone(),
+        );
+        let uploader = Uploader::new(
+            hosts.clone(),
+            Arc::new(transport),
+            app_key.clone(),
+        );
         Ok(Self {
             app_key,
             api_client,
@@ -112,6 +188,20 @@ impl SDK {
     ) -> Result<Object, UploadError> {
         let object = self.uploader.upload(reader, options).await?;
         Ok(object)
+    }
+
+    /// Uploads a single slab's worth of raw data with object-level encryption
+    /// applied at the given stream offset. Used by parallel upload workers.
+    pub async fn upload_slab_raw(
+        &self,
+        data: &[u8],
+        data_key: &EncryptionKey,
+        stream_offset: u64,
+        options: UploadOptions,
+    ) -> Result<Slab, UploadError> {
+        self.uploader
+            .upload_slab_raw(data, data_key, stream_offset, options)
+            .await
     }
 
     /// Creates a new packed upload. This allows multiple objects to be packed together
