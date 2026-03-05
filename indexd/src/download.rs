@@ -17,8 +17,8 @@ use tokio::task::JoinSet;
 #[cfg(not(target_arch = "wasm32"))]
 use tokio::time::error::Elapsed;
 
+use sia::rhp::Host;
 use sia::signing::PublicKey;
-use sia::types::v2::Protocol;
 
 use crate::rhp4::RHP4Client;
 use crate::{Hosts, Object, Sector};
@@ -64,13 +64,13 @@ pub struct DownloadOptions {
     pub length: Option<u64>,
 
     /// Optional channel to notify when each slab is downloaded.
-    /// This can be used to implement progress reporting.
-    pub slab_downloaded: Option<mpsc::UnboundedSender<()>>,
+    /// Sends the number of bytes written for the slab, enabling
+    /// accurate progress tracking and download speed calculation.
+    pub slab_downloaded: Option<mpsc::UnboundedSender<u64>>,
 
     /// Optional channel to report which host is being actively downloaded from.
-    /// Sends the host's address URL (e.g. "https://1.2.3.4:4820/sia/rhp/v4")
-    /// each time a sector download is initiated.
-    pub host_active: Option<mpsc::UnboundedSender<String>>,
+    /// Sends the full Host each time a sector download is initiated.
+    pub host_active: Option<mpsc::UnboundedSender<Host>>,
 }
 
 impl Default for DownloadOptions {
@@ -142,28 +142,6 @@ impl Downloader {
         }
     }
 
-    /// Resolves a host's public key to its WebTransport/HTTPS URL.
-    fn host_url(&self, host_key: &PublicKey) -> String {
-        self.hosts
-            .addresses(host_key)
-            .and_then(|addrs| {
-                addrs
-                    .into_iter()
-                    .find(|a| a.protocol == Protocol::QUIC)
-                    .map(|a| {
-                        let addr = &a.address;
-                        if addr.starts_with("https://") {
-                            addr.clone()
-                        } else if addr.contains('/') {
-                            format!("https://{addr}")
-                        } else {
-                            format!("https://{addr}")
-                        }
-                    })
-            })
-            .unwrap_or_else(|| host_key.to_string())
-    }
-
     /// Returns the public keys of all known hosts.
     pub(crate) fn known_hosts(&self) -> Vec<PublicKey> {
         self.hosts.hosts()
@@ -183,20 +161,16 @@ impl Downloader {
         }
     }
 
-    /// Downloads the shards of an erasure-coded slab.
-    /// Successful shards will be decrypted using the
-    /// encryption_key.
-    ///
-    /// offset and limit are the byte range to download
-    /// from each sector.
     /// Sends a host-active notification if the channel is present.
     fn notify_host_active(
         &self,
-        host_active: &Option<mpsc::UnboundedSender<String>>,
+        host_active: &Option<mpsc::UnboundedSender<Host>>,
         host_key: &PublicKey,
     ) {
         if let Some(tx) = host_active {
-            let _ = tx.send(self.host_url(host_key));
+            if let Some(host) = self.hosts.host(host_key) {
+                let _ = tx.send(host);
+            }
         }
     }
 
@@ -208,7 +182,7 @@ impl Downloader {
         offset: u64,
         length: u64,
         max_inflight: usize,
-        host_active: &Option<mpsc::UnboundedSender<String>>,
+        host_active: &Option<mpsc::UnboundedSender<Host>>,
     ) -> Result<Vec<Option<Vec<u8>>>, DownloadError> {
         let total_shards = sectors.len();
         let zero_key = PublicKey::new([0u8; 32]);
@@ -424,7 +398,7 @@ impl Downloader {
             .await?;
             length -= slab_length;
             if let Some(ref tx) = options.slab_downloaded {
-                let _ = tx.send(());
+                let _ = tx.send(slab_length);
             }
         }
         w.flush().await?;
