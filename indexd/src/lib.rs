@@ -2,6 +2,8 @@ use std::sync::Arc;
 
 use crate::app_client::{HostQuery, SlabPinParams};
 use crate::rhp4::{MultiTransport, RHP4Client};
+use crate::transport::quic::Client as QuicClient;
+use crate::transport::siamux::Client as SiamuxClient;
 
 use chrono::{DateTime, Utc};
 use sia::signing::PrivateKey;
@@ -74,9 +76,13 @@ impl SDK {
         let hosts = Hosts::new();
         hosts.update(usable_hosts);
 
-        let quic = quic::Client::new(tls_config, hosts.clone())?;
-        let transport: Arc<dyn RHP4Client> =
-            Arc::new(MultiTransport::new(hosts.clone(), vec![Arc::new(quic)]));
+        let quic = QuicClient::new(tls_config, hosts.clone())
+            .map_err(|e| BuilderError::Transport(e.to_string()))?;
+        let siamux = SiamuxClient::new(hosts.clone());
+        let transport: Arc<dyn RHP4Client> = Arc::new(MultiTransport::new(
+            hosts.clone(),
+            vec![Arc::new(siamux), Arc::new(quic)],
+        ));
         let downloader = Downloader::new(hosts.clone(), transport.clone(), app_key.clone());
         let uploader = Uploader::new(hosts.clone(), transport, app_key.clone());
         Ok(Self {
