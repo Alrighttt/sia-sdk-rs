@@ -2,6 +2,7 @@ use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, RwLock};
 use std::time::Duration;
 
+use async_trait::async_trait;
 use bytes::Bytes;
 use chrono::Utc;
 use sia::rhp::{self, HostPrices};
@@ -51,6 +52,7 @@ impl MockRHP4Client {
     }
 }
 
+#[async_trait]
 impl RHP4Client for Arc<MockRHP4Client> {
     async fn host_prices(&self, _: PublicKey, _: bool) -> Result<HostPrices, rhp4::Error> {
         Ok(HostPrices {
