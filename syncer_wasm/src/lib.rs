@@ -1889,9 +1889,9 @@ pub async fn sync_chain(
     let genesis_id = parse_genesis_id(&genesis_id_hex)?;
     let cert_hash = parse_cert_hash(&cert_hash_hex)?;
 
-    // V2 checkpoint block IDs (block before V2 activation)
-    const V2_CHECKPOINT_MAINNET: &str = "00000000000000002a5c67b118ab32a6e2ba88f10d1e9480dd43c14aff35056a"; // height 525999
-    const V2_CHECKPOINT_ZEN: &str = "00000009d768badc2187301f412fd7a7d7a0f71d872c471513d9df04f52206ce"; // height 39
+    // V2 checkpoint block IDs (block before V2 require height)
+    const V2_CHECKPOINT_MAINNET: &str = "0000000000000000b3b69b56214c974ce293a310d5fcfedb85f2e6b039e5bac0"; // height 529999
+    const V2_CHECKPOINT_ZEN: &str = "0000000863c1e1191775e601ead23feeae6f5bab166eb1da538b091c6613be72"; // height 49
 
     log("Connecting...", "info");
     let conn = connect_and_handshake(&url, genesis_id, cert_hash.as_deref()).await?;
@@ -1919,7 +1919,7 @@ pub async fn sync_chain(
             .map_err(|e| JsValue::from_str(&format!("bad checkpoint hex: {e}")))?;
         let mut id = [0u8; 32];
         id.copy_from_slice(&checkpoint_bytes);
-        log(&format!("Starting header sync from V2 activation (height {sh})"), "info");
+        log(&format!("Starting header sync from V2 require height (height {sh})"), "info");
         ChainIndex {
             height: sh.saturating_sub(1),
             id: BlockID::new(id),
@@ -2385,10 +2385,10 @@ pub async fn generate_filters(
         "ok",
     );
 
-    // Hardcoded checkpoint block IDs for V2-only mode (block before V2 activation)
+    // Hardcoded checkpoint block IDs for V2-only mode (block before V2 require height)
     // These allow skipping the full header sync by jumping directly to V2 blocks.
-    const V2_CHECKPOINT_MAINNET: &str = "00000000000000002a5c67b118ab32a6e2ba88f10d1e9480dd43c14aff35056a"; // height 525999
-    const V2_CHECKPOINT_ZEN: &str = "00000009d768badc2187301f412fd7a7d7a0f71d872c471513d9df04f52206ce"; // height 39
+    const V2_CHECKPOINT_MAINNET: &str = "0000000000000000b3b69b56214c974ce293a310d5fcfedb85f2e6b039e5bac0"; // height 529999
+    const V2_CHECKPOINT_ZEN: &str = "0000000863c1e1191775e601ead23feeae6f5bab166eb1da538b091c6613be72"; // height 49
 
     let cache_key = if start_height.is_some() { "filter_entries_v2" } else { "filter_entries" };
     let start_offset: u64 = start_height.map(|h| h.saturating_sub(1)).unwrap_or(0);
@@ -2529,7 +2529,7 @@ pub async fn generate_filters(
         let last_id = entries.last().unwrap().block_id;
         vec![BlockID::new(last_id)]
     } else if start_height.is_some() {
-        // V2-only: use hardcoded checkpoint to skip to V2 activation
+        // V2-only: use hardcoded checkpoint to skip to V2 require height
         let checkpoint_hex = if genesis_id_hex == "25f6e3b9295a61f69fcb956aca9f0076234ecf2e02d399db5448b6e22f26e81c" {
             V2_CHECKPOINT_MAINNET
         } else {
@@ -2722,9 +2722,9 @@ pub async fn generate_txindex(
     let genesis_id = parse_genesis_id(&genesis_id_hex)?;
     let cert_hash = parse_cert_hash(&cert_hash_hex)?;
 
-    // V2 checkpoint block IDs
-    const V2_CHECKPOINT_MAINNET: &str = "00000000000000002a5c67b118ab32a6e2ba88f10d1e9480dd43c14aff35056a";
-    const V2_CHECKPOINT_ZEN: &str = "00000009d768badc2187301f412fd7a7d7a0f71d872c471513d9df04f52206ce";
+    // V2 checkpoint block IDs (block before V2 require height)
+    const V2_CHECKPOINT_MAINNET: &str = "0000000000000000b3b69b56214c974ce293a310d5fcfedb85f2e6b039e5bac0"; // height 529999
+    const V2_CHECKPOINT_ZEN: &str = "0000000863c1e1191775e601ead23feeae6f5bab166eb1da538b091c6613be72"; // height 49
 
     log("Connecting to peer...", "info");
     let conn = connect_and_handshake(&url, genesis_id, cert_hash.as_deref()).await?;
