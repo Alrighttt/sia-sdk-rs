@@ -58,18 +58,18 @@ extern "C" {
     fn idb_load(key: &str) -> js_sys::Promise;
 }
 
-async fn save_header_ids(ids: &[BlockID]) -> Result<(), JsValue> {
+async fn save_header_ids_with_key(key: &str, ids: &[BlockID]) -> Result<(), JsValue> {
     let mut buf = Vec::with_capacity(ids.len() * 32);
     for id in ids {
         buf.extend_from_slice(id.as_ref());
     }
     let arr = Uint8Array::from(&buf[..]);
-    JsFuture::from(idb_save("header_ids", arr)).await?;
+    JsFuture::from(idb_save(key, arr)).await?;
     Ok(())
 }
 
-async fn load_header_ids() -> Result<Option<Vec<BlockID>>, JsValue> {
-    let result = JsFuture::from(idb_load("header_ids")).await?;
+async fn load_header_ids_with_key(key: &str) -> Result<Option<Vec<BlockID>>, JsValue> {
+    let result = JsFuture::from(idb_load(key)).await?;
     if result.is_null() || result.is_undefined() {
         return Ok(None);
     }
@@ -87,6 +87,10 @@ async fn load_header_ids() -> Result<Option<Vec<BlockID>>, JsValue> {
         })
         .collect();
     Ok(Some(ids))
+}
+
+async fn load_header_ids() -> Result<Option<Vec<BlockID>>, JsValue> {
+    load_header_ids_with_key("header_ids").await
 }
 
 // --- Block cache (IndexedDB) ---
@@ -1149,7 +1153,143 @@ fn build_gcs_filter(addresses: &[[u8; 32]], block_id: &[u8; 32], p: u8) -> Vec<u
     bw.into_bytes()
 }
 
-// --- Filter file format ---
+// =============================================================================
+// SCBF — Sia Compact Block Filters
+// =============================================================================
+//
+// Motivation
+// ----------
+// A light client that only cares about a few addresses shouldn't need to
+// download every block on the chain. SCBF files contain one Golomb-Coded Set
+// (GCS) filter per block, encoding the set of addresses that appear in that
+// block's transactions. A client downloads the compact filter file once, tests
+// each filter against its own addresses locally, and only fetches the handful
+// of blocks that actually match. This reduces bandwidth by orders of magnitude
+// compared to a full chain scan.
+//
+// The GCS construction follows BIP-158 conventions adapted for Sia:
+//   - Each address is a 32-byte Sia address (Blake2b-256 hash).
+//   - The SipHash-2-4 key is derived from the block ID: k0 = LE64(blockID[0:8]),
+//     k1 = LE64(blockID[8:16]).
+//   - Each address is hashed to a value in [0, N*M) via SipHash then fast_reduce,
+//     where N = number of addresses in the block and M = 2^P.
+//   - The sorted hashed values are delta-encoded and compressed with Golomb-Rice
+//     coding at parameter P (typically 19, giving M = 524288).
+//   - Golomb-Rice encoding: for each delta d, write (d >> P) zeros followed by
+//     a 1-bit (unary quotient), then the low P bits of d in MSB-first order.
+//   - The resulting bitstream is packed into bytes (MSB-first, zero-padded).
+//
+// To test membership, the client hashes its target address with the same
+// SipHash key, then decodes the Golomb-Rice stream looking for a match. False
+// positive rate is approximately 1/M per block (≈ 1 in 524,288 at P=19).
+//
+// Wire Format — Version 1
+// -----------------------
+// All integers are unsigned little-endian.
+//
+//   Header (24 bytes):
+//     [0:4]    magic       "SCBF" (0x53 0x43 0x42 0x46)
+//     [4:8]    version     uint32 = 1
+//     [8:12]   count       uint32, number of block entries
+//     [12:16]  P           uint32, Golomb-Rice parameter
+//     [16:24]  tipHeight   uint64, chain height at time of generation
+//
+//   Entries (repeated `count` times, variable length):
+//     [0:8]    height      uint64, block height
+//     [8:40]   blockID     [32]byte, block ID (hash)
+//     [40:42]  addrCount   uint16, number of addresses in the filter
+//     [42:46]  dataLen     uint32, byte length of the GCS filter data
+//     [46:46+dataLen]      GCS filter bitstream (Golomb-Rice encoded)
+//
+//   Total size: 24 + sum(46 + dataLen_i) for each entry
+//
+// Wire Format — Version 2 (compact)
+// ----------------------------------
+// V2 is designed for contiguous block ranges (e.g. V2-only sync starting at a
+// known activation height). Heights are implicit: entry i has height =
+// startHeight + i. Filter data lengths use uint16 instead of uint32, which is
+// safe because individual block filters are well under 64 KB.
+//
+//   Header (32 bytes):
+//     [0:4]    magic       "SCBF"
+//     [4:8]    version     uint32 = 2
+//     [8:12]   count       uint32, number of block entries
+//     [12:16]  P           uint32, Golomb-Rice parameter
+//     [16:24]  tipHeight   uint64, chain height at time of generation
+//     [24:32]  startHeight uint64, height of the first entry
+//
+//   Entries (repeated `count` times, variable length):
+//     [0:32]   blockID     [32]byte, block ID
+//     [32:34]  addrCount   uint16, number of addresses
+//     [34:36]  dataLen     uint16, byte length of GCS data
+//     [36:36+dataLen]      GCS filter bitstream
+//
+//   Entry height = startHeight + entry_index
+//   Total size: 32 + sum(36 + dataLen_i) for each entry
+//
+// Usage
+// -----
+// 1. Obtain: retrieve filters from a peer via the planned Syncer RPC command,
+//    or generate locally from downloaded blocks for stronger trust guarantees,
+//    or load from a static file.
+// 2. Scan: test each block's filter against target addresses. Collect matching
+//    block heights.
+// 3. Fetch: download only the matching blocks from a peer and extract
+//    transaction details.
+// 4. Cache: store in IndexedDB for offline use across page reloads.
+//
+// =============================================================================
+
+// =============================================================================
+// STXI — Sia Transaction Index
+// =============================================================================
+//
+// Motivation
+// ----------
+// Looking up a transaction by its ID on Sia normally requires either a full
+// node index or scanning the entire chain. The STXI format provides a compact
+// index that maps transaction ID prefixes to block heights. A client can
+// binary-search the sorted index to find which block contains a transaction,
+// then fetch only that block from a peer. Like SCBF, the index can be
+// retrieved from peers via a planned Syncer RPC or generated locally.
+//
+// The index stores only the first 8 bytes of each 32-byte transaction ID. This
+// is sufficient for practical uniqueness — with ~1M transactions, the
+// probability of an 8-byte prefix collision is roughly 1 in 10^13 (birthday
+// bound at 2^64). In the unlikely event of a collision, the client fetches a
+// small number of candidate blocks and checks the full transaction IDs.
+//
+// Wire Format — Version 1
+// -----------------------
+// All integers are unsigned little-endian. Entries MUST be sorted by prefix
+// in ascending lexicographic (byte) order to enable binary search.
+//
+//   Header (16 bytes):
+//     [0:4]    magic       "STXI" (0x53 0x54 0x58 0x49)
+//     [4:8]    version     uint32 = 1
+//     [8:12]   count       uint32, number of entries
+//     [12:16]  tipHeight   uint32, chain height at time of generation
+//
+//   Entries (repeated `count` times, fixed 12 bytes each):
+//     [0:8]    prefix      [8]byte, first 8 bytes of the transaction ID
+//     [8:12]   height      uint32, block height containing this transaction
+//
+//   Total size: 16 + (count * 12) bytes
+//
+// Usage
+// -----
+// 1. Generate: sync chain blocks, collect (txid_prefix, height) for each V2
+//    transaction, sort by prefix, serialize to STXI file.
+// 2. Lookup: binary search the sorted entries for the target txid prefix.
+//    Multiple matches are possible (prefix collisions) — collect all
+//    candidate heights.
+// 3. Fetch: download candidate blocks from a peer, scan for the full
+//    transaction ID, and return the matching transaction.
+//
+// Size estimate: ~1M transactions × 12 bytes = ~12 MB. Fits comfortably in
+// browser IndexedDB or as a static download.
+//
+// =============================================================================
 
 struct FilterEntry {
     height: u64,
@@ -1180,33 +1320,71 @@ fn parse_filter_file(data: &[u8]) -> Result<FilterFile, String> {
     let tip_height = u64::from_le_bytes(data[16..24].try_into().unwrap());
 
     let mut entries = Vec::with_capacity(count as usize);
-    let mut pos = 24usize;
 
-    for _ in 0..count {
-        if pos + 46 > data.len() {
-            return Err("truncated filter entry header".into());
+    if version == 2 {
+        // V2 compact format: header has extra startHeight(8) = 32 byte header
+        // Per entry: blockID(32) + addressCount(2) + dataLength(2, uint16) + data(N) = 36+N
+        if data.len() < 32 {
+            return Err("v2 filter file too small".into());
         }
-        let height = u64::from_le_bytes(data[pos..pos + 8].try_into().unwrap());
-        let mut block_id = [0u8; 32];
-        block_id.copy_from_slice(&data[pos + 8..pos + 40]);
-        let address_count =
-            u16::from_le_bytes(data[pos + 40..pos + 42].try_into().unwrap());
-        let filter_len =
-            u32::from_le_bytes(data[pos + 42..pos + 46].try_into().unwrap()) as usize;
-        pos += 46;
+        let start_height = u64::from_le_bytes(data[24..32].try_into().unwrap());
+        let mut pos = 32usize;
 
-        if pos + filter_len > data.len() {
-            return Err("truncated filter data".into());
+        for i in 0..count {
+            if pos + 36 > data.len() {
+                return Err("truncated v2 filter entry header".into());
+            }
+            let mut block_id = [0u8; 32];
+            block_id.copy_from_slice(&data[pos..pos + 32]);
+            let address_count =
+                u16::from_le_bytes(data[pos + 32..pos + 34].try_into().unwrap());
+            let filter_len =
+                u16::from_le_bytes(data[pos + 34..pos + 36].try_into().unwrap()) as usize;
+            pos += 36;
+
+            if pos + filter_len > data.len() {
+                return Err("truncated v2 filter data".into());
+            }
+            let filter_data = data[pos..pos + filter_len].to_vec();
+            pos += filter_len;
+
+            entries.push(FilterEntry {
+                height: start_height + i as u64,
+                block_id,
+                address_count,
+                filter_data,
+            });
         }
-        let filter_data = data[pos..pos + filter_len].to_vec();
-        pos += filter_len;
+    } else {
+        // V1 format: per entry: height(8) + blockID(32) + addressCount(2) + dataLength(4) + data(N) = 46+N
+        let mut pos = 24usize;
 
-        entries.push(FilterEntry {
-            height,
-            block_id,
-            address_count,
-            filter_data,
-        });
+        for _ in 0..count {
+            if pos + 46 > data.len() {
+                return Err("truncated filter entry header".into());
+            }
+            let height = u64::from_le_bytes(data[pos..pos + 8].try_into().unwrap());
+            let mut block_id = [0u8; 32];
+            block_id.copy_from_slice(&data[pos + 8..pos + 40]);
+            let address_count =
+                u16::from_le_bytes(data[pos + 40..pos + 42].try_into().unwrap());
+            let filter_len =
+                u32::from_le_bytes(data[pos + 42..pos + 46].try_into().unwrap()) as usize;
+            pos += 46;
+
+            if pos + filter_len > data.len() {
+                return Err("truncated filter data".into());
+            }
+            let filter_data = data[pos..pos + filter_len].to_vec();
+            pos += filter_len;
+
+            entries.push(FilterEntry {
+                height,
+                block_id,
+                address_count,
+                filter_data,
+            });
+        }
     }
 
     Ok(FilterFile {
@@ -1217,12 +1395,12 @@ fn parse_filter_file(data: &[u8]) -> Result<FilterFile, String> {
     })
 }
 
-/// Serialize filter entries to SCBF v2 binary format.
+/// Serialize filter entries to SCBF v1 binary format.
 fn serialize_filter_file(entries: &[FilterEntry], p: u32, tip_height: u64) -> Vec<u8> {
     let mut buf = Vec::new();
     // Header (24 bytes)
     buf.extend_from_slice(b"SCBF");
-    buf.extend_from_slice(&2u32.to_le_bytes()); // version
+    buf.extend_from_slice(&1u32.to_le_bytes()); // version
     buf.extend_from_slice(&(entries.len() as u32).to_le_bytes());
     buf.extend_from_slice(&p.to_le_bytes());
     buf.extend_from_slice(&tip_height.to_le_bytes());
@@ -1233,6 +1411,49 @@ fn serialize_filter_file(entries: &[FilterEntry], p: u32, tip_height: u64) -> Ve
         buf.extend_from_slice(&entry.address_count.to_le_bytes());
         buf.extend_from_slice(&(entry.filter_data.len() as u32).to_le_bytes());
         buf.extend_from_slice(&entry.filter_data);
+    }
+    buf
+}
+
+/// Serialize filter entries to SCBF v2 compact format (implicit heights, uint16 data lengths).
+fn serialize_filter_file_v2(entries: &[FilterEntry], p: u32, tip_height: u64, start_height: u64) -> Vec<u8> {
+    let mut buf = Vec::new();
+    // Header (32 bytes)
+    buf.extend_from_slice(b"SCBF");
+    buf.extend_from_slice(&2u32.to_le_bytes()); // version 2
+    buf.extend_from_slice(&(entries.len() as u32).to_le_bytes());
+    buf.extend_from_slice(&p.to_le_bytes());
+    buf.extend_from_slice(&tip_height.to_le_bytes());
+    buf.extend_from_slice(&start_height.to_le_bytes());
+    // Per-block entries (no height field, uint16 data length)
+    for entry in entries {
+        buf.extend_from_slice(&entry.block_id);
+        buf.extend_from_slice(&entry.address_count.to_le_bytes());
+        buf.extend_from_slice(&(entry.filter_data.len() as u16).to_le_bytes());
+        buf.extend_from_slice(&entry.filter_data);
+    }
+    buf
+}
+
+/// TxIndex entry: 8-byte txid prefix + 4-byte block height.
+#[derive(Clone)]
+struct TxIndexEntry {
+    prefix: [u8; 8],
+    height: u32,
+}
+
+/// Serialize txindex entries to STXI binary format.
+fn serialize_txindex(entries: &[TxIndexEntry], tip_height: u32) -> Vec<u8> {
+    let mut buf = Vec::with_capacity(16 + entries.len() * 12);
+    // Header (16 bytes)
+    buf.extend_from_slice(b"STXI");
+    buf.extend_from_slice(&1u32.to_le_bytes()); // version
+    buf.extend_from_slice(&(entries.len() as u32).to_le_bytes());
+    buf.extend_from_slice(&tip_height.to_le_bytes());
+    // Per-entry (12 bytes each)
+    for e in entries {
+        buf.extend_from_slice(&e.prefix);
+        buf.extend_from_slice(&e.height.to_le_bytes());
     }
     buf
 }
@@ -1551,6 +1772,7 @@ struct Connection {
 async fn connect_and_handshake(
     url: &str,
     genesis_id: BlockID,
+    cert_hash: Option<&[u8]>,
 ) -> Result<Connection, JsValue> {
     let mut unique_id = [0u8; 8];
     getrandom::fill(&mut unique_id).map_err(|e| JsValue::from_str(&e.to_string()))?;
@@ -1562,6 +1784,14 @@ async fn connect_and_handshake(
     };
 
     let options = web_sys::WebTransportOptions::new();
+    if let Some(hash_bytes) = cert_hash {
+        let wt_hash = web_sys::WebTransportHash::new();
+        wt_hash.set_algorithm("sha-256");
+        let hash_array = js_sys::Uint8Array::from(hash_bytes);
+        wt_hash.set_value_u8_array(&hash_array);
+        options.set_server_certificate_hashes(&[wt_hash]);
+        web_sys::console::log_1(&format!("Using cert hash: {} ({} bytes)", hex::encode(hash_bytes), hash_bytes.len()).into());
+    }
     let wt = web_sys::WebTransport::new_with_options(url, &options)?;
     JsFuture::from(wt.ready()).await?;
 
@@ -1580,6 +1810,20 @@ fn parse_genesis_id(hex: &str) -> Result<BlockID, JsValue> {
     let mut arr = [0u8; 32];
     arr.copy_from_slice(&bytes);
     Ok(BlockID::from(arr))
+}
+
+/// Parse an optional cert hash hex string into bytes.
+fn parse_cert_hash(cert_hash_hex: &Option<String>) -> Result<Option<Vec<u8>>, JsValue> {
+    match cert_hash_hex {
+        Some(h) if !h.is_empty() => {
+            let bytes = hex_to_bytes(h)?;
+            if bytes.len() != 32 {
+                return Err(JsValue::from_str("cert_hash must be 64 hex characters (SHA-256)"));
+            }
+            Ok(Some(bytes))
+        }
+        _ => Ok(None),
+    }
 }
 
 /// Parse an address from hex. Accepts either 64-char (raw) or 76-char (with checksum).
@@ -1607,11 +1851,13 @@ fn parse_address(hex: &str) -> Result<Address, JsValue> {
 pub async fn connect_and_discover_ip(
     url: String,
     genesis_id_hex: String,
+    cert_hash_hex: Option<String>,
 ) -> Result<JsValue, JsValue> {
     console_error_panic_hook::set_once();
 
     let genesis_id = parse_genesis_id(&genesis_id_hex)?;
-    let conn = connect_and_handshake(&url, genesis_id).await?;
+    let cert_hash = parse_cert_hash(&cert_hash_hex)?;
+    let conn = connect_and_handshake(&url, genesis_id, cert_hash.as_deref()).await?;
     let ip = discover_ip(&conn.wt).await?;
     conn.wt.close();
 
@@ -1627,6 +1873,8 @@ pub async fn sync_chain(
     url: String,
     genesis_id_hex: String,
     log_fn: js_sys::Function,
+    cert_hash_hex: Option<String>,
+    start_height: Option<u64>,
 ) -> Result<JsValue, JsValue> {
     console_error_panic_hook::set_once();
 
@@ -1639,9 +1887,14 @@ pub async fn sync_chain(
     };
 
     let genesis_id = parse_genesis_id(&genesis_id_hex)?;
+    let cert_hash = parse_cert_hash(&cert_hash_hex)?;
+
+    // V2 checkpoint block IDs (block before V2 activation)
+    const V2_CHECKPOINT_MAINNET: &str = "00000000000000002a5c67b118ab32a6e2ba88f10d1e9480dd43c14aff35056a"; // height 525999
+    const V2_CHECKPOINT_ZEN: &str = "00000009d768badc2187301f412fd7a7d7a0f71d872c471513d9df04f52206ce"; // height 39
 
     log("Connecting...", "info");
-    let conn = connect_and_handshake(&url, genesis_id).await?;
+    let conn = connect_and_handshake(&url, genesis_id, cert_hash.as_deref()).await?;
     log("WebTransport connected!", "ok");
 
     log(
@@ -1655,14 +1908,38 @@ pub async fn sync_chain(
     let ip = discover_ip(&conn.wt).await?;
     log(&format!("Our IP: {ip}"), "data");
 
-    // Sync headers from genesis to tip
-    log("", "info");
-    log("Syncing chain headers...", "info");
-
-    let mut current_index = ChainIndex {
-        height: 0,
-        id: genesis_id,
+    // Determine starting chain index
+    let start_index = if let Some(sh) = start_height {
+        let checkpoint_hex = if genesis_id_hex == "25f6e3b9295a61f69fcb956aca9f0076234ecf2e02d399db5448b6e22f26e81c" {
+            V2_CHECKPOINT_MAINNET
+        } else {
+            V2_CHECKPOINT_ZEN
+        };
+        let checkpoint_bytes = hex::decode(checkpoint_hex)
+            .map_err(|e| JsValue::from_str(&format!("bad checkpoint hex: {e}")))?;
+        let mut id = [0u8; 32];
+        id.copy_from_slice(&checkpoint_bytes);
+        log(&format!("Starting header sync from V2 activation (height {sh})"), "info");
+        ChainIndex {
+            height: sh.saturating_sub(1),
+            id: BlockID::new(id),
+        }
+    } else {
+        ChainIndex {
+            height: 0,
+            id: genesis_id,
+        }
     };
+
+    // Sync headers
+    log("", "info");
+    if start_height.is_some() {
+        log("Syncing V2 headers...", "info");
+    } else {
+        log("Syncing all chain headers from genesis...", "info");
+    }
+
+    let mut current_index = start_index;
     let mut total_headers: u64 = 0;
     let max_per_batch: u64 = 2000;
     let mut tip_header = None;
@@ -1694,7 +1971,7 @@ pub async fn sync_chain(
                     "info",
                 );
                 let _ = wt.close();
-                let new_conn = connect_and_handshake(&url, genesis_id).await?;
+                let new_conn = connect_and_handshake(&url, genesis_id, cert_hash.as_deref()).await?;
                 wt = new_conn.wt;
                 log("  Reconnected, resuming...", "ok");
                 continue;
@@ -1737,15 +2014,19 @@ pub async fn sync_chain(
 
     // Cache header IDs for generate_filters to reuse (in-memory + IndexedDB)
     if !header_ids.is_empty() {
-        log(&format!("Persisting {} header IDs to IndexedDB...", header_ids.len()), "info");
-        if let Err(e) = save_header_ids(&header_ids).await {
+        let idb_key = if start_height.is_some() { "header_ids_v2" } else { "header_ids" };
+        log(&format!("Persisting {} header IDs to IndexedDB ({})...", header_ids.len(), idb_key), "info");
+        if let Err(e) = save_header_ids_with_key(idb_key, &header_ids).await {
             log(&format!("Warning: failed to persist header IDs: {:?}", e), "info");
         } else {
             log("Header IDs persisted to IndexedDB.", "ok");
         }
-        CACHED_HEADER_IDS.with(|cache| {
-            *cache.borrow_mut() = Some(header_ids);
-        });
+        if start_height.is_none() {
+            // Only cache full header IDs in memory (used by tx lookup etc.)
+            CACHED_HEADER_IDS.with(|cache| {
+                *cache.borrow_mut() = Some(header_ids);
+            });
+        }
     }
 
     log("", "info");
@@ -1793,6 +2074,7 @@ pub async fn sync_chain(
             "tipBlockID": block_id.to_string(),
             "tipTimestamp": ts,
             "totalHeaders": total_headers,
+            "v2Only": start_height.is_some(),
             "block": block_json_value,
         });
         Ok(JsValue::from_str(&serde_json::to_string(&result).unwrap()))
@@ -1805,6 +2087,7 @@ pub async fn sync_chain(
             "ip": ip,
             "tipHeight": 0,
             "totalHeaders": 0,
+            "v2Only": start_height.is_some(),
             "block": null,
         });
         Ok(JsValue::from_str(&serde_json::to_string(&result).unwrap()))
@@ -1818,6 +2101,7 @@ pub async fn scan_balance(
     target_address: String,
     start_height: u64,
     log_fn: js_sys::Function,
+    cert_hash_hex: Option<String>,
 ) -> Result<JsValue, JsValue> {
     console_error_panic_hook::set_once();
 
@@ -1830,10 +2114,11 @@ pub async fn scan_balance(
     };
 
     let genesis_id = parse_genesis_id(&genesis_id_hex)?;
+    let cert_hash = parse_cert_hash(&cert_hash_hex)?;
     let target = parse_address(&target_address)?;
 
     log("Connecting...", "info");
-    let conn = connect_and_handshake(&url, genesis_id).await?;
+    let conn = connect_and_handshake(&url, genesis_id, cert_hash.as_deref()).await?;
     log(
         &format!(
             "Connected! Peer version: {}, addr: {}",
@@ -1955,7 +2240,7 @@ pub async fn scan_balance(
                     "info",
                 );
                 let _ = wt.close();
-                let new_conn = connect_and_handshake(&url, genesis_id).await?;
+                let new_conn = connect_and_handshake(&url, genesis_id, cert_hash.as_deref()).await?;
                 wt = new_conn.wt;
                 log("  Reconnected, resuming scan...", "ok");
 
@@ -2072,6 +2357,8 @@ pub async fn generate_filters(
     url: String,
     genesis_id_hex: String,
     log_fn: js_sys::Function,
+    cert_hash_hex: Option<String>,
+    start_height: Option<u64>,
 ) -> Result<JsValue, JsValue> {
     console_error_panic_hook::set_once();
 
@@ -2084,11 +2371,12 @@ pub async fn generate_filters(
     };
 
     let genesis_id = parse_genesis_id(&genesis_id_hex)?;
+    let cert_hash = parse_cert_hash(&cert_hash_hex)?;
     let p: u8 = 19;
 
     // Step 1: Connect
     log("Connecting to peer...", "info");
-    let conn = connect_and_handshake(&url, genesis_id).await?;
+    let conn = connect_and_handshake(&url, genesis_id, cert_hash.as_deref()).await?;
     log(
         &format!(
             "Connected! Peer version: {}, addr: {}",
@@ -2097,112 +2385,170 @@ pub async fn generate_filters(
         "ok",
     );
 
-    // Step 2: Sync all headers to discover chain tip and collect block IDs
-    // Check in-memory cache first, then IndexedDB, then sync from peer
-    let cached = CACHED_HEADER_IDS.with(|cache| cache.borrow().clone());
+    // Hardcoded checkpoint block IDs for V2-only mode (block before V2 activation)
+    // These allow skipping the full header sync by jumping directly to V2 blocks.
+    const V2_CHECKPOINT_MAINNET: &str = "00000000000000002a5c67b118ab32a6e2ba88f10d1e9480dd43c14aff35056a"; // height 525999
+    const V2_CHECKPOINT_ZEN: &str = "00000009d768badc2187301f412fd7a7d7a0f71d872c471513d9df04f52206ce"; // height 39
+
+    let cache_key = if start_height.is_some() { "filter_entries_v2" } else { "filter_entries" };
+    let start_offset: u64 = start_height.map(|h| h.saturating_sub(1)).unwrap_or(0);
     let mut wt = conn.wt;
+    let mut tip_height: u64 = 0;
 
-    let header_ids: Vec<BlockID> = if let Some(ids) = cached {
-        log(
-            &format!("Using {} cached header IDs from memory", ids.len()),
-            "ok",
-        );
-        ids
-    } else if let Ok(Some(ids)) = load_header_ids().await {
-        log(
-            &format!("Loaded {} header IDs from IndexedDB", ids.len()),
-            "ok",
-        );
-        ids
+    // Step 2: Get header IDs (skip entirely for V2-only mode)
+    let header_ids: Vec<BlockID> = if start_height.is_some() {
+        log(&format!("V2-only mode: skipping header sync, starting from height {}", start_offset + 1), "info");
+        Vec::new() // not needed — v2 blocks have correct block.id()
     } else {
-        log("Syncing chain headers...", "info");
+        // Full mode: sync all headers
+        let cached = CACHED_HEADER_IDS.with(|cache| cache.borrow().clone());
+        let ids = if let Some(ids) = cached {
+            log(
+                &format!("Using {} cached header IDs from memory", ids.len()),
+                "ok",
+            );
+            ids
+        } else if let Ok(Some(ids)) = load_header_ids().await {
+            log(
+                &format!("Loaded {} header IDs from IndexedDB", ids.len()),
+                "ok",
+            );
+            ids
+        } else {
+            log("Syncing chain headers...", "info");
 
-        let mut current_index = ChainIndex {
-            height: 0,
-            id: genesis_id,
-        };
-        let mut total_headers: u64 = 0;
-        let max_per_batch: u64 = 2000;
-        let mut ids: Vec<BlockID> = Vec::new();
-        let mut retries: u32 = 0;
-        const MAX_RETRIES: u32 = 3;
+            let mut current_index = ChainIndex {
+                height: 0,
+                id: genesis_id,
+            };
+            let mut total_headers: u64 = 0;
+            let max_per_batch: u64 = 2000;
+            let mut synced_ids: Vec<BlockID> = Vec::new();
+            let mut retries: u32 = 0;
+            const MAX_RETRIES: u32 = 3;
 
-        loop {
-            let resp = match send_headers_rpc(&wt, current_index, max_per_batch).await {
-                Ok(r) => {
-                    retries = 0;
-                    r
-                }
-                Err(_) => {
-                    retries += 1;
-                    if retries > MAX_RETRIES {
+            loop {
+                let resp = match send_headers_rpc(&wt, current_index, max_per_batch).await {
+                    Ok(r) => {
+                        retries = 0;
+                        r
+                    }
+                    Err(_) => {
+                        retries += 1;
+                        if retries > MAX_RETRIES {
+                            log(
+                                &format!("  Failed after {MAX_RETRIES} retries at {total_headers} headers, continuing with what we have"),
+                                "info",
+                            );
+                            break;
+                        }
                         log(
-                            &format!("  Failed after {MAX_RETRIES} retries at {total_headers} headers, continuing with what we have"),
+                            &format!(
+                                "  Connection lost after {total_headers} headers, reconnecting ({retries}/{MAX_RETRIES})..."
+                            ),
                             "info",
                         );
-                        break;
+                        let _ = wt.close();
+                        let new_conn = connect_and_handshake(&url, genesis_id, cert_hash.as_deref()).await?;
+                        wt = new_conn.wt;
+                        log("  Reconnected, resuming...", "ok");
+                        continue;
                     }
-                    log(
-                        &format!(
-                            "  Connection lost after {total_headers} headers, reconnecting ({retries}/{MAX_RETRIES})..."
-                        ),
-                        "info",
-                    );
-                    let _ = wt.close();
-                    let new_conn = connect_and_handshake(&url, genesis_id).await?;
-                    wt = new_conn.wt;
-                    log("  Reconnected, resuming...", "ok");
-                    continue;
+                };
+                let batch_count = resp.headers.len() as u64;
+
+                if batch_count == 0 {
+                    break;
                 }
-            };
-            let batch_count = resp.headers.len() as u64;
 
-            if batch_count == 0 {
-                break;
+                for header in &resp.headers {
+                    synced_ids.push(header.id());
+                }
+
+                total_headers += batch_count;
+                let estimated_total = total_headers + resp.remaining;
+                log(
+                    &format!("  Headers: {total_headers} / ~{estimated_total}"),
+                    "data",
+                );
+
+                let last_header = resp.headers.last().unwrap();
+                let last_id = last_header.id();
+                let new_height = current_index.height + batch_count;
+
+                if resp.remaining == 0 {
+                    break;
+                }
+
+                current_index = ChainIndex {
+                    height: new_height,
+                    id: last_id,
+                };
             }
 
-            for header in &resp.headers {
-                ids.push(header.id());
-            }
-
-            total_headers += batch_count;
-            let estimated_total = total_headers + resp.remaining;
             log(
-                &format!("  Headers: {total_headers} / ~{estimated_total}"),
-                "data",
+                &format!("Header sync complete: {total_headers} headers"),
+                "ok",
             );
-
-            let last_header = resp.headers.last().unwrap();
-            let last_id = last_header.id();
-            let new_height = current_index.height + batch_count;
-
-            if resp.remaining == 0 {
-                break;
-            }
-
-            current_index = ChainIndex {
-                height: new_height,
-                id: last_id,
-            };
-        }
-
-        log(
-            &format!("Header sync complete: {total_headers} headers"),
-            "ok",
-        );
+            synced_ids
+        };
+        tip_height = ids.len() as u64;
         ids
     };
 
-    let tip_height = header_ids.len() as u64;
+    // Step 3: Load cached filters from IndexedDB and resume
+    let mut entries: Vec<FilterEntry> = Vec::new();
+    let mut blocks_downloaded: u64 = start_offset;
+    let mut total_addresses: u64 = 0;
 
-    // Step 3: Download all blocks and build filters
+    if let Ok(result) = JsFuture::from(idb_load(cache_key)).await {
+        if !result.is_null() && !result.is_undefined() {
+            let arr = Uint8Array::from(result);
+            let cached_bytes = arr.to_vec();
+            if let Ok(cached) = parse_filter_file(&cached_bytes) {
+                let cached_count = cached.entries.len() as u64;
+                log(
+                    &format!("Loaded {cached_count} cached filter entries from IndexedDB (up to height {})",
+                        cached.entries.last().map(|e| e.height).unwrap_or(0)),
+                    "ok",
+                );
+                for e in &cached.entries {
+                    total_addresses += e.address_count as u64;
+                }
+                blocks_downloaded = start_offset + cached_count;
+                entries = cached.entries;
+            }
+        }
+    }
+
     log("Downloading blocks and building filters...", "info");
 
-    let mut entries: Vec<FilterEntry> = Vec::new();
-    let mut history: Vec<BlockID> = Vec::new(); // empty = start from genesis
+    // Build initial history for block download
+    let mut history: Vec<BlockID> = if !entries.is_empty() {
+        // Resume from last cached filter entry's block ID
+        let last_id = entries.last().unwrap().block_id;
+        vec![BlockID::new(last_id)]
+    } else if start_height.is_some() {
+        // V2-only: use hardcoded checkpoint to skip to V2 activation
+        let checkpoint_hex = if genesis_id_hex == "25f6e3b9295a61f69fcb956aca9f0076234ecf2e02d399db5448b6e22f26e81c" {
+            V2_CHECKPOINT_MAINNET
+        } else {
+            V2_CHECKPOINT_ZEN
+        };
+        let checkpoint_bytes = hex::decode(checkpoint_hex)
+            .map_err(|e| JsValue::from_str(&format!("bad checkpoint hex: {e}")))?;
+        let mut id = [0u8; 32];
+        id.copy_from_slice(&checkpoint_bytes);
+        vec![BlockID::new(id)]
+    } else if blocks_downloaded > 0 {
+        // Full mode resume: use header ID
+        vec![header_ids[(blocks_downloaded - 1) as usize].clone()]
+    } else {
+        Vec::new() // start from genesis
+    };
+
     let blocks_per_batch: u64 = 100;
-    let mut blocks_downloaded: u64 = 0;
-    let mut total_addresses: u64 = 0;
+    let save_interval: u64 = 1000;
     loop {
         let rpc_result = send_v2_blocks_rpc(&wt, history.clone(), blocks_per_batch).await;
 
@@ -2211,12 +2557,13 @@ pub async fn generate_filters(
             Err(_) => {
                 log(
                     &format!(
-                        "  Connection lost after {blocks_downloaded} blocks, reconnecting..."
+                        "  Connection lost after {} blocks, reconnecting...",
+                        blocks_downloaded - start_offset
                     ),
                     "info",
                 );
                 let _ = wt.close();
-                let new_conn = connect_and_handshake(&url, genesis_id).await?;
+                let new_conn = connect_and_handshake(&url, genesis_id, cert_hash.as_deref()).await?;
                 wt = new_conn.wt;
                 log("  Reconnected, resuming...", "ok");
                 if history.is_empty() && blocks_downloaded > 0 {
@@ -2232,10 +2579,12 @@ pub async fn generate_filters(
 
         for (block, _raw) in &blocks_with_raw {
             let height = block.v2_height.unwrap_or(blocks_downloaded);
-            // Use the header ID (which includes the correct v1 merkle root
-            // commitment) instead of DecodedBlock.id() which uses zeros for
-            // v1 blocks, producing a different ID than Go computes.
-            let block_id_obj = if (blocks_downloaded as usize) < header_ids.len() {
+            // For v2 blocks, block.id() is correct.
+            // For v1 blocks, use the header ID (which includes the correct v1 merkle root).
+            let block_id_obj = if start_height.is_some() {
+                // V2-only mode: block.id() is always correct for v2 blocks
+                block.id()
+            } else if (blocks_downloaded as usize) < header_ids.len() {
                 header_ids[blocks_downloaded as usize].clone()
             } else {
                 block.id()
@@ -2260,39 +2609,63 @@ pub async fn generate_filters(
             blocks_downloaded += 1;
         }
 
-        let total_est = blocks_downloaded + remaining;
+        // Update tip_height for v2-only mode from remaining count
+        if start_height.is_some() && tip_height == 0 {
+            tip_height = blocks_downloaded + remaining;
+        }
+
+        let processed = blocks_downloaded - start_offset;
+        let total_est = processed + remaining;
         let pct = if total_est > 0 {
-            (blocks_downloaded as f64 / total_est as f64 * 100.0) as u32
+            (processed as f64 / total_est as f64 * 100.0) as u32
         } else {
             100
         };
         log(
             &format!(
-                "  {blocks_downloaded} / ~{total_est} blocks ({pct}%) | {total_addresses} addresses",
+                "  Blocks: {processed} / ~{total_est} ({pct}%) | {total_addresses} addresses",
             ),
             "data",
         );
+
+        // save progress periodically
+        if processed % save_interval == 0 && processed > 0 {
+            let checkpoint = if let Some(sh) = start_height {
+                serialize_filter_file_v2(&entries, p as u32, tip_height, sh)
+            } else {
+                serialize_filter_file(&entries, p as u32, tip_height)
+            };
+            let arr = Uint8Array::from(&checkpoint[..]);
+            let _ = JsFuture::from(idb_save(cache_key, arr)).await;
+            log("  (progress saved to IndexedDB)", "info");
+        }
 
         if remaining == 0 {
             break;
         }
 
-        // Use the header ID for the last downloaded block as history.
-        // header_ids is 0-indexed where index 0 = height 1.
-        let last_header_id = header_ids[(blocks_downloaded - 1) as usize].clone();
-        history = vec![last_header_id];
+        // Use block ID from last processed block as history
+        let last_id = entries.last().unwrap().block_id;
+        history = vec![BlockID::new(last_id)];
     }
 
     let _ = wt.close();
 
-    // Step 4: Serialize filter file
+    // Step 4: Serialize filter file and save final result to IndexedDB
     log("Serializing filter file...", "info");
-    let file_bytes = serialize_filter_file(&entries, p as u32, tip_height);
+    let file_bytes = if let Some(sh) = start_height {
+        serialize_filter_file_v2(&entries, p as u32, tip_height, sh)
+    } else {
+        serialize_filter_file(&entries, p as u32, tip_height)
+    };
+    let arr = Uint8Array::from(&file_bytes[..]);
+    let _ = JsFuture::from(idb_save(cache_key, arr)).await;
 
     log("", "info");
     log("Filter generation complete!", "ok");
+    let total_processed = blocks_downloaded - start_offset;
     log(
-        &format!("  Blocks processed: {blocks_downloaded}"),
+        &format!("  Blocks processed: {total_processed}"),
         "data",
     );
     log(
@@ -2329,12 +2702,12 @@ pub async fn generate_filters(
 }
 
 #[wasm_bindgen]
-pub async fn scan_balance_filtered(
+pub async fn generate_txindex(
     url: String,
     genesis_id_hex: String,
-    target_address: String,
-    filter_url: String,
     log_fn: js_sys::Function,
+    cert_hash_hex: Option<String>,
+    start_height: Option<u64>,
 ) -> Result<JsValue, JsValue> {
     console_error_panic_hook::set_once();
 
@@ -2347,6 +2720,204 @@ pub async fn scan_balance_filtered(
     };
 
     let genesis_id = parse_genesis_id(&genesis_id_hex)?;
+    let cert_hash = parse_cert_hash(&cert_hash_hex)?;
+
+    // V2 checkpoint block IDs
+    const V2_CHECKPOINT_MAINNET: &str = "00000000000000002a5c67b118ab32a6e2ba88f10d1e9480dd43c14aff35056a";
+    const V2_CHECKPOINT_ZEN: &str = "00000009d768badc2187301f412fd7a7d7a0f71d872c471513d9df04f52206ce";
+
+    log("Connecting to peer...", "info");
+    let conn = connect_and_handshake(&url, genesis_id, cert_hash.as_deref()).await?;
+    log(
+        &format!(
+            "Connected! Peer version: {}, addr: {}",
+            conn.peer_info.version, conn.peer_info.addr
+        ),
+        "ok",
+    );
+
+    let cache_key = if start_height.is_some() { "txindex_entries_v2" } else { "txindex_entries" };
+    let start_offset: u64 = start_height.map(|h| h.saturating_sub(1)).unwrap_or(0);
+    let mut wt = conn.wt;
+    let mut tip_height: u64 = 0;
+    let mut entries: Vec<TxIndexEntry> = Vec::new();
+    let mut blocks_downloaded: u64 = start_offset;
+    let mut total_txns: u64 = 0;
+
+    // Build initial history
+    let mut history: Vec<BlockID> = if start_height.is_some() {
+        let checkpoint_hex = if genesis_id_hex == "25f6e3b9295a61f69fcb956aca9f0076234ecf2e02d399db5448b6e22f26e81c" {
+            V2_CHECKPOINT_MAINNET
+        } else {
+            V2_CHECKPOINT_ZEN
+        };
+        let checkpoint_bytes = hex::decode(checkpoint_hex)
+            .map_err(|e| JsValue::from_str(&format!("bad checkpoint hex: {e}")))?;
+        let mut id = [0u8; 32];
+        id.copy_from_slice(&checkpoint_bytes);
+        log(&format!("V2-only mode: starting from height {}", start_offset + 1), "info");
+        vec![BlockID::new(id)]
+    } else {
+        Vec::new()
+    };
+
+    log("Downloading blocks and building transaction index...", "info");
+
+    let blocks_per_batch: u64 = 100;
+    let save_interval: u64 = 1000;
+    let mut last_block_id: Option<BlockID> = None;
+
+    loop {
+        let rpc_result = send_v2_blocks_rpc(&wt, history.clone(), blocks_per_batch).await;
+
+        let (blocks_with_raw, remaining) = match rpc_result {
+            Ok(result) => result,
+            Err(_) => {
+                log(
+                    &format!(
+                        "  Connection lost after {} blocks, reconnecting...",
+                        blocks_downloaded - start_offset
+                    ),
+                    "info",
+                );
+                let _ = wt.close();
+                let new_conn = connect_and_handshake(&url, genesis_id, cert_hash.as_deref()).await?;
+                wt = new_conn.wt;
+                log("  Reconnected, resuming...", "ok");
+                if history.is_empty() && blocks_downloaded > 0 {
+                    break;
+                }
+                continue;
+            }
+        };
+
+        if blocks_with_raw.is_empty() {
+            break;
+        }
+
+        for (block, _raw) in &blocks_with_raw {
+            let height = block.v2_height.unwrap_or(blocks_downloaded);
+
+            // Collect V2 transaction ID prefixes
+            for txn in &block.v2_transactions {
+                let tid = txn.id();
+                let tid_bytes: &[u8] = tid.as_ref();
+                let mut prefix = [0u8; 8];
+                prefix.copy_from_slice(&tid_bytes[..8]);
+                entries.push(TxIndexEntry {
+                    prefix,
+                    height: height as u32,
+                });
+                total_txns += 1;
+            }
+
+            last_block_id = Some(block.id());
+            blocks_downloaded += 1;
+        }
+
+        // Update tip_height from remaining count
+        if start_height.is_some() && tip_height == 0 {
+            tip_height = blocks_downloaded + remaining;
+        }
+
+        let processed = blocks_downloaded - start_offset;
+        let total_est = processed + remaining;
+        let pct = if total_est > 0 {
+            (processed as f64 / total_est as f64 * 100.0) as u32
+        } else {
+            100
+        };
+        log(
+            &format!(
+                "  Blocks: {processed} / ~{total_est} ({pct}%) | {total_txns} transactions",
+            ),
+            "data",
+        );
+
+        // Save progress periodically
+        if processed % save_interval == 0 && processed > 0 {
+            let mut sorted = entries.clone();
+            sorted.sort_by(|a, b| a.prefix.cmp(&b.prefix));
+            let checkpoint = serialize_txindex(&sorted, tip_height as u32);
+            let arr = Uint8Array::from(&checkpoint[..]);
+            let _ = JsFuture::from(idb_save(cache_key, arr)).await;
+            log("  (progress saved to IndexedDB)", "info");
+        }
+
+        if remaining == 0 {
+            break;
+        }
+
+        history = vec![last_block_id.unwrap()];
+    }
+
+    let _ = wt.close();
+
+    // Sort entries by txid prefix for binary search
+    log("Sorting transaction index...", "info");
+    entries.sort_by(|a, b| a.prefix.cmp(&b.prefix));
+
+    // Serialize and save
+    log("Serializing transaction index...", "info");
+    let file_bytes = serialize_txindex(&entries, tip_height as u32);
+    let arr = Uint8Array::from(&file_bytes[..]);
+    let _ = JsFuture::from(idb_save(cache_key, arr)).await;
+
+    log("", "info");
+    log("Transaction index generation complete!", "ok");
+    let total_processed = blocks_downloaded - start_offset;
+    log(
+        &format!("  Blocks processed: {total_processed}"),
+        "data",
+    );
+    log(
+        &format!("  Transactions:     {total_txns}"),
+        "data",
+    );
+    log(
+        &format!("  Tip height:       {tip_height}"),
+        "data",
+    );
+    log(
+        &format!(
+            "  File size:        {:.1} KB ({:.1} MB)",
+            file_bytes.len() as f64 / 1024.0,
+            file_bytes.len() as f64 / 1024.0 / 1024.0
+        ),
+        "data",
+    );
+    log(
+        &format!("  Entries:          {} (12 bytes each)", entries.len()),
+        "data",
+    );
+
+    let uint8_array = Uint8Array::new_with_length(file_bytes.len() as u32);
+    uint8_array.copy_from(&file_bytes);
+    Ok(uint8_array.into())
+}
+
+#[wasm_bindgen]
+pub async fn scan_balance_filtered(
+    url: String,
+    genesis_id_hex: String,
+    target_address: String,
+    filter_url: String,
+    log_fn: js_sys::Function,
+    cert_hash_hex: Option<String>,
+    max_matches: Option<u32>,
+) -> Result<JsValue, JsValue> {
+    console_error_panic_hook::set_once();
+
+    let log = |msg: &str, cls: &str| {
+        let _ = log_fn.call2(
+            &JsValue::NULL,
+            &JsValue::from_str(msg),
+            &JsValue::from_str(cls),
+        );
+    };
+
+    let genesis_id = parse_genesis_id(&genesis_id_hex)?;
+    let cert_hash = parse_cert_hash(&cert_hash_hex)?;
     let target = parse_address(&target_address)?;
     let target_bytes: [u8; 32] = {
         let slice: &[u8] = target.as_ref();
@@ -2400,6 +2971,17 @@ pub async fn scan_balance_filtered(
         log("No filter matches in covered blocks.", "info");
     }
 
+    // If max_matches is set and exceeded, return early with match count
+    if let Some(limit) = max_matches {
+        if matches.len() > limit as usize {
+            let result = format!(
+                r#"{{"tooManyMatches": true, "matchCount": {}}}"#,
+                matches.len()
+            );
+            return Ok(JsValue::from_str(&result));
+        }
+    }
+
     // Build height → index lookup for getting previous block's ID
     let height_to_idx: std::collections::HashMap<u64, usize> = filter_file
         .entries
@@ -2410,7 +2992,7 @@ pub async fn scan_balance_filtered(
 
     // Step 3: Connect to peer and download matching blocks + tail
     log("Connecting to peer...", "info");
-    let conn = connect_and_handshake(&url, genesis_id).await?;
+    let conn = connect_and_handshake(&url, genesis_id, cert_hash.as_deref()).await?;
     log(
         &format!(
             "Connected! Peer version: {}, addr: {}",
@@ -2498,7 +3080,7 @@ pub async fn scan_balance_filtered(
                     "info",
                 );
                 let _ = wt.close();
-                let new_conn = connect_and_handshake(&url, genesis_id).await?;
+                let new_conn = connect_and_handshake(&url, genesis_id, cert_hash.as_deref()).await?;
                 wt = new_conn.wt;
                 log("  Reconnected, retrying...", "ok");
                 match send_v2_blocks_rpc(&wt, vec![prev_block_id], 1).await {
@@ -2607,7 +3189,7 @@ pub async fn scan_balance_filtered(
                     "info",
                 );
                 let _ = wt.close();
-                let new_conn = connect_and_handshake(&url, genesis_id).await?;
+                let new_conn = connect_and_handshake(&url, genesis_id, cert_hash.as_deref()).await?;
                 wt = new_conn.wt;
                 log("  Reconnected, resuming tail scan...", "ok");
                 if tail_history.is_empty() {
@@ -2822,6 +3404,7 @@ pub async fn lookup_txid(
     txid_hex: String,
     txindex_url: String,
     log_fn: js_sys::Function,
+    cert_hash_hex: Option<String>,
 ) -> Result<JsValue, JsValue> {
     console_error_panic_hook::set_once();
 
@@ -2834,6 +3417,7 @@ pub async fn lookup_txid(
     };
 
     let genesis_id = parse_genesis_id(&genesis_id_hex)?;
+    let cert_hash = parse_cert_hash(&cert_hash_hex)?;
 
     // Parse txid
     let txid_bytes = hex_to_bytes(&txid_hex)?;
@@ -2904,7 +3488,7 @@ pub async fn lookup_txid(
     };
 
     log("Connecting to peer...", "info");
-    let conn = connect_and_handshake(&url, genesis_id).await?;
+    let conn = connect_and_handshake(&url, genesis_id, cert_hash.as_deref()).await?;
     log(
         &format!("Connected to {}", conn.peer_info.addr),
         "ok",
@@ -3061,7 +3645,7 @@ mod tests {
         let mut data = Vec::new();
         // Header: magic + version + count + P + tip_height
         data.extend_from_slice(b"SCBF");
-        data.extend_from_slice(&2u32.to_le_bytes()); // version 2
+        data.extend_from_slice(&1u32.to_le_bytes()); // version 1
         data.extend_from_slice(&1u32.to_le_bytes()); // count
         data.extend_from_slice(&19u32.to_le_bytes()); // P
         data.extend_from_slice(&100u64.to_le_bytes()); // tip_height
