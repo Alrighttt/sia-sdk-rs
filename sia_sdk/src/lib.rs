@@ -8,6 +8,7 @@ pub mod erasure_coding;
 pub mod rhp;
 pub mod seed;
 pub mod signing;
+pub mod transaction_builder;
 pub mod types;
 
 pub mod macros;
