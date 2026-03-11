@@ -1,6 +1,6 @@
 use std::io;
 
-use crate::consensus::ChainState;
+use crate::consensus::{ChainState, LEAF_HASH_PREFIX};
 use crate::encoding::{self, SiaDecodable, SiaDecode, SiaEncodable, SiaEncode};
 use crate::encoding_async::{
     AsyncDecoder, AsyncEncoder, AsyncSiaDecodable, AsyncSiaDecode, AsyncSiaEncodable,
@@ -128,7 +128,7 @@ pub struct NetAddress {
 /// previous attestations with the same key. (This allows hosts to announce a new
 /// network address, for example.)
 #[derive(
-    Debug, PartialEq, Serialize, Deserialize, SiaEncode, SiaDecode, AsyncSiaEncode, AsyncSiaDecode,
+    Debug, PartialEq, Serialize, Deserialize, SiaEncode, SiaDecode, AsyncSiaEncode, AsyncSiaDecode, Clone,
 )]
 #[serde(rename_all = "camelCase")]
 pub struct Attestation {
@@ -152,7 +152,8 @@ impl Attestation {
         let mut state = Params::new().hash_length(32).to_state();
         state.update("sia/sig/attestation|".as_bytes());
         state.update(cs.replay_prefix());
-        self.encode_semantics(&mut state).unwrap();
+        self.encode_semantics(&mut state)
+            .expect("encode_semantics writes to blake2b State, which is infallible");
         state.finalize().into()
     }
 }
@@ -219,7 +220,8 @@ impl FileContract {
         let mut state = Params::new().hash_length(32).to_state();
         state.update("sia/sig/filecontract|".as_bytes());
         state.update(cs.replay_prefix());
-        self.encode_semantics(&mut state).unwrap();
+        self.encode_semantics(&mut state)
+            .expect("encode_semantics writes to blake2b State, which is infallible");
         state.finalize().into()
     }
 }
@@ -246,7 +248,7 @@ pub struct SiacoinElement {
 
 /// A SiafundElement is a record of a Siafund UTXO within the state accumulator.
 #[derive(
-    Debug, PartialEq, Serialize, Deserialize, SiaEncode, SiaDecode, AsyncSiaDecode, AsyncSiaEncode,
+    Debug, PartialEq, Serialize, Deserialize, SiaEncode, SiaDecode, AsyncSiaDecode, AsyncSiaEncode, Clone,
 )]
 #[serde(rename_all = "camelCase")]
 pub struct SiafundElement {
@@ -259,7 +261,7 @@ pub struct SiafundElement {
 /// A V2FileContractElement is a record of a FileContract within the state
 /// accumulator.
 #[derive(
-    Debug, PartialEq, Serialize, Deserialize, SiaEncode, SiaDecode, AsyncSiaDecode, AsyncSiaEncode,
+    Debug, PartialEq, Serialize, Deserialize, SiaEncode, SiaDecode, AsyncSiaDecode, AsyncSiaEncode, Clone,
 )]
 #[serde(rename_all = "camelCase")]
 pub struct FileContractElement {
@@ -270,7 +272,7 @@ pub struct FileContractElement {
 
 /// A ChainIndexElement is a record of a ChainIndex within the state accumulator.
 #[derive(
-    Debug, PartialEq, Serialize, Deserialize, SiaEncode, SiaDecode, AsyncSiaDecode, AsyncSiaEncode,
+    Debug, PartialEq, Serialize, Deserialize, SiaEncode, SiaDecode, AsyncSiaDecode, AsyncSiaEncode, Clone,
 )]
 #[serde(rename_all = "camelCase")]
 pub struct ChainIndexElement {
@@ -300,7 +302,7 @@ pub struct AttestationElement {
 /// A V2SiacoinInput represents a Siacoin UTXO that is being spent in a v2
 /// transaction.
 #[derive(
-    Debug, PartialEq, Serialize, Deserialize, SiaEncode, SiaDecode, AsyncSiaEncode, AsyncSiaDecode,
+    Debug, PartialEq, Serialize, Deserialize, SiaEncode, SiaDecode, AsyncSiaEncode, AsyncSiaDecode, Clone,
 )]
 #[serde(rename_all = "camelCase")]
 pub struct SiacoinInput {
@@ -311,7 +313,7 @@ pub struct SiacoinInput {
 /// A V2SiafundInput represents a Siafund UTXO that is being spent in a v2
 /// transaction.
 #[derive(
-    Debug, PartialEq, Serialize, Deserialize, AsyncSiaDecode, AsyncSiaEncode, SiaEncode, SiaDecode,
+    Debug, PartialEq, Serialize, Deserialize, AsyncSiaDecode, AsyncSiaEncode, SiaEncode, SiaDecode, Clone,
 )]
 #[serde(rename_all = "camelCase")]
 pub struct SiafundInput {
@@ -322,7 +324,7 @@ pub struct SiafundInput {
 
 /// A FileContractRevision updates the state of an existing file contract.
 #[derive(
-    Debug, PartialEq, Serialize, Deserialize, AsyncSiaDecode, AsyncSiaEncode, SiaEncode, SiaDecode,
+    Debug, PartialEq, Serialize, Deserialize, AsyncSiaDecode, AsyncSiaEncode, SiaEncode, SiaDecode, Clone,
 )]
 #[serde(rename_all = "camelCase")]
 pub struct FileContractRevision {
@@ -341,7 +343,7 @@ impl FileContractRevision {
 /// A FileContractRenewal renews a file contract with optional rollover
 /// of any unspent funds.
 #[derive(
-    Debug, PartialEq, Serialize, Deserialize, AsyncSiaDecode, AsyncSiaEncode, SiaEncode, SiaDecode,
+    Debug, PartialEq, Serialize, Deserialize, AsyncSiaDecode, AsyncSiaEncode, SiaEncode, SiaDecode, Clone,
 )]
 #[serde(rename_all = "camelCase")]
 pub struct FileContractRenewal {
@@ -372,7 +374,8 @@ impl FileContractRenewal {
         let mut state = Params::new().hash_length(32).to_state();
         state.update("sia/sig/filecontractrenewal|".as_bytes());
         state.update(cs.replay_prefix());
-        self.encode_semantics(&mut state).unwrap();
+        self.encode_semantics(&mut state)
+            .expect("encode_semantics writes to blake2b State, which is infallible");
         state.finalize().into()
     }
 }
@@ -380,7 +383,7 @@ impl FileContractRenewal {
 /// A StorageProof asserts the presence of a randomly-selected leaf within the
 /// Merkle tree of a V2FileContract's data.
 #[derive(
-    Debug, PartialEq, Serialize, Deserialize, AsyncSiaDecode, AsyncSiaEncode, SiaEncode, SiaDecode,
+    Debug, PartialEq, Serialize, Deserialize, AsyncSiaDecode, AsyncSiaEncode, SiaEncode, SiaDecode, Clone,
 )]
 #[serde(rename_all = "camelCase")]
 pub struct StorageProof {
@@ -436,7 +439,7 @@ impl StorageProof {
 /// types are "valid." As a special case, the expiration of an empty contract is
 /// considered valid, reflecting the fact that the host has not failed to perform
 /// any duty.
-#[derive(Debug, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, PartialEq, Serialize, Deserialize, Clone)]
 #[serde(rename_all = "camelCase")]
 #[allow(clippy::large_enum_variant)]
 pub enum ContractResolution {
@@ -446,7 +449,7 @@ pub enum ContractResolution {
 }
 
 /// A FileContractResolution closes a v2 file contract's payment channel.
-#[derive(Debug, PartialEq)]
+#[derive(Debug, PartialEq, Clone)]
 pub struct FileContractResolution {
     pub parent: FileContractElement,
     pub resolution: ContractResolution,
@@ -659,7 +662,7 @@ pub struct Transaction {
 }
 
 impl Transaction {
-    fn encode_semantics<W: io::Write>(&self, w: &mut W) -> encoding::Result<()> {
+    pub(crate) fn encode_semantics<W: io::Write>(&self, w: &mut W) -> encoding::Result<()> {
         self.siacoin_inputs.len().encode(w)?;
         for input in &self.siacoin_inputs {
             input.parent.id.encode(w)?;
@@ -692,7 +695,8 @@ impl Transaction {
     pub fn id(&self) -> TransactionID {
         let mut state = Params::new().hash_length(32).to_state();
         state.update(b"sia/id/transaction|");
-        self.encode_semantics(&mut state).unwrap();
+        self.encode_semantics(&mut state)
+            .expect("encode_semantics writes to blake2b State, which is infallible");
         state.finalize().into()
     }
 
@@ -714,7 +718,8 @@ impl Transaction {
         let mut state = Params::new().hash_length(32).to_state();
         state.update("sia/sig/input|".as_bytes());
         state.update(cs.replay_prefix());
-        self.encode_semantics(&mut state).unwrap();
+        self.encode_semantics(&mut state)
+            .expect("encode_semantics writes to blake2b State, which is infallible");
         state.finalize().into()
     }
 }
