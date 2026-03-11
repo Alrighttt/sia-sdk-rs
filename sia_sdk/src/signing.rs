@@ -59,11 +59,39 @@ impl PublicKey {
         PublicKey(buf)
     }
 
-    /// verifies a message against the signature using this public key
+    /// Verifies a message against the signature using this public key.
     pub fn verify(&self, msg: &[u8], signature: &Signature) -> bool {
         let pk = VerifyingKey::from_bytes(&self.0).unwrap();
         pk.verify(msg, &ED25519Signature::from_bytes(signature.as_ref()))
             .is_ok()
+    }
+
+    /// Compute an additive key tweak: `P' = P + H(P || topic) * G`.
+    ///
+    /// Anyone who knows the original public key and the topic string can
+    /// independently derive the same tweaked key — no private key needed.
+    /// Returns `None` if the public key bytes are not a valid curve point.
+    pub fn tweak(&self, topic: &[u8]) -> Option<PublicKey> {
+        let t = self.tweak_scalar(topic);
+        let point = CompressedEdwardsY(self.0).decompress()?;
+        let tweaked = point + curve25519_dalek::constants::ED25519_BASEPOINT_POINT * t;
+        Some(PublicKey(tweaked.compress().to_bytes()))
+    }
+
+    /// Compute the tweak scalar: `t = Blake2b-256(pk_bytes || topic)` reduced mod l.
+    ///
+    /// Domain-separated with `"sia/tweak|"` to avoid collisions with other hash uses.
+    pub fn tweak_scalar(&self, topic: &[u8]) -> Scalar {
+        let hash = blake2b_simd::Params::new()
+            .hash_length(32)
+            .to_state()
+            .update(b"sia/tweak|")
+            .update(&self.0)
+            .update(topic)
+            .finalize();
+        let mut t = [0u8; 32];
+        t.copy_from_slice(hash.as_bytes());
+        Scalar::from_bytes_mod_order(t)
     }
 }
 
