@@ -384,7 +384,7 @@ impl SiaEncodable for State {
         self.prev_timestamps
             .iter()
             .take(timestamps_count)
-            .for_each(|ts| ts.encode(w).unwrap());
+            .try_for_each(|ts| ts.encode(w))?;
         self.depth.encode(w)?;
         self.child_target.encode(w)?;
         self.siafund_pool.encode(w)?;
