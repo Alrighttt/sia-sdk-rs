@@ -696,6 +696,20 @@ impl Transaction {
         state.finalize().into()
     }
 
+    /// Compute the Merkle leaf hash of this transaction: `blake2b256(0x00 || encode(txn))`.
+    ///
+    /// This is the identifier used by the p2p layer to refer to transactions,
+    /// distinct from [`id`] (which hashes only the semantic fields). It is
+    /// Required when using `RPCSendTransactions`, which takes a list of Merkle
+    /// leaf hashes to fetch transactions from a peer's transaction pool.
+    pub fn merkle_leaf_hash(&self) -> Hash256 {
+        let mut buf = Vec::new();
+        buf.push(LEAF_HASH_PREFIX);
+        self.encode(&mut buf)
+            .expect("encoding into Vec<u8> is infallible");
+        Params::new().hash_length(32).hash(&buf).into()
+    }
+
     pub fn input_sig_hash(&self, cs: &ChainState) -> Hash256 {
         let mut state = Params::new().hash_length(32).to_state();
         state.update("sia/sig/input|".as_bytes());
