@@ -1731,6 +1731,89 @@ fn serialize_filter_file_v2(entries: &[FilterEntry], p: u32, tip_height: u64, st
     buf
 }
 
+/// Append new filter entries to an already-serialized SCBF byte blob in-place,
+/// updating the count and tip_height header fields without re-serializing.
+/// Supports both SCBF v1 (46-byte entries with height) and v2 (36-byte compact).
+fn append_entries_to_filter_bytes(bytes: &mut Vec<u8>, new_entries: &[FilterEntry], tip_height: u64) {
+    if new_entries.is_empty() || bytes.len() < 24 {
+        return;
+    }
+    let version = u32::from_le_bytes(bytes[4..8].try_into().unwrap());
+    // Update count
+    let old_count = u32::from_le_bytes(bytes[8..12].try_into().unwrap());
+    let new_count = old_count + new_entries.len() as u32;
+    bytes[8..12].copy_from_slice(&new_count.to_le_bytes());
+    // Update tip_height
+    bytes[16..24].copy_from_slice(&tip_height.to_le_bytes());
+    // Append entries
+    if version == 2 {
+        for e in new_entries {
+            bytes.extend_from_slice(&e.block_id);
+            bytes.extend_from_slice(&e.address_count.to_le_bytes());
+            bytes.extend_from_slice(&(e.filter_data.len() as u16).to_le_bytes());
+            bytes.extend_from_slice(&e.filter_data);
+        }
+    } else {
+        for e in new_entries {
+            bytes.extend_from_slice(&e.height.to_le_bytes());
+            bytes.extend_from_slice(&e.block_id);
+            bytes.extend_from_slice(&e.address_count.to_le_bytes());
+            bytes.extend_from_slice(&(e.filter_data.len() as u32).to_le_bytes());
+            bytes.extend_from_slice(&e.filter_data);
+        }
+    }
+}
+
+/// Scan a serialized SCBF blob and return (last_height, tip_height, last_block_id, total_addresses)
+/// without allocating FilterEntry structs. Used to resume from a cached file.
+fn filter_file_resume_info(data: &[u8]) -> Option<(u64, u64, [u8; 32], u64)> {
+    if data.len() < 24 || &data[0..4] != b"SCBF" {
+        return None;
+    }
+    let version = u32::from_le_bytes(data[4..8].try_into().ok()?);
+    let count = u32::from_le_bytes(data[8..12].try_into().ok()?) as usize;
+    let tip_height = u64::from_le_bytes(data[16..24].try_into().ok()?);
+    if count == 0 {
+        return None;
+    }
+    let mut last_block_id = [0u8; 32];
+    let mut last_height = 0u64;
+    let mut total_addresses = 0u64;
+    if version == 2 {
+        if data.len() < 32 {
+            return None;
+        }
+        let start_height = u64::from_le_bytes(data[24..32].try_into().ok()?);
+        let mut pos = 32usize;
+        for i in 0..count {
+            if pos + 36 > data.len() {
+                return None;
+            }
+            let addr = u16::from_le_bytes(data[pos + 32..pos + 34].try_into().ok()?);
+            let flen = u16::from_le_bytes(data[pos + 34..pos + 36].try_into().ok()?) as usize;
+            last_block_id.copy_from_slice(&data[pos..pos + 32]);
+            last_height = start_height + i as u64;
+            total_addresses += addr as u64;
+            pos += 36 + flen;
+        }
+    } else {
+        let mut pos = 24usize;
+        for _ in 0..count {
+            if pos + 46 > data.len() {
+                return None;
+            }
+            let height = u64::from_le_bytes(data[pos..pos + 8].try_into().ok()?);
+            let addr = u16::from_le_bytes(data[pos + 40..pos + 42].try_into().ok()?);
+            let flen = u32::from_le_bytes(data[pos + 42..pos + 46].try_into().ok()?) as usize;
+            last_block_id.copy_from_slice(&data[pos + 8..pos + 40]);
+            last_height = height;
+            total_addresses += addr as u64;
+            pos += 46 + flen;
+        }
+    }
+    Some((last_height, tip_height, last_block_id, total_addresses))
+}
+
 /// TxIndex entry: 8-byte txid prefix + 4-byte block height.
 #[derive(Clone)]
 struct TxIndexEntry {
@@ -3450,49 +3533,60 @@ pub async fn generate_filters(
         synced_ids
     };
 
-    // Step 3: Load cached filters from IndexedDB and resume
-    let mut entries: Vec<FilterEntry> = Vec::new();
+    // Step 3: Load cached filters from IndexedDB and resume.
+    // We keep a flat `idb_bytes: Vec<u8>` (the serialized SCBF blob) instead of
+    // deserializing all entries into Vec<FilterEntry>.  This bounds memory to one
+    // compact binary buffer regardless of how many blocks have been indexed.
+    let mut current_entries: Vec<FilterEntry> = Vec::new();
     let mut blocks_downloaded: u64 = start_offset;
     let mut total_addresses: u64 = 0;
+    let mut idb_bytes: Vec<u8> = Vec::new();
+    // After each periodic save current_entries[0] is a kept-over entry from the
+    // previous batch; entries_offset tracks how many leading entries to skip when
+    // computing "new entries since last save".
+    let mut entries_offset: usize = 0;
+    let mut resume_block_id: Option<[u8; 32]> = None;
 
     if let Ok(result) = JsFuture::from(idb_load(&cache_key)).await {
         if !result.is_null() && !result.is_undefined() {
             let arr = Uint8Array::from(result);
-            let cached_bytes = arr.to_vec();
-            if let Ok(cached) = parse_filter_file(&cached_bytes) {
-                let cached_count = cached.entries.len() as u64;
-                let last_height = cached.entries.last().map(|e| e.height).unwrap_or(0);
-                log(
-                    &format!("Loaded {cached_count} cached filter entries from IndexedDB (up to height {})",
-                        last_height),
-                    "ok",
-                );
-
-                // Corruption detection:
-                // 1. Entry count far exceeds height range (duplicates)
-                // 2. Max height unreasonably far from start (bogus heights from count-based era)
-                let expected_count = last_height.saturating_sub(start_offset);
-                let height_too_high = start_height.is_some() && last_height > start_offset + 200_000;
-                if cached_count > expected_count + 1000 || height_too_high {
-                    log(
-                        &format!("Filter cache corrupted: {} entries, max height {} (start {}) — discarding",
-                            cached_count, last_height, start_offset),
-                        "err",
-                    );
-                    // Clear corrupted entries from IndexedDB — save empty data
-                    let _ = JsFuture::from(idb_save(&cache_key, Uint8Array::new_with_length(0))).await;
-                } else {
-                    for e in &cached.entries {
-                        total_addresses += e.address_count as u64;
+            let raw = arr.to_vec();
+            if raw.len() >= 24 && &raw[0..4] == b"SCBF" {
+                let cached_count = u32::from_le_bytes(raw[8..12].try_into().unwrap()) as u64;
+                if let Some((last_height, cached_tip, last_bid, addr_total)) =
+                    filter_file_resume_info(&raw)
+                {
+                    // Corruption detection
+                    let expected_count = last_height.saturating_sub(start_offset);
+                    let height_too_high =
+                        start_height.is_some() && last_height > start_offset + 200_000;
+                    if cached_count > expected_count + 1000 || height_too_high {
+                        log(
+                            &format!(
+                                "Filter cache corrupted: {} entries, max height {} (start {}) — discarding",
+                                cached_count, last_height, start_offset
+                            ),
+                            "err",
+                        );
+                        let _ = JsFuture::from(idb_save(
+                            &cache_key,
+                            Uint8Array::new_with_length(0),
+                        ))
+                        .await;
+                    } else {
+                        log(
+                            &format!(
+                                "Loaded {cached_count} cached filter entries from IndexedDB (up to height {})",
+                                last_height
+                            ),
+                            "ok",
+                        );
+                        total_addresses = addr_total;
+                        blocks_downloaded = last_height;
+                        tip_height = if cached_tip > 0 { cached_tip } else if last_height > 0 { last_height } else { tip_height };
+                        idb_bytes = raw;
+                        resume_block_id = Some(last_bid);
                     }
-                    // Use last entry's actual height (not count-based offset)
-                    blocks_downloaded = last_height;
-                    if cached.tip_height > 0 {
-                        tip_height = cached.tip_height;
-                    } else if last_height > 0 {
-                        tip_height = last_height;
-                    }
-                    entries = cached.entries;
                 }
             }
         }
@@ -3501,10 +3595,8 @@ pub async fn generate_filters(
     log("Downloading blocks and building filters...", "info");
 
     // Build initial history for block download
-    let mut history: Vec<BlockID> = if !entries.is_empty() {
-        // Resume from last cached filter entry's block ID
-        let last_id = entries.last().unwrap().block_id;
-        vec![BlockID::new(last_id)]
+    let mut history: Vec<BlockID> = if let Some(bid) = resume_block_id {
+        vec![BlockID::new(bid)]
     } else if start_height.is_some() {
         // V2-only: use hardcoded checkpoint to skip to V2 require height
         let checkpoint_hex = if genesis_id_hex == "25f6e3b9295a61f69fcb956aca9f0076234ecf2e02d399db5448b6e22f26e81c" {
@@ -3581,7 +3673,7 @@ pub async fn generate_filters(
 
             let filter_data = build_gcs_filter(&addresses, &block_id_bytes, p);
 
-            entries.push(FilterEntry {
+            current_entries.push(FilterEntry {
                 height,
                 block_id: block_id_bytes,
                 address_count: addresses.len() as u16,
@@ -3618,16 +3710,29 @@ pub async fn generate_filters(
             "data",
         );
 
-        // save progress periodically
+        // Periodically flush current_entries to idb_bytes and free them.
+        // This keeps memory proportional to save_interval rather than total blocks.
         if processed % save_interval == 0 && processed > 0 {
-            let checkpoint = if let Some(sh) = start_height {
-                serialize_filter_file_v2(&entries, p as u32, tip_height, sh)
+            let new_entries = &current_entries[entries_offset..];
+            if idb_bytes.is_empty() {
+                // First save — initialize the blob from all current entries
+                idb_bytes = if let Some(sh) = start_height {
+                    serialize_filter_file_v2(new_entries, p as u32, tip_height, sh)
+                } else {
+                    serialize_filter_file(new_entries, p as u32, tip_height)
+                };
             } else {
-                serialize_filter_file(&entries, p as u32, tip_height)
-            };
-            let arr = Uint8Array::from(&checkpoint[..]);
+                // Subsequent save — binary-append only the new entries
+                append_entries_to_filter_bytes(&mut idb_bytes, new_entries, tip_height);
+            }
+            let arr = Uint8Array::from(&idb_bytes[..]);
             let _ = JsFuture::from(idb_save(&cache_key, arr)).await;
             log("  (progress saved to IndexedDB)", "info");
+            // Free old entries; keep only the last one as the anchor for next batch
+            let last = current_entries.pop().unwrap();
+            current_entries.clear();
+            current_entries.push(last);
+            entries_offset = 1; // current_entries[0] is the kept-over anchor
         }
 
         if remaining == 0 {
@@ -3635,21 +3740,35 @@ pub async fn generate_filters(
         }
 
         // Use block ID from last processed block as history
-        let last_id = entries.last().unwrap().block_id;
+        let last_id = current_entries.last().unwrap().block_id;
         history = vec![BlockID::new(last_id)];
     }
 
     let _ = wt.close();
 
-    // Step 4: Serialize filter file and save final result to IndexedDB
+    // Step 4: Append any remaining entries and save final result to IndexedDB.
+    // At this point current_entries holds at most save_interval+1 entries.
     log("Serializing filter file...", "info");
-    let file_bytes = if let Some(sh) = start_height {
-        serialize_filter_file_v2(&entries, p as u32, tip_height, sh)
+    let new_entries = &current_entries[entries_offset..];
+    if idb_bytes.is_empty() {
+        // Fewer than save_interval total blocks — never saved yet
+        idb_bytes = if let Some(sh) = start_height {
+            serialize_filter_file_v2(new_entries, p as u32, tip_height, sh)
+        } else {
+            serialize_filter_file(new_entries, p as u32, tip_height)
+        };
     } else {
-        serialize_filter_file(&entries, p as u32, tip_height)
-    };
-    let arr = Uint8Array::from(&file_bytes[..]);
+        append_entries_to_filter_bytes(&mut idb_bytes, new_entries, tip_height);
+    }
+    let arr = Uint8Array::from(&idb_bytes[..]);
     let _ = JsFuture::from(idb_save(&cache_key, arr)).await;
+
+    // Read total entry count from the header for stats
+    let total_entries = if idb_bytes.len() >= 12 {
+        u32::from_le_bytes(idb_bytes[8..12].try_into().unwrap()) as u64
+    } else {
+        0
+    };
 
     log("", "info");
     log("Filter generation complete!", "ok");
@@ -3669,25 +3788,25 @@ pub async fn generate_filters(
     log(
         &format!(
             "  File size:        {:.1} KB",
-            file_bytes.len() as f64 / 1024.0
+            idb_bytes.len() as f64 / 1024.0
         ),
         "data",
     );
     log(
         &format!(
             "  Avg filter size:  {:.0} bytes",
-            if entries.is_empty() {
+            if total_entries == 0 {
                 0.0
             } else {
-                file_bytes.len() as f64 / entries.len() as f64
+                idb_bytes.len() as f64 / total_entries as f64
             }
         ),
         "data",
     );
 
     // Return as Uint8Array
-    let uint8_array = Uint8Array::new_with_length(file_bytes.len() as u32);
-    uint8_array.copy_from(&file_bytes);
+    let uint8_array = Uint8Array::new_with_length(idb_bytes.len() as u32);
+    uint8_array.copy_from(&idb_bytes);
     Ok(uint8_array.into())
 }
 
