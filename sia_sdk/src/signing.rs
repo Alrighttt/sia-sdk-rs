@@ -129,7 +129,11 @@ impl PrivateKey {
     }
 
     pub fn sign(&self, h: &[u8]) -> Signature {
-        let sk = SigningKey::from_bytes(&self.0[..32].try_into().unwrap());
+        let sk = SigningKey::from_bytes(
+            &self.0[..32]
+                .try_into()
+                .expect("PrivateKey is [u8; 64], first 32 bytes always fit [u8; 32]"),
+        );
         Signature::new(sk.sign(h).to_bytes())
     }
 
@@ -142,12 +146,16 @@ impl PrivateKey {
     /// Internally performs the SHA-512 expansion and ed25519 clamping that
     /// dalek normally hides, then adds the tweak scalar before signing.
     pub fn sign_tweaked(&self, topic: &[u8], msg: &[u8]) -> Signature {
-        let seed: [u8; 32] = self.0[..32].try_into().unwrap();
+        let seed: [u8; 32] = self.0[..32]
+            .try_into()
+            .expect("PrivateKey is [u8; 64], first 32 bytes always fit [u8; 32]");
         let pk = self.public_key();
 
         // SHA-512 expand the seed (replicating dalek's internal expansion)
         let h = Sha512::digest(&seed);
-        let mut scalar_bytes: [u8; 32] = h[..32].try_into().unwrap();
+        let mut scalar_bytes: [u8; 32] = h[..32]
+            .try_into()
+            .expect("SHA-512 output is 64 bytes, first 32 always fit [u8; 32]");
         // Ed25519 clamping
         scalar_bytes[0] &= 248;
         scalar_bytes[31] &= 127;
@@ -160,7 +168,9 @@ impl PrivateKey {
 
         // Tweaked scalar and public key
         let a_prime = a + t;
-        let a_prime_point = CompressedEdwardsY(pk.0).decompress().unwrap()
+        let a_prime_point = CompressedEdwardsY(pk.0)
+            .decompress()
+            .expect("public key from valid PrivateKey is always a valid curve point")
             + curve25519_dalek::constants::ED25519_BASEPOINT_POINT * t;
         let a_prime_bytes = a_prime_point.compress().to_bytes();
 
@@ -169,7 +179,11 @@ impl PrivateKey {
             .chain_update(nonce_prefix)
             .chain_update(msg)
             .finalize();
-        let r = Scalar::from_bytes_mod_order_wide(r_hash[..64].try_into().unwrap());
+        let r = Scalar::from_bytes_mod_order_wide(
+            r_hash[..64]
+                .try_into()
+                .expect("SHA-512 output is exactly 64 bytes"),
+        );
 
         // R = r * G
         let r_point = (curve25519_dalek::constants::ED25519_BASEPOINT_POINT * r).compress();
@@ -180,7 +194,11 @@ impl PrivateKey {
             .chain_update(&a_prime_bytes)
             .chain_update(msg)
             .finalize();
-        let k = Scalar::from_bytes_mod_order_wide(k_hash[..64].try_into().unwrap());
+        let k = Scalar::from_bytes_mod_order_wide(
+            k_hash[..64]
+                .try_into()
+                .expect("SHA-512 output is exactly 64 bytes"),
+        );
 
         // S = (r + k * a') mod l
         let s = r + k * a_prime;
