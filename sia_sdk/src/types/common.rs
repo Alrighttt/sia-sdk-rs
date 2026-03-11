@@ -1013,7 +1013,7 @@ mod tests {
         Ok(())
     }
 
-    const UNASSIGNED_LEAF_INDEX: u64 = u64::MAX;
+    const UNASSIGNED_LEAF_INDEX: u64 = 10_101_010_101_010_101_010;
 
     /// Set merkle proof lengths based on numLeaves (mirrors syncer_wasm set_proof_lengths)
     fn set_proof_lengths(txns: &mut [v2::Transaction], num_leaves: u64) {
