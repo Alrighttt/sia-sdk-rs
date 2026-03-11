@@ -64,7 +64,9 @@ impl PublicKey {
 
     /// Verifies a message against the signature using this public key.
     pub fn verify(&self, msg: &[u8], signature: &Signature) -> bool {
-        let pk = VerifyingKey::from_bytes(&self.0).unwrap();
+        let Ok(pk) = VerifyingKey::from_bytes(&self.0) else {
+            return false;
+        };
         pk.verify(msg, &ED25519Signature::from_bytes(signature.as_ref()))
             .is_ok()
     }
