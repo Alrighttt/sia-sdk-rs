@@ -545,11 +545,11 @@ impl ChainState {
 
     pub fn replay_prefix(&self) -> &[u8] {
         if self.state.index.height >= self.network.hardfork_v2.allow_height {
-            return &[2];
+            return REPLAY_PREFIX_V2;
         } else if self.state.index.height >= self.network.hardfork_foundation.height {
-            return &[1];
+            return REPLAY_PREFIX_FOUNDATION;
         } else if self.state.index.height >= self.network.hardfork_asic.height {
-            return &[0];
+            return REPLAY_PREFIX_ASIC;
         }
         &[]
     }
