@@ -1,10 +1,40 @@
 use crate::address;
+use crate::merkle::sum_node;
 use chrono::{DateTime, Duration, Utc};
 use serde::ser::SerializeStruct;
 use serde::{Deserialize, Serialize, Serializer};
+use std::io::Write;
+use std::sync::LazyLock;
+use thiserror::Error;
 
 use crate::encoding::{self, SiaDecodable, SiaEncodable};
 use crate::types::{Address, BlockID, ChainIndex, Currency, Hash256, SiacoinOutput, Work};
+
+/// Shared blake2b-256 params for all accumulator hashing. Avoids re-allocating
+/// a `Params` struct on every call to `proof_root`, `add_leaves`, etc.
+static BLAKE2B_256_PARAMS: LazyLock<blake2b_simd::Params> = LazyLock::new(|| {
+    let mut p = blake2b_simd::Params::new();
+    p.hash_length(32);
+    p
+});
+
+const LEAF_HASH_PREFIX: u8 = 0x00;
+
+/// Sentinel value for elements not yet added to the accumulator.
+pub const UNASSIGNED_LEAF_INDEX: u64 = 10_101_010_101_010_101_010;
+
+/// Errors that can occur during accumulator operations.
+#[derive(Debug, Clone, PartialEq, Eq, Error)]
+pub enum AccumulatorError {
+    /// Multiple leaves share the same accumulator index, indicating corrupted
+    /// block data or a bug in element extraction.
+    #[error("multiple leaves with same accumulator index {0}")]
+    DuplicateLeafIndex(u64),
+    /// Tree range underflow: j < i in recompute, indicating corrupted leaf
+    /// indices or proof lengths.
+    #[error("tree range underflow: i={0}, j={1}")]
+    TreeRangeUnderflow(u64, u64),
+}
 
 /// HardforkDevAddr contains the parameters for a hardfork that changed
 /// the developer address.
@@ -32,8 +62,13 @@ pub struct HardforkStorageProof {
     pub height: u64,
 }
 
-/// HardforkBlockSubsidy contains the parameters for a hardfork that changed
-/// the difficulty adjustment algorithm.
+/// HardforkOak contains the parameters for the Oak hardfork, which replaced
+/// the legacy per-1000-block difficulty adjustment with the continuous "Oak"
+/// algorithm. Oak tracks a decayed cumulative time (`OakTime`) and adjusts
+/// difficulty each block based on how far actual elapsed time deviates from
+/// the ideal schedule anchored at `genesis_timestamp`. `fix_height` marks a
+/// subsequent correction that fixed a timestamp-accumulation bug in the
+/// original Oak implementation.
 #[derive(PartialEq, Debug, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct HardforkOak {
@@ -376,11 +411,7 @@ pub struct State {
 impl SiaEncodable for State {
     fn encode<W: std::io::Write>(&self, w: &mut W) -> crate::encoding::Result<()> {
         self.index.encode(w)?;
-        let timestamps_count = if self.index.child_height() < 11 {
-            self.index.child_height() as usize
-        } else {
-            11
-        };
+        let timestamps_count = (self.index.child_height() as usize).min(11);
         self.prev_timestamps
             .iter()
             .take(timestamps_count)
@@ -404,11 +435,7 @@ impl SiaEncodable for State {
 impl SiaDecodable for State {
     fn decode<R: std::io::Read>(r: &mut R) -> crate::encoding::Result<Self> {
         let index = ChainIndex::decode(r)?;
-        let timestamps_count = if index.child_height() < 11 {
-            index.child_height() as usize
-        } else {
-            11
-        };
+        let timestamps_count = (index.child_height() as usize).min(11);
         let mut prev_timestamps = [DateTime::UNIX_EPOCH; 11];
         prev_timestamps[..timestamps_count]
             .iter_mut()
@@ -477,7 +504,7 @@ impl ChainState {
         1000
     }
 
-    // blocks_per_month estimates the number of blocks expected in a calendar month
+    /// Estimates the number of blocks expected in a calendar month.
     pub fn blocks_per_month(&self) -> u64 {
         (Duration::days(365).num_milliseconds()
             / 12
@@ -497,12 +524,14 @@ impl ChainState {
             return None;
         }
 
-        let subsidy_per_block = Currency::siacoins(30000);
+        // 30,000 SC/month; the first payment at the hardfork block is 12x as a
+        // one-time retroactive payment covering the 12 months prior to the hardfork.
+        let monthly_subsidy = Currency::siacoins(30000);
         Some(SiacoinOutput {
             value: if self.child_height() == self.network.hardfork_foundation.height {
-                subsidy_per_block * Currency::new(12)
+                monthly_subsidy * Currency::new(12)
             } else {
-                subsidy_per_block
+                monthly_subsidy
             },
             address: self.network.hardfork_foundation.primary_address.clone(),
         })
@@ -531,13 +560,438 @@ impl ChainState {
     }
 }
 
+// ===========================================================================
+// Element Accumulator — state proof tracking
+// Ported from go.sia.tech/core/consensus/merkle.go
+// ===========================================================================
+
+/// SiaHasher wraps blake2b-256 for computing element hashes using the Sia
+/// "hashAll" convention: a distinguisher prefix "sia/<name>|" followed by
+/// the concatenated V2 encodings of the arguments.
+pub struct SiaHasher {
+    state: blake2b_simd::State,
+}
+
+impl Default for SiaHasher {
+    fn default() -> Self {
+        SiaHasher {
+            state: BLAKE2B_256_PARAMS.to_state(),
+        }
+    }
+}
+
+impl SiaHasher {
+    pub fn write_distinguisher(&mut self, s: &str) {
+        self.state.update(b"sia/");
+        self.state.update(s.as_bytes());
+        self.state.update(b"|");
+    }
+
+    /// Encode a value into the hasher. This is infallible because
+    /// `SiaHasher`'s `Write` impl always succeeds.
+    pub fn encode(&mut self, val: &impl encoding::SiaEncodable) {
+        val.encode(self).expect("SiaHasher::write is infallible");
+    }
+
+    pub fn finalize(self) -> Hash256 {
+        self.state.finalize().into()
+    }
+}
+
+/// `Write` is infallible for `SiaHasher` — it always succeeds and returns
+/// `Ok(buf.len())`. Use [`SiaHasher::encode`] instead of calling
+/// `SiaEncodable::encode` directly to avoid manual unwraps.
+impl Write for SiaHasher {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        self.state.update(buf);
+        Ok(buf.len())
+    }
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+/// Compute the element hash for a siacoin element.
+/// hashAll("leaf/siacoin", id, V2SiacoinOutput{value, address}, maturityHeight)
+pub fn siacoin_element_hash(
+    id: &crate::types::SiacoinOutputID,
+    output: &SiacoinOutput,
+    maturity_height: u64,
+) -> Hash256 {
+    let mut h = SiaHasher::default();
+    h.write_distinguisher("leaf/siacoin");
+    h.encode(id);
+    h.encode(output);
+    h.encode(&maturity_height);
+    h.finalize()
+}
+
+/// Compute the element hash for a siafund element.
+/// hashAll("leaf/siafund", id, V2SiafundOutput{value, address}, V2Currency(claimStart))
+pub fn siafund_element_hash(
+    id: &crate::types::SiafundOutputID,
+    output: &crate::types::SiafundOutput,
+    claim_start: &Currency,
+) -> Hash256 {
+    let mut h = SiaHasher::default();
+    h.write_distinguisher("leaf/siafund");
+    h.encode(id);
+    h.encode(output);
+    h.encode(claim_start);
+    h.finalize()
+}
+
+/// Compute the element hash for a v2 file contract element.
+/// hashAll("leaf/v2filecontract", id, v2FileContract)
+pub fn v2_file_contract_element_hash(
+    id: &crate::types::FileContractID,
+    contract: &crate::types::v2::FileContract,
+) -> Hash256 {
+    let mut h = SiaHasher::default();
+    h.write_distinguisher("leaf/v2filecontract");
+    h.encode(id);
+    h.encode(contract);
+    h.finalize()
+}
+
+/// Compute the element hash for a chain index element.
+/// hashAll("leaf/chainindex", id, chainIndex)
+pub fn chain_index_element_hash(id: &BlockID, chain_index: &ChainIndex) -> Hash256 {
+    let mut h = SiaHasher::default();
+    h.write_distinguisher("leaf/chainindex");
+    h.encode(id);
+    h.encode(chain_index);
+    h.finalize()
+}
+
+/// Compute the element hash for an attestation element.
+/// hashAll("leaf/attestation", id, attestation)
+pub fn attestation_element_hash(
+    id: &crate::types::AttestationID,
+    attestation: &crate::types::v2::Attestation,
+) -> Hash256 {
+    let mut h = SiaHasher::default();
+    h.write_distinguisher("leaf/attestation");
+    h.encode(id);
+    h.encode(attestation);
+    h.finalize()
+}
+
+/// An ElementLeaf represents a leaf in the ElementAccumulator Merkle tree.
+#[derive(Clone)]
+pub struct ElementLeaf {
+    pub state_element: crate::types::StateElement,
+    pub element_hash: Hash256,
+    pub spent: bool,
+}
+
+impl ElementLeaf {
+    /// Compute the leaf's hash for direct use in the Merkle tree.
+    /// 42-byte buffer: [0x00 | element_hash(32) | leaf_index_LE(8) | spent_flag(1)]
+    pub fn hash(&self) -> Hash256 {
+        let mut buf = [0u8; 42];
+        buf[0] = LEAF_HASH_PREFIX;
+        buf[1..33].copy_from_slice(self.element_hash.as_ref());
+        buf[33..41].copy_from_slice(&self.state_element.leaf_index.to_le_bytes());
+        if self.spent {
+            buf[41] = 1;
+        }
+        // HashBytes: blake2b-256 of raw bytes (no prefix)
+        let hash = BLAKE2B_256_PARAMS.hash(&buf);
+        hash.into()
+    }
+
+    /// Compute the root obtained from this leaf and its proof.
+    pub fn proof_root(&self) -> Hash256 {
+        proof_root(
+            self.hash(),
+            self.state_element.leaf_index,
+            &self.state_element.merkle_proof,
+        )
+    }
+}
+
+/// Compute the Merkle root from a leaf hash, its index, and its proof.
+pub fn proof_root(mut root: Hash256, leaf_index: u64, proof: &[Hash256]) -> Hash256 {
+    for (i, h) in proof.iter().enumerate() {
+        if leaf_index & (1 << i) == 0 {
+            root = sum_node(&BLAKE2B_256_PARAMS, &root, h);
+        } else {
+            root = sum_node(&BLAKE2B_256_PARAMS, h, &root);
+        }
+    }
+    root
+}
+
+/// Returns the height at which the proof paths of x and y merge.
+/// Equivalent to Go's bits.Len64(x ^ y).
+fn merge_height(x: u64, y: u64) -> usize {
+    64 - (x ^ y).leading_zeros() as usize
+}
+
+/// Clears the n least significant bits of x.
+fn clear_bits(x: u64, n: usize) -> u64 {
+    if n >= 64 { 0 } else { x & !((1u64 << n) - 1) }
+}
+
+/// The result of applying a block to the accumulator. Contains the
+/// information needed to update proofs of elements not directly involved
+/// in the block.
+pub struct ElementApplyUpdate {
+    pub updated: [Vec<ElementLeaf>; 64],
+    pub tree_growth: [Vec<Hash256>; 64],
+    pub old_num_leaves: u64,
+    pub num_leaves: u64,
+}
+
+impl ElementApplyUpdate {
+    /// Update the Merkle proof of an element to incorporate the changes made
+    /// by this block. The element's proof must be up-to-date (valid for the
+    /// accumulator before this block was applied).
+    ///
+    /// # Panics
+    ///
+    /// Panics if the element has `leaf_index == UNASSIGNED_LEAF_INDEX`,
+    /// indicating it was never added to the accumulator. This is a caller
+    /// bug — only elements returned by `apply_block` (with assigned indices)
+    /// should be passed here.
+    pub fn update_element_proof(&self, e: &mut crate::types::StateElement) {
+        if e.leaf_index == UNASSIGNED_LEAF_INDEX {
+            panic!("cannot update an ephemeral element");
+        } else if e.leaf_index >= self.old_num_leaves {
+            return; // newly-added element
+        }
+        update_proof(e, &self.updated);
+        let mh = merge_height(self.num_leaves, e.leaf_index);
+        if mh != e.merkle_proof.len() {
+            e.merkle_proof
+                .extend_from_slice(&self.tree_growth[e.merkle_proof.len()]);
+        }
+    }
+}
+
+/// Update a single element's proof using the closest updated element in the
+/// same tree.
+fn update_proof(e: &mut crate::types::StateElement, updated: &[Vec<ElementLeaf>; 64]) {
+    let updated_in_tree = &updated[e.merkle_proof.len()];
+    if updated_in_tree.is_empty() {
+        return;
+    }
+    let mut best = &updated_in_tree[0];
+    for ul in &updated_in_tree[1..] {
+        if merge_height(e.leaf_index, ul.state_element.leaf_index)
+            < merge_height(e.leaf_index, best.state_element.leaf_index)
+        {
+            best = ul;
+        }
+    }
+
+    if best.state_element.leaf_index == e.leaf_index {
+        // copy over the updated proof in its entirety
+        e.merkle_proof
+            .copy_from_slice(&best.state_element.merkle_proof);
+    } else {
+        // copy over the updated proof above the mergeHeight
+        let mh = merge_height(e.leaf_index, best.state_element.leaf_index);
+        e.merkle_proof[mh..].copy_from_slice(&best.state_element.merkle_proof[mh..]);
+        // at the merge point itself, compute the updated sibling hash
+        e.merkle_proof[mh - 1] = proof_root(
+            best.hash(),
+            best.state_element.leaf_index,
+            &best.state_element.merkle_proof[..mh - 1],
+        );
+    }
+}
+
+/// Updates the Merkle proofs of each leaf to reflect the changes in all
+/// other leaves, and returns the leaves grouped by tree height.
+/// Port of Go updateLeaves (merkle.go:312-380).
+fn update_leaves(leaves: &mut [ElementLeaf]) -> Result<[Vec<ElementLeaf>; 64], AccumulatorError> {
+    fn recompute(i: u64, j: u64, leaves: &mut [ElementLeaf]) -> Result<Hash256, AccumulatorError> {
+        if j <= i {
+            return Err(AccumulatorError::TreeRangeUnderflow(i, j));
+        }
+        let height = (j - i).trailing_zeros() as usize;
+        if height == 0 {
+            if leaves.len() > 1 {
+                return Err(AccumulatorError::DuplicateLeafIndex(
+                    leaves[0].state_element.leaf_index,
+                ));
+            }
+            return Ok(leaves[0].hash());
+        }
+        let mid = (i + j) / 2;
+        let split = leaves
+            .iter()
+            .position(|l| l.state_element.leaf_index >= mid)
+            .unwrap_or(leaves.len());
+        let (left, right) = leaves.split_at_mut(split);
+
+        let left_root;
+        let right_root;
+
+        if left.is_empty() {
+            left_root = right[0].state_element.merkle_proof[height - 1];
+        } else {
+            left_root = recompute(i, mid, left)?;
+            for e in right.iter_mut() {
+                e.state_element.merkle_proof[height - 1] = left_root;
+            }
+        }
+
+        if right.is_empty() {
+            right_root = left[0].state_element.merkle_proof[height - 1];
+        } else {
+            right_root = recompute(mid, j, right)?;
+            for e in left.iter_mut() {
+                e.state_element.merkle_proof[height - 1] = right_root;
+            }
+        }
+
+        Ok(sum_node(&BLAKE2B_256_PARAMS, &left_root, &right_root))
+    }
+
+    // Sort by (proof length, leaf index)
+    leaves.sort_by(|a, b| {
+        a.state_element
+            .merkle_proof
+            .len()
+            .cmp(&b.state_element.merkle_proof.len())
+            .then(a.state_element.leaf_index.cmp(&b.state_element.leaf_index))
+    });
+
+    // Group leaves by tree (proof length = tree height)
+    let mut trees: [Vec<ElementLeaf>; 64] = std::array::from_fn(|_| Vec::new());
+    let mut start = 0;
+    while start < leaves.len() {
+        let height = leaves[start].state_element.merkle_proof.len();
+        let mut end = start;
+        while end < leaves.len() && leaves[end].state_element.merkle_proof.len() == height {
+            end += 1;
+        }
+        // Recompute proofs within this tree
+        let tree_start = clear_bits(leaves[start].state_element.leaf_index, height);
+        let tree_end = tree_start + (1u64 << height);
+        recompute(tree_start, tree_end, &mut leaves[start..end])?;
+        // Clone leaves into the trees array
+        trees[height] = leaves[start..end].to_vec();
+        start = end;
+    }
+
+    Ok(trees)
+}
+
+impl ElementAccumulator {
+    /// Add leaves to the accumulator, filling in their Merkle proofs and
+    /// returning the new node hashes that extend each existing tree.
+    /// Port of Go addLeaves (merkle.go:253-308).
+    ///
+    /// # Safety invariant
+    /// The inner loop iterates over tree heights 0..64. The i64 arithmetic
+    /// `1i64 << height` would overflow at height >= 63. This is safe because
+    /// the loop only continues while `has_tree_at_height` returns true and
+    /// the accumulator has exactly 64 trees — so height is bounded to 0..63.
+    /// The debug_assert below documents this invariant.
+    pub fn add_leaves(&mut self, leaves: &mut [ElementLeaf]) -> [Vec<Hash256>; 64] {
+        let initial_leaves = self.num_leaves;
+        let mut tree_growth: [Vec<Hash256>; 64] = std::array::from_fn(|_| Vec::new());
+
+        for i in 0..leaves.len() {
+            leaves[i].state_element.leaf_index = self.num_leaves;
+
+            let mut h = leaves[i].hash();
+            for height in 0..64 {
+                if !has_tree_at_height(self.num_leaves, height) {
+                    // No tree at this height; insert the new tree
+                    self.trees[height] = h;
+                    self.num_leaves += 1;
+                    break;
+                }
+                // Another tree exists at this height. Append roots to proofs.
+                debug_assert!(height < 63, "height {height} would overflow 1i64 << height");
+                let old_root = self.trees[height];
+                self.trees[height] = Hash256::default();
+                let start_of_new_tree = i as i64 - (1i64 << height);
+                let start_of_old_tree = i as i64 - (1i64 << (height + 1));
+
+                let mut j = i as i64;
+                while j > start_of_new_tree && j >= 0 {
+                    leaves[j as usize].state_element.merkle_proof.push(old_root);
+                    j -= 1;
+                }
+                while j > start_of_old_tree && j >= 0 {
+                    leaves[j as usize].state_element.merkle_proof.push(h);
+                    j -= 1;
+                }
+
+                // Record growth for existing trees
+                let cur_tree_index = (self.num_leaves + 1).wrapping_sub(1u64 << height);
+                let prev_tree_index = (self.num_leaves + 1).wrapping_sub(1u64 << (height + 1));
+                for bit in 0..64 {
+                    if initial_leaves & (1u64 << bit) == 0 {
+                        continue;
+                    }
+                    let tree_start_index = clear_bits(initial_leaves, bit + 1);
+                    if tree_start_index >= cur_tree_index {
+                        tree_growth[bit].push(old_root);
+                    } else if tree_start_index >= prev_tree_index {
+                        tree_growth[bit].push(h);
+                    }
+                }
+
+                // Merge: existing root is left sibling, new hash is right
+                h = sum_node(&BLAKE2B_256_PARAMS, &old_root, &h);
+            }
+        }
+
+        tree_growth
+    }
+
+    /// Apply a block's updated and added elements to the accumulator,
+    /// producing an ElementApplyUpdate that can be used to update proofs
+    /// of tracked elements.
+    /// Port of Go applyBlock (merkle.go:384-405).
+    pub fn apply_block(
+        &mut self,
+        updated: &mut [ElementLeaf],
+        added: &mut [ElementLeaf],
+    ) -> Result<ElementApplyUpdate, AccumulatorError> {
+        let updated_trees = update_leaves(updated)?;
+
+        // Update tree roots from recomputed proofs
+        for (height, es) in updated_trees.iter().enumerate() {
+            if !es.is_empty() {
+                self.trees[height] = es[0].proof_root();
+            }
+        }
+
+        let old_num_leaves = self.num_leaves;
+        let tree_growth = self.add_leaves(added);
+
+        // Extend updated elements' proofs with tree growth
+        for e in updated.iter_mut() {
+            let proof_len = e.state_element.merkle_proof.len();
+            e.state_element
+                .merkle_proof
+                .extend_from_slice(&tree_growth[proof_len]);
+        }
+
+        Ok(ElementApplyUpdate {
+            updated: updated_trees,
+            tree_growth,
+            old_num_leaves,
+            num_leaves: self.num_leaves,
+        })
+    }
+}
+
 #[cfg(test)]
 mod tests {
+    use crate::types::StateElement;
     use crate::{block_id, hash_256};
 
     use super::*;
     use chrono::FixedOffset;
-    use serde_json;
 
     #[test]
     fn test_serialize_network() {
@@ -765,5 +1219,321 @@ mod tests {
         assert_eq!(BINARY_STR, hex::encode(serialized.clone()));
         let deserialized = State::decode(&mut &serialized[..]).unwrap();
         assert_eq!(s, deserialized);
+    }
+
+    // =========================================================================
+    // Test vectors generated by Go program (sia-sdk-rs/sia_sdk/testutil/go-vectors/main.go).
+    // Regenerate with:
+    //   cd sia_sdk/testutil/go-vectors && go run . > ../../src/test_vectors.json
+    // CI generates this automatically (see .github/workflows/main.yml).
+    // =========================================================================
+
+    #[derive(serde::Deserialize)]
+    struct TestVectors {
+        unassigned_leaf_index: u64,
+        element_hashes: Vec<ElementHashVec>,
+        leaf_hashes: Vec<LeafHashVec>,
+        sum_pairs: Vec<SumPairVec>,
+        accumulator: Vec<AccumulatorStepVec>,
+        proof_roots: Vec<ProofRootVec>,
+        chain_index_hashes: Vec<ChainIndexHashVec>,
+        miner_output_ids: Vec<MinerOutputIDVec>,
+        foundation_output_ids: Vec<FoundationOutputIDVec>,
+    }
+
+    #[derive(serde::Deserialize)]
+    struct ElementHashVec {
+        id_hex: String,
+        value_lo: u64,
+        value_hi: u64,
+        address_hex: String,
+        maturity_height: u64,
+        result_hex: String,
+    }
+
+    #[derive(serde::Deserialize)]
+    struct LeafHashVec {
+        element_hash_hex: String,
+        leaf_index: u64,
+        spent: bool,
+        result_hex: String,
+    }
+
+    #[derive(serde::Deserialize)]
+    struct SumPairVec {
+        left_hex: String,
+        right_hex: String,
+        result_hex: String,
+    }
+
+    #[derive(serde::Deserialize)]
+    struct AccumulatorStepVec {
+        leaf_hash_hex: String,
+        num_leaves: u64,
+        trees_hex: Vec<String>,
+    }
+
+    #[derive(serde::Deserialize)]
+    struct ProofRootVec {
+        leaf_hash_hex: String,
+        leaf_index: u64,
+        proof_hex: Vec<String>,
+        result_hex: String,
+    }
+
+    #[derive(serde::Deserialize)]
+    struct ChainIndexHashVec {
+        id_hex: String,
+        index_height: u64,
+        index_id_hex: String,
+        result_hex: String,
+    }
+
+    #[derive(serde::Deserialize)]
+    struct MinerOutputIDVec {
+        block_id_hex: String,
+        index: u64,
+        result_hex: String,
+    }
+
+    #[derive(serde::Deserialize)]
+    struct FoundationOutputIDVec {
+        block_id_hex: String,
+        result_hex: String,
+    }
+
+    fn hex_to_hash(s: &str) -> Hash256 {
+        let bytes = hex::decode(s).unwrap();
+        let mut h = [0u8; 32];
+        h.copy_from_slice(&bytes);
+        Hash256::from(h)
+    }
+
+    fn load_vectors() -> TestVectors {
+        let json = include_str!("test_vectors.json");
+        serde_json::from_str(json).unwrap()
+    }
+
+    #[test]
+    fn test_unassigned_leaf_index() {
+        let v = load_vectors();
+        assert_eq!(
+            UNASSIGNED_LEAF_INDEX, v.unassigned_leaf_index,
+            "UNASSIGNED_LEAF_INDEX mismatch: rust={} go={}",
+            UNASSIGNED_LEAF_INDEX, v.unassigned_leaf_index
+        );
+    }
+
+    #[test]
+    fn test_siacoin_element_hash_vectors() {
+        let v = load_vectors();
+        for (i, tc) in v.element_hashes.iter().enumerate() {
+            let id_bytes = hex::decode(&tc.id_hex).unwrap();
+            let mut id_arr = [0u8; 32];
+            id_arr.copy_from_slice(&id_bytes);
+            let id = crate::types::SiacoinOutputID::from(id_arr);
+
+            let value = Currency::new((tc.value_hi as u128) << 64 | tc.value_lo as u128);
+
+            let addr_bytes = hex::decode(&tc.address_hex).unwrap();
+            let mut addr_arr = [0u8; 32];
+            addr_arr.copy_from_slice(&addr_bytes);
+            let address = crate::types::Address::new(addr_arr);
+
+            let output = SiacoinOutput { value, address };
+
+            let result = siacoin_element_hash(&id, &output, tc.maturity_height);
+            let expected = hex_to_hash(&tc.result_hex);
+            assert_eq!(
+                result,
+                expected,
+                "element_hash case {} mismatch:\n  got:      {}\n  expected: {}",
+                i,
+                hex::encode(result.as_ref() as &[u8]),
+                tc.result_hex
+            );
+        }
+    }
+
+    #[test]
+    fn test_leaf_hash_vectors() {
+        let v = load_vectors();
+        for (i, tc) in v.leaf_hashes.iter().enumerate() {
+            let elem_hash = hex_to_hash(&tc.element_hash_hex);
+            let leaf = ElementLeaf {
+                state_element: StateElement {
+                    leaf_index: tc.leaf_index,
+                    merkle_proof: Vec::new(),
+                },
+                element_hash: elem_hash,
+                spent: tc.spent,
+            };
+            let result = leaf.hash();
+            let expected = hex_to_hash(&tc.result_hex);
+            assert_eq!(
+                result,
+                expected,
+                "leaf_hash case {} mismatch:\n  got:      {}\n  expected: {}",
+                i,
+                hex::encode(result.as_ref() as &[u8]),
+                tc.result_hex
+            );
+        }
+    }
+
+    #[test]
+    fn test_sum_pair_vectors() {
+        let v = load_vectors();
+        for (i, tc) in v.sum_pairs.iter().enumerate() {
+            let left = hex_to_hash(&tc.left_hex);
+            let right = hex_to_hash(&tc.right_hex);
+            let result = sum_node(&BLAKE2B_256_PARAMS, &left, &right);
+            let expected = hex_to_hash(&tc.result_hex);
+            assert_eq!(
+                result,
+                expected,
+                "sum_pair case {} mismatch:\n  got:      {}\n  expected: {}",
+                i,
+                hex::encode(result.as_ref() as &[u8]),
+                tc.result_hex
+            );
+        }
+    }
+
+    #[test]
+    fn test_accumulator_vectors() {
+        let v = load_vectors();
+        let mut acc = ElementAccumulator::default();
+
+        for (i, step) in v.accumulator.iter().enumerate() {
+            let leaf_hash = hex_to_hash(&step.leaf_hash_hex);
+
+            // Manually add the leaf hash (replicating Go's Accumulator.AddLeaf)
+            let mut h = leaf_hash;
+            let mut height = 0;
+            while has_tree_at_height(acc.num_leaves, height) {
+                h = sum_node(&BLAKE2B_256_PARAMS, &acc.trees[height], &h);
+                height += 1;
+            }
+            acc.trees[height] = h;
+            acc.num_leaves += 1;
+
+            assert_eq!(
+                acc.num_leaves, step.num_leaves,
+                "accumulator step {} num_leaves mismatch",
+                i
+            );
+
+            // Check trees
+            for tree_entry in &step.trees_hex {
+                let parts: Vec<&str> = tree_entry.splitn(2, ':').collect();
+                let tree_idx: usize = parts[0].parse().unwrap();
+                let expected_hash = hex_to_hash(parts[1]);
+                assert_eq!(
+                    acc.trees[tree_idx],
+                    expected_hash,
+                    "accumulator step {} tree[{}] mismatch:\n  got:      {}\n  expected: {}",
+                    i,
+                    tree_idx,
+                    hex::encode(acc.trees[tree_idx].as_ref() as &[u8]),
+                    parts[1]
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn test_proof_root_vectors() {
+        let v = load_vectors();
+        for (i, tc) in v.proof_roots.iter().enumerate() {
+            let leaf_hash = hex_to_hash(&tc.leaf_hash_hex);
+            let proof: Vec<Hash256> = tc.proof_hex.iter().map(|h| hex_to_hash(h)).collect();
+            let result = proof_root(leaf_hash, tc.leaf_index, &proof);
+            let expected = hex_to_hash(&tc.result_hex);
+            assert_eq!(
+                result,
+                expected,
+                "proof_root case {} mismatch:\n  got:      {}\n  expected: {}",
+                i,
+                hex::encode(result.as_ref() as &[u8]),
+                tc.result_hex
+            );
+        }
+    }
+
+    #[test]
+    fn test_chain_index_hash_vectors() {
+        let v = load_vectors();
+        for (i, tc) in v.chain_index_hashes.iter().enumerate() {
+            let id_bytes = hex::decode(&tc.id_hex).unwrap();
+            let mut id = [0u8; 32];
+            id.copy_from_slice(&id_bytes);
+            let block_id = BlockID::new(id);
+
+            let index_id_bytes = hex::decode(&tc.index_id_hex).unwrap();
+            let mut index_id = [0u8; 32];
+            index_id.copy_from_slice(&index_id_bytes);
+            let chain_index = ChainIndex {
+                height: tc.index_height,
+                id: BlockID::new(index_id),
+            };
+
+            let result = chain_index_element_hash(&block_id, &chain_index);
+            let expected = hex_to_hash(&tc.result_hex);
+            assert_eq!(
+                result,
+                expected,
+                "chain_index_element_hash case {} mismatch:\n  got:      {}\n  expected: {}",
+                i,
+                hex::encode(result.as_ref() as &[u8]),
+                tc.result_hex
+            );
+        }
+    }
+
+    #[test]
+    fn test_miner_output_id_vectors() {
+        let v = load_vectors();
+        for (i, tc) in v.miner_output_ids.iter().enumerate() {
+            let id_bytes = hex::decode(&tc.block_id_hex).unwrap();
+            let mut id = [0u8; 32];
+            id.copy_from_slice(&id_bytes);
+            let block_id = BlockID::new(id);
+
+            let result = block_id.miner_output_id(tc.index as usize);
+            let expected_bytes = hex::decode(&tc.result_hex).unwrap();
+            let result_ref: &[u8] = result.as_ref();
+            assert_eq!(
+                result_ref,
+                expected_bytes.as_slice(),
+                "miner_output_id case {} mismatch:\n  got:      {}\n  expected: {}",
+                i,
+                hex::encode(result_ref),
+                tc.result_hex
+            );
+        }
+    }
+
+    #[test]
+    fn test_foundation_output_id_vectors() {
+        let v = load_vectors();
+        for (i, tc) in v.foundation_output_ids.iter().enumerate() {
+            let id_bytes = hex::decode(&tc.block_id_hex).unwrap();
+            let mut id = [0u8; 32];
+            id.copy_from_slice(&id_bytes);
+            let block_id = BlockID::new(id);
+
+            let result = block_id.foundation_output_id();
+            let expected_bytes = hex::decode(&tc.result_hex).unwrap();
+            let result_ref: &[u8] = result.as_ref();
+            assert_eq!(
+                result_ref,
+                expected_bytes.as_slice(),
+                "foundation_output_id case {} mismatch:\n  got:      {}\n  expected: {}",
+                i,
+                hex::encode(result_ref),
+                tc.result_hex
+            );
+        }
     }
 }
