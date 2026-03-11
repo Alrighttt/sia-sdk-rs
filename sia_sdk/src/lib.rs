@@ -1,11 +1,12 @@
 pub mod blake2;
-pub mod hd;
-pub mod hd_encryption;
 pub mod consensus;
 pub mod encoding;
 pub mod encoding_async;
 pub mod encryption;
 pub mod erasure_coding;
+pub mod hd;
+pub mod hd_encryption;
+pub mod manifest;
 pub mod rhp;
 pub mod seed;
 pub mod signing;
