@@ -60,6 +60,12 @@ impl HdMnemonic {
         Ok(Self { mnemonic })
     }
 
+    /// Create an HdMnemonic from raw entropy bytes.
+    pub fn from_entropy(entropy: &[u8]) -> Result<Self, HdError> {
+        let mnemonic = Mnemonic::from_entropy(entropy)?;
+        Ok(Self { mnemonic })
+    }
+
     /// Derive the 512-bit BIP39 seed using PBKDF2-HMAC-SHA512.
     ///
     /// Pass `""` for no passphrase.
