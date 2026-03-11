@@ -249,7 +249,7 @@ impl Network {
     }
 }
 
-fn has_tree_at_height(num_leaves: &u64, height: usize) -> bool {
+fn has_tree_at_height(num_leaves: u64, height: usize) -> bool {
     num_leaves & (1 << height) != 0
 }
 
@@ -272,7 +272,7 @@ impl SiaEncodable for ElementAccumulator {
     fn encode<W: std::io::Write>(&self, w: &mut W) -> encoding::Result<()> {
         self.num_leaves.encode(w)?;
         for (i, root) in self.trees.iter().enumerate() {
-            if has_tree_at_height(&self.num_leaves, i) {
+            if has_tree_at_height(self.num_leaves, i) {
                 root.encode(w)?;
             }
         }
@@ -285,7 +285,7 @@ impl SiaDecodable for ElementAccumulator {
         let num_leaves = u64::decode(r)?;
         let mut trees = [Hash256::default(); 64];
         for (i, root) in trees.iter_mut().enumerate() {
-            if has_tree_at_height(&num_leaves, i) {
+            if has_tree_at_height(num_leaves, i) {
                 let h = Hash256::decode(r)?;
                 *root = h;
             }
@@ -302,7 +302,7 @@ impl Serialize for ElementAccumulator {
             .trees
             .iter()
             .enumerate()
-            .filter(|(i, _)| has_tree_at_height(&self.num_leaves, *i))
+            .filter(|(i, _)| has_tree_at_height(self.num_leaves, *i))
             .map(|(_, root)| *root)
             .collect();
         state.serialize_field("trees", &trees)?;
@@ -334,7 +334,7 @@ impl<'de> Deserialize<'de> for ElementAccumulator {
         };
         let mut trees_iter = inter.trees.into_iter();
         for i in 0..64 {
-            if has_tree_at_height(&ea.num_leaves, i) {
+            if has_tree_at_height(ea.num_leaves, i) {
                 if let Some(root) = trees_iter.next() {
                     ea.trees[i] = root
                 } else {
