@@ -3,9 +3,12 @@ use core::fmt;
 use crate::encoding::{self, SiaDecodable, SiaDecode, SiaEncodable, SiaEncode};
 use crate::encoding_async::{AsyncSiaDecodable, AsyncSiaDecode, AsyncSiaEncodable, AsyncSiaEncode};
 use crate::types::{Hash256, HexParseError};
+use curve25519_dalek::edwards::CompressedEdwardsY;
+use curve25519_dalek::scalar::Scalar;
 use ed25519_dalek::{Signature as ED25519Signature, Signer, SigningKey, Verifier, VerifyingKey};
 use serde::de::Error;
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha512};
 use zeroize::ZeroizeOnDrop;
 
 /// An ed25519 public key that can be used to verify a signature
@@ -126,6 +129,64 @@ impl PrivateKey {
     pub fn sign(&self, h: &[u8]) -> Signature {
         let sk = SigningKey::from_bytes(&self.0[..32].try_into().unwrap());
         Signature::new(sk.sign(h).to_bytes())
+    }
+
+    /// Sign a message using an additively-tweaked private key.
+    ///
+    /// The tweaked keypair is `(a' = a + t, A' = A + t*G)` where
+    /// `t = H(A || topic)`. The resulting signature verifies against
+    /// `public_key().tweak(topic)`.
+    ///
+    /// Internally performs the SHA-512 expansion and ed25519 clamping that
+    /// dalek normally hides, then adds the tweak scalar before signing.
+    pub fn sign_tweaked(&self, topic: &[u8], msg: &[u8]) -> Signature {
+        let seed: [u8; 32] = self.0[..32].try_into().unwrap();
+        let pk = self.public_key();
+
+        // SHA-512 expand the seed (replicating dalek's internal expansion)
+        let h = Sha512::digest(&seed);
+        let mut scalar_bytes: [u8; 32] = h[..32].try_into().unwrap();
+        // Ed25519 clamping
+        scalar_bytes[0] &= 248;
+        scalar_bytes[31] &= 127;
+        scalar_bytes[31] |= 64;
+        let a = Scalar::from_bytes_mod_order(scalar_bytes);
+        let nonce_prefix = &h[32..64];
+
+        // Compute tweak: t = H(A || topic)
+        let t = pk.tweak_scalar(topic);
+
+        // Tweaked scalar and public key
+        let a_prime = a + t;
+        let a_prime_point = CompressedEdwardsY(pk.0).decompress().unwrap()
+            + curve25519_dalek::constants::ED25519_BASEPOINT_POINT * t;
+        let a_prime_bytes = a_prime_point.compress().to_bytes();
+
+        // Deterministic nonce: r = SHA-512(nonce_prefix || msg) mod l
+        let r_hash = Sha512::new()
+            .chain_update(nonce_prefix)
+            .chain_update(msg)
+            .finalize();
+        let r = Scalar::from_bytes_mod_order_wide(r_hash[..64].try_into().unwrap());
+
+        // R = r * G
+        let r_point = (curve25519_dalek::constants::ED25519_BASEPOINT_POINT * r).compress();
+
+        // k = SHA-512(R || A' || msg) mod l
+        let k_hash = Sha512::new()
+            .chain_update(r_point.as_bytes())
+            .chain_update(&a_prime_bytes)
+            .chain_update(msg)
+            .finalize();
+        let k = Scalar::from_bytes_mod_order_wide(k_hash[..64].try_into().unwrap());
+
+        // S = (r + k * a') mod l
+        let s = r + k * a_prime;
+
+        let mut sig = [0u8; 64];
+        sig[..32].copy_from_slice(r_point.as_bytes());
+        sig[32..].copy_from_slice(s.as_bytes());
+        Signature(sig)
     }
 }
 
@@ -260,5 +321,94 @@ mod tests {
             format!("\"ed25519:{public_key_str}\"")
         );
         assert_eq!(public_key_deserialized, public_key);
+    }
+
+    #[test]
+    fn test_tweak_deterministic() {
+        let seed = [42u8; 32];
+        let sk = PrivateKey::from_seed(&seed);
+        let pk = sk.public_key();
+
+        let tweaked1 = pk.tweak(b".sia/manifest").unwrap();
+        let tweaked2 = pk.tweak(b".sia/manifest").unwrap();
+        assert_eq!(tweaked1, tweaked2);
+    }
+
+    #[test]
+    fn test_tweak_different_topics() {
+        let seed = [42u8; 32];
+        let sk = PrivateKey::from_seed(&seed);
+        let pk = sk.public_key();
+
+        let t1 = pk.tweak(b".sia/manifest").unwrap();
+        let t2 = pk.tweak(b".sia/profile").unwrap();
+        assert_ne!(t1, t2);
+        // Both differ from the original
+        assert_ne!(t1, pk);
+        assert_ne!(t2, pk);
+    }
+
+    #[test]
+    fn test_sign_tweaked_verifies() {
+        let seed = [42u8; 32];
+        let sk = PrivateKey::from_seed(&seed);
+        let pk = sk.public_key();
+        let topic = b".sia/manifest";
+        let msg = b"hello world";
+
+        let sig = sk.sign_tweaked(topic, msg);
+        let tweaked_pk = pk.tweak(topic).unwrap();
+
+        // Signature must verify against the tweaked public key
+        assert!(tweaked_pk.verify(msg, &sig));
+
+        // Must NOT verify against the original public key
+        assert!(!pk.verify(msg, &sig));
+    }
+
+    #[test]
+    fn test_sign_tweaked_wrong_topic_fails() {
+        let seed = [42u8; 32];
+        let sk = PrivateKey::from_seed(&seed);
+        let pk = sk.public_key();
+
+        let sig = sk.sign_tweaked(b".sia/manifest", b"hello");
+        let wrong_tweaked = pk.tweak(b".sia/profile").unwrap();
+
+        assert!(!wrong_tweaked.verify(b"hello", &sig));
+    }
+
+    #[test]
+    fn test_sign_tweaked_wrong_message_fails() {
+        let seed = [42u8; 32];
+        let sk = PrivateKey::from_seed(&seed);
+        let pk = sk.public_key();
+        let topic = b".sia/manifest";
+
+        let sig = sk.sign_tweaked(topic, b"hello");
+        let tweaked_pk = pk.tweak(topic).unwrap();
+
+        assert!(!tweaked_pk.verify(b"goodbye", &sig));
+    }
+
+    #[test]
+    fn test_tweak_from_hd_key() {
+        // Verify tweaking works with HD-derived keys (the real use case)
+        use crate::hd::HdMnemonic;
+        let m = HdMnemonic::from_phrase(
+            "abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about",
+        ).unwrap();
+        let master = m.to_extended_key("");
+        let child = master.derive_path("m/44'/1991'/0'/0'/0'").unwrap();
+        let sk = child.private_key();
+        let pk = child.public_key();
+
+        let topic = b".sia/manifest";
+        let msg = b"test message";
+
+        let sig = sk.sign_tweaked(topic, msg);
+        let tweaked_pk = pk.tweak(topic).unwrap();
+
+        assert!(tweaked_pk.verify(msg, &sig));
     }
 }
