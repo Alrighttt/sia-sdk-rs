@@ -383,7 +383,7 @@ pub struct SiacoinOutput {
 /// A SiafundOutput is a Siafund UTXO that can be spent using the unlock conditions
 /// for Address
 #[derive(
-    Debug, PartialEq, Serialize, Deserialize, SiaEncode, SiaDecode, AsyncSiaEncode, AsyncSiaDecode,
+    Debug, PartialEq, Serialize, Deserialize, SiaEncode, SiaDecode, AsyncSiaEncode, AsyncSiaDecode, Clone,
 )]
 #[serde(rename_all = "camelCase")]
 pub struct SiafundOutput {
