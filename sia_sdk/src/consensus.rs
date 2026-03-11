@@ -18,7 +18,7 @@ static BLAKE2B_256_PARAMS: LazyLock<blake2b_simd::Params> = LazyLock::new(|| {
     p
 });
 
-const LEAF_HASH_PREFIX: u8 = 0x00;
+pub(crate) const LEAF_HASH_PREFIX: u8 = 0x00;
 
 /// Sentinel value for elements not yet added to the accumulator.
 pub const UNASSIGNED_LEAF_INDEX: u64 = 10_101_010_101_010_101_010;
