@@ -12,7 +12,7 @@ use crate::encoding::{
 };
 use crate::macros::impl_hash_id;
 use crate::types::currency::Currency;
-use crate::types::{v1, v2};
+use crate::types::v1;
 
 use super::{Specifier, specifier};
 
