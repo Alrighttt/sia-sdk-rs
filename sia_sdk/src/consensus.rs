@@ -20,6 +20,12 @@ static BLAKE2B_256_PARAMS: LazyLock<blake2b_simd::Params> = LazyLock::new(|| {
 
 pub(crate) const LEAF_HASH_PREFIX: u8 = 0x00;
 
+/// Replay protection prefixes included in transaction sig hashes to prevent
+/// cross-era replays. A new prefix is introduced at each hardfork.
+pub const REPLAY_PREFIX_ASIC: &[u8] = &[0];
+pub const REPLAY_PREFIX_FOUNDATION: &[u8] = &[1];
+pub const REPLAY_PREFIX_V2: &[u8] = &[2];
+
 /// Sentinel value for elements not yet added to the accumulator.
 pub const UNASSIGNED_LEAF_INDEX: u64 = 10_101_010_101_010_101_010;
 
