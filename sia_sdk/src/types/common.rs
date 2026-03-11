@@ -99,8 +99,8 @@ impl_hash_id!(FileContractID);
 
 impl FileContractID {
     const PROOF_OUTPUT_ID_PREFIX: Specifier = specifier!("storage proof");
-    const V2_PROOF_OUTPUT_ID_PREFIX: &'static str = "id/v2filecontractoutput";
-    const V2_FILE_CONTRACT_RENEWAL_PREFIX: &'static str = "id/v2filecontractrenewal";
+    const V2_PROOF_OUTPUT_ID_PREFIX: &'static str = "sia/id/v2filecontractoutput|";
+    const V2_FILE_CONTRACT_RENEWAL_PREFIX: &'static str = "sia/id/v2filecontractrenewal|";
 
     fn derive_proof_output_id<T: From<blake2b_simd::Hash>>(&self, valid: bool, i: usize) -> T {
         let mut state = Params::new().hash_length(32).to_state();
