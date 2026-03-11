@@ -94,6 +94,8 @@ pub struct Network {
     pub hardfork_v2: HardforkV2,
 }
 
+/// Convert a Unix timestamp to a `DateTime<Utc>`. Only called with hardcoded
+/// constants, so an out-of-range value would be caught at compile time.
 const fn unix_timestamp(secs: i64) -> DateTime<Utc> {
     match DateTime::from_timestamp_secs(secs) {
         Some(t) => t,
