@@ -174,9 +174,13 @@ impl PrivateKey {
             + curve25519_dalek::constants::ED25519_BASEPOINT_POINT * t;
         let a_prime_bytes = a_prime_point.compress().to_bytes();
 
-        // Deterministic nonce: r = SHA-512(nonce_prefix || msg) mod l
+        // Deterministic nonce: r = SHA-512(nonce_prefix || topic || msg) mod l
+        // Including topic ensures unique nonces when the same seed signs the
+        // same message under different topics, avoiding shared-nonce scenarios
+        // that could become exploitable if the signing logic is later modified.
         let r_hash = Sha512::new()
             .chain_update(nonce_prefix)
+            .chain_update(topic)
             .chain_update(msg)
             .finalize();
         let r = Scalar::from_bytes_mod_order_wide(
