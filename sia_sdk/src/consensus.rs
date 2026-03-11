@@ -12,7 +12,7 @@ use crate::types::{Address, BlockID, ChainIndex, Currency, Hash256, SiacoinOutpu
 
 /// Shared blake2b-256 params for all accumulator hashing. Avoids re-allocating
 /// a `Params` struct on every call to `proof_root`, `add_leaves`, etc.
-static BLAKE2B_256_PARAMS: LazyLock<blake2b_simd::Params> = LazyLock::new(|| {
+pub(crate) static BLAKE2B_256_PARAMS: LazyLock<blake2b_simd::Params> = LazyLock::new(|| {
     let mut p = blake2b_simd::Params::new();
     p.hash_length(32);
     p
