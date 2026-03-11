@@ -251,7 +251,7 @@ fn has_tree_at_height(num_leaves: &u64, height: usize) -> bool {
     num_leaves & (1 << height) != 0
 }
 
-#[derive(PartialEq, Debug)]
+#[derive(PartialEq, Debug, Clone)]
 pub struct ElementAccumulator {
     pub num_leaves: u64,
     pub trees: [Hash256; 64],
