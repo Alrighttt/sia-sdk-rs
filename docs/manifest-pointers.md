@@ -54,12 +54,20 @@ This derivation produces:
 
 Different path strings produce completely independent keys, allowing multiple applications to coexist on the same seed without interference.
 
+**Attestation key derivation**: The attestation `key` field is an opaque hash, not the plaintext path string. This prevents on-chain observers from identifying private manifest attestations by their key string.
+
+```
+key = hex(blake2b-256("sia/manifest/key" || path))
+```
+
+The distinguisher prefix `"sia/manifest/key"` namespaces the hash to avoid collisions with other uses of Blake2b. The seed holder can recompute the key from the path string; to everyone else it appears as a random 64-character hex string.
+
 **Attestation structure**:
 
 | Field | Value |
 |-------|-------|
 | `public_key` | Derived from `m/44'/19911'/{account}'/0'/{hash(path)}'` |
-| `key` | The path string (e.g. `".sia/manifest"`) |
+| `key` | `hex(blake2b-256("sia/manifest/key" \|\| path))` |
 | `value` | Encrypted URL (XChaCha20-Poly1305 AEAD) |
 
 **Payload format** (in the `value` field):
@@ -70,7 +78,7 @@ Different path strings produce completely independent keys, allowing multiple ap
 [ciphertext + tag   ]  encrypted URL + 16-byte Poly1305 authentication tag
 ```
 
-The AEAD tag ensures that only the seed holder can produce payloads that decrypt successfully — other attestations from different keys at the same key string fail authentication and are silently rejected.
+The AEAD tag ensures that only the seed holder can produce payloads that decrypt successfully — other attestations from different keys at the same key string fail authentication and are silently rejected. Combined with the opaque key and HD-derived pubkey, private manifest attestations are indistinguishable from any other attestation on-chain.
 
 **Example use cases**:
 
@@ -163,10 +171,11 @@ The group secret also serves as the encryption key for payloads.
 ### Private manifest recovery
 
 1. Derive the manifest keypair from the seed phrase using the known path string
-2. Query the SAPI index for the derived public key
-3. For each matching attestation with the expected key string, fetch the block and extract the value
-4. Decrypt the value with the derived encryption key — AEAD rejects tampered or unrelated data
-5. The most recent successfully decrypted URL is the current manifest pointer
+2. Compute the expected attestation key: `hex(blake2b-256("sia/manifest/key" || path))`
+3. Query the SAPI index for the derived public key
+4. For each matching attestation whose key matches the expected hash, fetch the block and extract the value
+5. Decrypt the value with the derived encryption key — AEAD rejects tampered or unrelated data
+6. The most recent successfully decrypted URL is the current manifest pointer
 
 An application that uses multiple paths simply repeats this process for each one.
 
