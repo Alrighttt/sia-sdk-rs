@@ -541,9 +541,10 @@ impl AppClient for Client {
             .await
     }
 
-    /// Saves an object to the indexer.
+    /// Saves an object to the indexer using the minimal pin request format.
     async fn save_object(&self, app_key: &PrivateKey, object: &SealedObject) -> Result<(), Error> {
-        self.post_json::<_, EmptyResponse>("objects", Some(app_key), Some(object))
+        let pin_request = object.pin_request();
+        self.post_json::<_, EmptyResponse>("objects", Some(app_key), Some(&pin_request))
             .await
             .map(|_| ())
     }

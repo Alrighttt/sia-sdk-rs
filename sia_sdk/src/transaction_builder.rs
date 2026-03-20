@@ -91,6 +91,12 @@ impl V2TransactionBuilder {
         self
     }
 
+    /// Set pre-signed attestations to include in the transaction.
+    pub fn attestations(&mut self, attestations: Vec<v2::Attestation>) -> &mut Self {
+        self.attestations = attestations;
+        self
+    }
+
     /// Set the miner fee.
     pub fn miner_fee(&mut self, fee: Currency) -> &mut Self {
         self.miner_fee = fee;

@@ -4321,28 +4321,39 @@ pub async fn scan_balance_filtered(
         };
 
         // Fetch 1 block starting after prev_block_id
-        let rpc_result = send_v2_blocks_rpc(&wt, vec![prev_block_id], 1, true).await;
-        let blocks_with_raw = match rpc_result {
-            Ok((blocks, _remaining)) => blocks,
-            Err(_) => {
-                // Reconnect and retry
-                log(
-                    &format!("  Connection lost at block {}, reconnecting...", height),
-                    "info",
-                );
-                let _ = wt.close();
-                let new_conn = connect_and_handshake(&url, genesis_id, cert_hash.as_deref()).await?;
-                wt = new_conn.wt;
-                log("  Reconnected, retrying...", "ok");
-                match send_v2_blocks_rpc(&wt, vec![prev_block_id], 1, true).await {
-                    Ok((blocks, _)) => blocks,
-                    Err(e) => {
-                        log(&format!("  Failed after reconnect: {:?}", e), "err");
-                        continue;
+        let mut blocks_with_raw = Vec::new();
+        let max_retries = 3;
+        for attempt in 0..=max_retries {
+            match send_v2_blocks_rpc(&wt, vec![prev_block_id], 1, true).await {
+                Ok((blocks, _remaining)) => {
+                    blocks_with_raw = blocks;
+                    break;
+                }
+                Err(e) => {
+                    if attempt == max_retries {
+                        log(&format!("  Failed after {} retries at height {}: {:?}", max_retries, height, e), "err");
+                        break;
+                    }
+                    log(
+                        &format!("  Connection lost at height {} (attempt {}/{}), reconnecting...", height, attempt + 1, max_retries),
+                        "info",
+                    );
+                    let _ = wt.close();
+                    match connect_and_handshake(&url, genesis_id, cert_hash.as_deref()).await {
+                        Ok(new_conn) => {
+                            wt = new_conn.wt;
+                            log("  Reconnected.", "ok");
+                        }
+                        Err(ce) => {
+                            log(&format!("  Reconnect failed: {:?}. Retrying...", ce), "err");
+                        }
                     }
                 }
             }
-        };
+        }
+        if blocks_with_raw.is_empty() {
+            continue;
+        }
 
         blocks_fetched += 1;
 
@@ -5745,8 +5756,46 @@ pub fn derive_addresses(entropy_hex: &str, start: u32, count: u32) -> Result<Str
     serde_json::to_string(&results).map_err(|e| JsValue::from_str(&e.to_string()))
 }
 
+/// Helper to build a minimal ChainState at a post-v2 height for the given network.
+/// This is sufficient for computing attestation sig hashes (only the replay prefix matters).
+fn manifest_chain_state(network: &str) -> Result<sia::consensus::ChainState, JsValue> {
+    use sia::consensus::{ChainState, Network, State, ElementAccumulator};
+    use sia::types::Work;
+
+    let net = match network {
+        "mainnet" => Network::mainnet(),
+        "zen" => Network::zen(),
+        _ => return Err(JsValue::from_str(&format!("unknown network: {}", network))),
+    };
+    let height = net.hardfork_v2.require_height + 1;
+    let addr = net.hardfork_foundation.primary_address.clone();
+    let epoch = ::chrono::DateTime::<::chrono::Utc>::UNIX_EPOCH;
+    Ok(ChainState {
+        state: State {
+            index: ChainIndex { height, id: BlockID::default() },
+            prev_timestamps: [epoch; 11],
+            depth: BlockID::default(),
+            child_target: BlockID::default(),
+            siafund_pool: Currency::zero(),
+            oak_time: ::chrono::TimeDelta::zero(),
+            oak_target: BlockID::default(),
+            foundation_primary_address: addr.clone(),
+            foundation_failsafe_address: addr,
+            total_work: Work::zero(),
+            difficulty: Work::zero(),
+            oak_work: Work::zero(),
+            elements: ElementAccumulator::default(),
+            attestations: 0,
+        },
+        network: net,
+    })
+}
+
+/// Derive the manifest public key and HD path info for a private manifest.
+///
+/// Returns JSON: `{ publicKey, account, path }`
 #[wasm_bindgen]
-pub fn derive_manifest_info(entropy_hex: &str, account: u32) -> Result<String, JsValue> {
+pub fn derive_manifest_info(entropy_hex: &str, account: u32, index: u32) -> Result<String, JsValue> {
     use sia::hd::HdMnemonic;
     use sia::manifest::derive_manifest;
 
@@ -5756,46 +5805,35 @@ pub fn derive_manifest_info(entropy_hex: &str, account: u32) -> Result<String, J
         .map_err(|e| JsValue::from_str(&e.to_string()))?;
     let master = mnemonic.to_extended_key("");
 
-    let (_key, address) = derive_manifest(&master, account)
+    let (_enc_key, signing_key) = derive_manifest(&master, account, index)
         .map_err(|e| JsValue::from_str(&e.to_string()))?;
 
+    let pk = signing_key.public_key();
     let result = serde_json::json!({
-        "address": address.to_string(),
+        "publicKey": format!("ed25519:{}", hex::encode(pk.as_ref())),
         "account": account,
-        "path": format!("m/44'/19911'/{}'/0'/{{hash(\".sia/manifest\")}}'", account),
+        "index": index,
+        "path": format!("m/44'/19911'/{}'/0'/{}'", account, index),
     });
 
     serde_json::to_string(&result).map_err(|e| JsValue::from_str(&e.to_string()))
 }
 
+/// Build a private manifest attestation transaction.
+///
+/// Returns the unsigned transaction as pretty-printed JSON.
+/// The caller must add siacoin inputs to cover the miner fee and sign them.
 #[wasm_bindgen]
-pub fn seal_manifest_url_wasm(entropy_hex: &str, account: u32, url: &str) -> Result<String, JsValue> {
-    use sia::hd::HdMnemonic;
-    use sia::manifest;
-
-    let entropy =
-        hex::decode(entropy_hex).map_err(|e| JsValue::from_str(&e.to_string()))?;
-    let mnemonic = HdMnemonic::from_entropy(&entropy)
-        .map_err(|e| JsValue::from_str(&e.to_string()))?;
-    let master = mnemonic.to_extended_key("");
-
-    let (key, _address) = manifest::derive_manifest(&master, account)
-        .map_err(|e| JsValue::from_str(&e.to_string()))?;
-
-    let sealed = manifest::seal_manifest_url(&key, url);
-    Ok(hex::encode(sealed))
-}
-
-#[wasm_bindgen]
-pub fn build_manifest_transaction(
+pub fn build_private_manifest_transaction(
     entropy_hex: &str,
     account: u32,
+    index: u32,
     url: &str,
     miner_fee_hastings: &str,
+    network: &str,
 ) -> Result<String, JsValue> {
     use sia::hd::HdMnemonic;
     use sia::manifest;
-    use sia::types::Currency;
     use std::str::FromStr;
 
     let entropy =
@@ -5804,17 +5842,203 @@ pub fn build_manifest_transaction(
         .map_err(|e| JsValue::from_str(&e.to_string()))?;
     let master = mnemonic.to_extended_key("");
 
-    let (key, address) = manifest::derive_manifest(&master, account)
+    let (enc_key, signing_key) = manifest::derive_manifest(&master, account, index)
         .map_err(|e| JsValue::from_str(&e.to_string()))?;
-
-    let sealed = manifest::seal_manifest_url(&key, url);
 
     let miner_fee = Currency::from_str(miner_fee_hastings)
         .map_err(|_| JsValue::from_str("invalid miner fee"))?;
+    let cs = manifest_chain_state(network)?;
 
-    let txn = manifest::manifest_pointer_transaction(address, sealed, miner_fee);
+    let txn = manifest::private_manifest_transaction(&signing_key, &enc_key, url, miner_fee, &cs);
 
     serde_json::to_string_pretty(&txn).map_err(|e| JsValue::from_str(&e.to_string()))
+}
+
+/// Build a public manifest attestation transaction.
+///
+/// Uses the wallet key at the given address index as the publisher identity.
+#[wasm_bindgen]
+pub fn build_public_manifest_transaction(
+    entropy_hex: &str,
+    account: u32,
+    address_index: u32,
+    url: &str,
+    miner_fee_hastings: &str,
+    network: &str,
+) -> Result<String, JsValue> {
+    use sia::hd::{ExtendedPrivateKey, HdMnemonic};
+    use sia::manifest;
+    use std::str::FromStr;
+
+    let entropy =
+        hex::decode(entropy_hex).map_err(|e| JsValue::from_str(&e.to_string()))?;
+    let mnemonic = HdMnemonic::from_entropy(&entropy)
+        .map_err(|e| JsValue::from_str(&e.to_string()))?;
+    let seed = mnemonic.to_seed("");
+    let master = ExtendedPrivateKey::from_bip39_seed(&seed);
+    let signing_key = master
+        .derive_path(&format!("m/44'/1991'/{}'/0'/{}'", account, address_index))
+        .map_err(|e| JsValue::from_str(&e.to_string()))?
+        .private_key();
+
+    let miner_fee = Currency::from_str(miner_fee_hastings)
+        .map_err(|_| JsValue::from_str("invalid miner fee"))?;
+    let cs = manifest_chain_state(network)?;
+
+    let txn = manifest::public_manifest_transaction(&signing_key, url, miner_fee, &cs);
+
+    serde_json::to_string_pretty(&txn).map_err(|e| JsValue::from_str(&e.to_string()))
+}
+
+/// Build a channel manifest attestation transaction.
+#[wasm_bindgen]
+pub fn build_channel_manifest_transaction(
+    entropy_hex: &str,
+    account: u32,
+    address_index: u32,
+    channel_name: &str,
+    channel_key_hex: &str,
+    url: &str,
+    miner_fee_hastings: &str,
+    network: &str,
+) -> Result<String, JsValue> {
+    use sia::encryption::EncryptionKey;
+    use sia::hd::{ExtendedPrivateKey, HdMnemonic};
+    use sia::manifest;
+    use std::str::FromStr;
+
+    let entropy =
+        hex::decode(entropy_hex).map_err(|e| JsValue::from_str(&e.to_string()))?;
+    let mnemonic = HdMnemonic::from_entropy(&entropy)
+        .map_err(|e| JsValue::from_str(&e.to_string()))?;
+    let seed = mnemonic.to_seed("");
+    let master = ExtendedPrivateKey::from_bip39_seed(&seed);
+    let signing_key = master
+        .derive_path(&format!("m/44'/1991'/{}'/0'/{}'", account, address_index))
+        .map_err(|e| JsValue::from_str(&e.to_string()))?
+        .private_key();
+
+    let channel_key_bytes: [u8; 32] = hex::decode(channel_key_hex)
+        .map_err(|e| JsValue::from_str(&e.to_string()))?
+        .try_into()
+        .map_err(|_| JsValue::from_str("channel key must be 32 bytes"))?;
+    let channel_key = EncryptionKey::from(channel_key_bytes);
+
+    let miner_fee = Currency::from_str(miner_fee_hastings)
+        .map_err(|_| JsValue::from_str("invalid miner fee"))?;
+    let cs = manifest_chain_state(network)?;
+
+    let txn = manifest::channel_manifest_transaction(
+        &signing_key, channel_name, &channel_key, url, miner_fee, &cs,
+    );
+
+    serde_json::to_string_pretty(&txn).map_err(|e| JsValue::from_str(&e.to_string()))
+}
+
+/// Build a group manifest attestation transaction.
+#[wasm_bindgen]
+pub fn build_group_manifest_transaction(
+    entropy_hex: &str,
+    account: u32,
+    address_index: u32,
+    group_secret_hex: &str,
+    url: &str,
+    miner_fee_hastings: &str,
+    network: &str,
+) -> Result<String, JsValue> {
+    use sia::encryption::EncryptionKey;
+    use sia::hd::{ExtendedPrivateKey, HdMnemonic};
+    use sia::manifest;
+    use std::str::FromStr;
+
+    let entropy =
+        hex::decode(entropy_hex).map_err(|e| JsValue::from_str(&e.to_string()))?;
+    let mnemonic = HdMnemonic::from_entropy(&entropy)
+        .map_err(|e| JsValue::from_str(&e.to_string()))?;
+    let seed = mnemonic.to_seed("");
+    let master = ExtendedPrivateKey::from_bip39_seed(&seed);
+    let signing_key = master
+        .derive_path(&format!("m/44'/1991'/{}'/0'/{}'", account, address_index))
+        .map_err(|e| JsValue::from_str(&e.to_string()))?
+        .private_key();
+
+    let group_bytes: [u8; 32] = hex::decode(group_secret_hex)
+        .map_err(|e| JsValue::from_str(&e.to_string()))?
+        .try_into()
+        .map_err(|_| JsValue::from_str("group secret must be 32 bytes"))?;
+    let group_secret = EncryptionKey::from(group_bytes);
+
+    let miner_fee = Currency::from_str(miner_fee_hastings)
+        .map_err(|_| JsValue::from_str("invalid miner fee"))?;
+    let cs = manifest_chain_state(network)?;
+
+    let txn = manifest::group_manifest_transaction(
+        &signing_key, &group_secret, url, miner_fee, &cs,
+    );
+
+    serde_json::to_string_pretty(&txn).map_err(|e| JsValue::from_str(&e.to_string()))
+}
+
+/// Decrypt a private manifest attestation value.
+///
+/// Returns the URL string, or an error if decryption fails.
+#[wasm_bindgen]
+pub fn open_private_manifest(entropy_hex: &str, account: u32, index: u32, value_hex: &str) -> Result<String, JsValue> {
+    use sia::hd::HdMnemonic;
+    use sia::manifest;
+
+    let entropy =
+        hex::decode(entropy_hex).map_err(|e| JsValue::from_str(&e.to_string()))?;
+    let mnemonic = HdMnemonic::from_entropy(&entropy)
+        .map_err(|e| JsValue::from_str(&e.to_string()))?;
+    let master = mnemonic.to_extended_key("");
+
+    let (enc_key, _) = manifest::derive_manifest(&master, account, index)
+        .map_err(|e| JsValue::from_str(&e.to_string()))?;
+
+    let value = hex::decode(value_hex)
+        .map_err(|e| JsValue::from_str(&e.to_string()))?;
+
+    manifest::open_private_url(&enc_key, &value)
+        .ok_or_else(|| JsValue::from_str("decryption failed"))
+}
+
+/// Decrypt a channel manifest attestation value.
+#[wasm_bindgen]
+pub fn open_channel_manifest(channel_key_hex: &str, value_hex: &str) -> Result<String, JsValue> {
+    use sia::encryption::EncryptionKey;
+    use sia::manifest;
+
+    let key_bytes: [u8; 32] = hex::decode(channel_key_hex)
+        .map_err(|e| JsValue::from_str(&e.to_string()))?
+        .try_into()
+        .map_err(|_| JsValue::from_str("channel key must be 32 bytes"))?;
+    let key = EncryptionKey::from(key_bytes);
+
+    let value = hex::decode(value_hex)
+        .map_err(|e| JsValue::from_str(&e.to_string()))?;
+
+    manifest::open_channel_url(&key, &value)
+        .ok_or_else(|| JsValue::from_str("decryption failed"))
+}
+
+/// Decrypt a group manifest attestation value.
+#[wasm_bindgen]
+pub fn open_group_manifest(group_secret_hex: &str, value_hex: &str) -> Result<String, JsValue> {
+    use sia::encryption::EncryptionKey;
+    use sia::manifest;
+
+    let key_bytes: [u8; 32] = hex::decode(group_secret_hex)
+        .map_err(|e| JsValue::from_str(&e.to_string()))?
+        .try_into()
+        .map_err(|_| JsValue::from_str("group secret must be 32 bytes"))?;
+    let key = EncryptionKey::from(key_bytes);
+
+    let value = hex::decode(value_hex)
+        .map_err(|e| JsValue::from_str(&e.to_string()))?;
+
+    manifest::open_group_url(&key, &value)
+        .ok_or_else(|| JsValue::from_str("decryption failed"))
 }
 
 /// Build, sign, and return a V2 siacoin transaction as JSON.
@@ -5826,6 +6050,7 @@ pub fn build_manifest_transaction(
 /// - `outputs_json`: JSON array of recipients: `[{address, value}]`
 /// - `miner_fee_hastings`: miner fee in hastings (decimal string)
 /// - `change_address`: address for change output (76-char hex); ignored if no change
+/// - `attestations_json`: optional JSON array of pre-signed attestations to include
 #[wasm_bindgen]
 pub fn build_v2_transaction(
     entropy_hex: &str,
@@ -5834,6 +6059,7 @@ pub fn build_v2_transaction(
     outputs_json: &str,
     miner_fee_hastings: &str,
     change_address: &str,
+    attestations_json: Option<String>,
 ) -> Result<String, JsValue> {
     use sia::hd::{ExtendedPrivateKey, HdMnemonic};
     use sia::transaction_builder::V2TransactionBuilder;
@@ -5966,6 +6192,13 @@ pub fn build_v2_transaction(
             value: change,
             address: change_addr,
         });
+    }
+
+    // Add pre-signed attestations before signing inputs (input sigs cover attestations)
+    if let Some(ref att_json) = attestations_json {
+        let attestations: Vec<v2::Attestation> = serde_json::from_str(att_json)
+            .map_err(|e| JsValue::from_str(&format!("invalid attestations JSON: {}", e)))?;
+        builder.attestations(attestations);
     }
 
     let key_refs: Vec<&sia::signing::PrivateKey> = signing_keys.iter().collect();
@@ -7663,12 +7896,20 @@ pub async fn listen_for_relays(
                             ));
                         }
                         let miner_fee: u128 = *txn.miner_fee;
+                        let attestations_str = if txn.attestations.is_empty() {
+                            String::new()
+                        } else {
+                            let att_json = serde_json::to_string(&txn.attestations)
+                                .unwrap_or_else(|_| "[]".to_string());
+                            format!(",\"attestations\":{}", att_json)
+                        };
                         txns_json.push(format!(
-                            "{{\"id\":\"{}\",\"inputs\":[{}],\"outputs\":[{}],\"minerFee\":\"{}\"}}",
+                            "{{\"id\":\"{}\",\"inputs\":[{}],\"outputs\":[{}],\"minerFee\":\"{}\"{}}}",
                             txid,
                             inputs_json.join(","),
                             outputs_json.join(","),
                             miner_fee,
+                            attestations_str,
                         ));
                     }
                     emit(

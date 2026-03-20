@@ -100,6 +100,38 @@ pub enum SealedObjectError {
     InvalidSignature,
 }
 
+/// A minimal representation of a slab for pinning an object. Contains the
+/// slab's digest (ID) and its offset/length within the object, but not the
+/// full slab data (encryption key, sectors, etc.).
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ObjectSlab {
+    pub id: Hash256,
+    pub offset: u32,
+    pub length: u32,
+}
+
+/// The minimal request body for `POST /objects`. Uses slab digests instead of
+/// full slab data, since the slabs have already been pinned via `POST /slabs`.
+#[serde_as]
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PinObjectRequest {
+    pub id: Hash256,
+    #[serde_as(as = "Base64")]
+    pub encrypted_data_key: Vec<u8>,
+    pub slabs: Vec<ObjectSlab>,
+    pub data_signature: Signature,
+
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    #[serde_as(as = "DefaultOnNull<Base64>")]
+    pub encrypted_metadata_key: Vec<u8>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    #[serde_as(as = "DefaultOnNull<Base64>")]
+    pub encrypted_metadata: Vec<u8>,
+    pub metadata_signature: Signature,
+}
+
 #[serde_as]
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq)]
 #[serde(rename_all = "camelCase")]
@@ -190,6 +222,38 @@ impl SealedObject {
 
     pub fn id(&self) -> Hash256 {
         object_id(&self.slabs)
+    }
+
+    /// Converts to a `PinObjectRequest` for the `POST /objects` endpoint.
+    pub fn pin_request(&self) -> PinObjectRequest {
+        let object_slabs: Vec<ObjectSlab> = self
+            .slabs
+            .iter()
+            .map(|s| ObjectSlab {
+                id: s.digest(),
+                offset: s.offset,
+                length: s.length,
+            })
+            .collect();
+        let id = {
+            let mut state = Blake2b256::default();
+            for os in &object_slabs {
+                os.id.encode(&mut state).unwrap();
+                ((os.offset as u64) << 32 | os.length as u64)
+                    .encode(&mut state)
+                    .unwrap();
+            }
+            state.finalize().into()
+        };
+        PinObjectRequest {
+            id,
+            encrypted_data_key: self.encrypted_data_key.clone(),
+            slabs: object_slabs,
+            data_signature: self.data_signature.clone(),
+            encrypted_metadata_key: self.encrypted_metadata_key.clone(),
+            encrypted_metadata: self.encrypted_metadata.clone(),
+            metadata_signature: self.metadata_signature.clone(),
+        }
     }
 
     pub fn open(self, app_key: &PrivateKey) -> Result<Object, SealedObjectError> {

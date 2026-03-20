@@ -1199,15 +1199,10 @@ impl SDK {
     }
 
     /// Retrieves a shared object from a signed share URL.
-    /// Accepts both `https://` and `sia://` schemes.
+    /// Accepts `sia://` scheme URLs.
     #[wasm_bindgen(js_name = "sharedObject")]
     pub async fn shared_object(&self, share_url: &str) -> Result<PinnedObject, JsError> {
-        let url = if share_url.starts_with("sia://") {
-            format!("https://{}", &share_url[6..])
-        } else {
-            share_url.to_string()
-        };
-        let obj = self.inner.shared_object(url).await.map_err(to_js_err)?;
+        let obj = self.inner.shared_object(share_url).await.map_err(to_js_err)?;
         Ok(PinnedObject {
             inner: Arc::new(Mutex::new(obj)),
         })
