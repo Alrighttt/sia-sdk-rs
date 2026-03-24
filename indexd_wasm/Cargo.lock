@@ -1018,6 +1018,7 @@ dependencies = [
  "blake2",
  "blake2b_simd",
  "bytes",
+ "chacha20 0.10.0",
  "chacha20poly1305",
  "chrono",
  "getrandom 0.2.17",
@@ -1048,6 +1049,7 @@ dependencies = [
 name = "indexd_wasm"
 version = "0.2.0"
 dependencies = [
+ "bytes",
  "console_error_panic_hook",
  "console_log",
  "getrandom 0.2.17",

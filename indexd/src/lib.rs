@@ -232,6 +232,23 @@ impl SDK {
             .await
     }
 
+    /// Uploads pre-encoded, pre-encrypted shards. Use with `encode_slab()` for
+    /// the compute-worker architecture where encoding happens in Web Workers
+    /// and uploading happens on the main thread.
+    pub async fn upload_encoded_shards(
+        &self,
+        shards: Vec<Vec<u8>>,
+        slab_key: EncryptionKey,
+        data_length: u32,
+        stream_offset: u32,
+        min_shards: u8,
+        options: UploadOptions,
+    ) -> Result<Slab, UploadError> {
+        self.uploader
+            .upload_encoded_shards(shards, slab_key, data_length, stream_offset, min_shards, options)
+            .await
+    }
+
     /// Creates a new packed upload. This allows multiple objects to be packed together
     /// for more efficient uploads. The returned `PackedUpload` can be used to add objects to the upload, and then finalized to get the resulting objects.
     ///

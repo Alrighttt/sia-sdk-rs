@@ -1,112 +1,72 @@
-/// JavaScript-backed chunked reader for streaming large file uploads in WASM
+/// JavaScript-backed chunked reader for streaming large file uploads in WASM.
 ///
-/// This module provides a bridge between JavaScript's File API and Rust's AsyncRead trait,
-/// allowing large files to be uploaded without loading the entire file into WASM memory.
-use std::collections::VecDeque;
+/// Uses a tokio mpsc channel as the bridge between JavaScript's File API and
+/// Rust's AsyncRead trait. JavaScript sends chunks via the channel sender,
+/// and the upload pipeline reads from the receiver via AsyncRead.
+use bytes::Bytes;
 use std::io;
 use std::pin::Pin;
-use std::sync::{Arc, Mutex};
-use std::task::{Context, Poll, Waker};
+use std::task::{Context, Poll};
 use tokio::io::AsyncRead;
+use tokio::sync::mpsc;
 
-/// State shared between the reader and the WASM binding layer
-pub struct ReaderState {
-    /// Queue of data chunks received from JavaScript
-    pub chunks: VecDeque<Vec<u8>>,
-    /// Current chunk being read
-    pub(crate) current_chunk: Option<Vec<u8>>,
-    /// Current read position within the current chunk
-    pub(crate) position: usize,
-    /// Whether EOF has been reached
-    pub eof: bool,
-    /// Waker to notify when new data arrives (for the upload pipeline)
-    pub waker: Option<Waker>,
-    /// Error from JavaScript side
-    pub error: Option<String>,
-}
-
-/// A reader that receives chunks from JavaScript on-demand
+/// A reader that receives chunks from JavaScript via a tokio mpsc channel.
 pub struct JsChunkedReader {
-    /// Shared state for this reader
-    state: Arc<Mutex<ReaderState>>,
+    rx: mpsc::Receiver<Bytes>,
+    /// Remaining bytes from a partially-read chunk
+    current: Option<Bytes>,
 }
 
 impl JsChunkedReader {
-    pub fn new() -> Self {
-        Self {
-            state: Arc::new(Mutex::new(ReaderState {
-                chunks: VecDeque::new(),
-                current_chunk: None,
-                position: 0,
-                eof: false,
-                waker: None,
-                error: None,
-            })),
-        }
-    }
-
-    /// Returns a reference to the reader state for external access
-    pub fn state(&self) -> &Arc<Mutex<ReaderState>> {
-        &self.state
+    /// Creates a new reader and returns it along with the sender.
+    /// JavaScript pushes `Bytes` into the sender; call `drop(tx)` or
+    /// let it go out of scope to signal EOF.
+    pub fn new(buffer: usize) -> (Self, mpsc::Sender<Bytes>) {
+        let (tx, rx) = mpsc::channel(buffer);
+        (
+            Self {
+                rx,
+                current: None,
+            },
+            tx,
+        )
     }
 }
 
 impl AsyncRead for JsChunkedReader {
     fn poll_read(
-        self: Pin<&mut Self>,
+        mut self: Pin<&mut Self>,
         cx: &mut Context<'_>,
         buf: &mut tokio::io::ReadBuf<'_>,
     ) -> Poll<io::Result<()>> {
-        let mut state = self
-            .state
-            .lock()
-            .expect("WASM is single-threaded; mutex cannot be poisoned");
-
-        // Check for error first
-        if let Some(error) = &state.error {
-            return Poll::Ready(Err(io::Error::new(io::ErrorKind::Other, error.clone())));
-        }
-
         loop {
-            // Try to read from current chunk if available
-            if state.current_chunk.is_some() {
-                let chunk = state.current_chunk.as_ref().unwrap();
-                let chunk_len = chunk.len();
-                let available = chunk_len - state.position;
+            // Drain the current chunk first
+            if let Some(ref mut chunk) = self.current {
+                let to_read = chunk.len().min(buf.remaining());
+                buf.put_slice(&chunk[..to_read]);
+                *chunk = chunk.slice(to_read..);
+                if chunk.is_empty() {
+                    self.current = None;
+                }
+                return Poll::Ready(Ok(()));
+            }
 
-                if available > 0 {
-                    let to_read = available.min(buf.remaining());
-                    let start = state.position;
-                    let end = start + to_read;
-
-                    buf.put_slice(&chunk[start..end]);
-                    let _ = chunk; // release immutable borrow
-                    state.position = end;
-
-                    if state.position >= chunk_len {
-                        state.current_chunk = None;
-                        state.position = 0;
+            // Try to receive the next chunk
+            match self.rx.poll_recv(cx) {
+                Poll::Ready(Some(chunk)) => {
+                    if chunk.is_empty() {
+                        continue;
                     }
-
+                    self.current = Some(chunk);
+                    continue;
+                }
+                Poll::Ready(None) => {
+                    // Channel closed = EOF
                     return Poll::Ready(Ok(()));
                 }
-            }
-
-            // Current chunk is exhausted or doesn't exist, try to get the next one
-            if let Some(next_chunk) = state.chunks.pop_front() {
-                state.current_chunk = Some(next_chunk);
-                state.position = 0;
-                continue;
-            }
-
-            // No chunks available
-            if state.eof {
-                // No more data and EOF reached
-                return Poll::Ready(Ok(()));
-            } else {
-                // No data available yet, register waker and wait
-                state.waker = Some(cx.waker().clone());
-                return Poll::Pending;
+                Poll::Pending => {
+                    return Poll::Pending;
+                }
             }
         }
     }

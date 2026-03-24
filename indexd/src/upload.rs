@@ -65,6 +65,13 @@ pub enum UploadError {
     Cancelled,
 }
 
+/// Sent when a shard upload completes successfully.
+pub struct ShardComplete {
+    pub host_key: PublicKey,
+    pub elapsed: Duration,
+    pub bytes: usize,
+}
+
 pub struct UploadOptions {
     pub data_shards: u8,
     pub parity_shards: u8,
@@ -73,6 +80,14 @@ pub struct UploadOptions {
     /// Optional channel to notify when each shard is uploaded.
     /// This can be used to implement progress reporting.
     pub shard_uploaded: Option<mpsc::UnboundedSender<()>>,
+
+    /// Optional channel to notify when a host is actively being uploaded to.
+    /// Sends the full Host metadata each time a shard upload starts.
+    pub host_active: Option<mpsc::UnboundedSender<sia::rhp::Host>>,
+
+    /// Optional channel to notify when a shard upload completes.
+    /// Carries the host key, elapsed time, and bytes uploaded for bandwidth calculation.
+    pub shard_complete: Option<mpsc::UnboundedSender<ShardComplete>>,
 }
 
 impl Default for UploadOptions {
@@ -85,6 +100,8 @@ impl Default for UploadOptions {
             #[cfg(not(target_arch = "wasm32"))]
             max_inflight: 16,
             shard_uploaded: None,
+            host_active: None,
+            shard_complete: None,
         }
     }
 }
@@ -207,6 +224,18 @@ impl Uploader {
         }
     }
 
+    fn notify_host_active(
+        hosts: &Hosts,
+        host_active: &Option<mpsc::UnboundedSender<sia::rhp::Host>>,
+        host_key: &PublicKey,
+    ) {
+        if let Some(tx) = host_active {
+            if let Some(host) = hosts.host(host_key) {
+                let _ = tx.send(host);
+            }
+        }
+    }
+
     async fn upload_shard(
         transport: Arc<dyn RHP4Client>,
         hosts: HostQueue,
@@ -214,6 +243,7 @@ impl Uploader {
         account_key: Arc<PrivateKey>,
         data: Bytes,
         write_timeout: Duration,
+        shard_complete_tx: Option<mpsc::UnboundedSender<ShardComplete>>,
     ) -> Result<Sector, UploadError> {
         debug!("upload_shard: START host={host_key} timeout={write_timeout:?}");
         let now = Instant::now();
@@ -259,10 +289,15 @@ impl Uploader {
                 )));
             }
         };
-        debug!(
-            "upload_shard: SUCCESS host={host_key} elapsed={:?}",
-            now.elapsed()
-        );
+        let elapsed = now.elapsed();
+        debug!("upload_shard: SUCCESS host={host_key} elapsed={elapsed:?}");
+        if let Some(tx) = shard_complete_tx {
+            let _ = tx.send(ShardComplete {
+                host_key,
+                elapsed,
+                bytes: rhp::SECTOR_SIZE,
+            });
+        }
         Ok(Sector { root, host_key })
     }
 
@@ -275,11 +310,14 @@ impl Uploader {
         permit: OwnedSemaphorePermit,
         transport: Arc<dyn RHP4Client>,
         hosts: HostQueue,
+        all_hosts: Hosts,
         account_key: Arc<PrivateKey>,
         data: Bytes,
         slab_index: usize,
         shard_index: usize,
         progress_tx: Option<mpsc::UnboundedSender<()>>,
+        host_active_tx: Option<mpsc::UnboundedSender<sia::rhp::Host>>,
+        shard_complete_tx: Option<mpsc::UnboundedSender<ShardComplete>>,
         initial_host: (PublicKey, usize),
     ) -> Result<(usize, Sector), UploadError> {
         let (host_key, attempts) = initial_host;
@@ -289,6 +327,7 @@ impl Uploader {
             "upload_slab_shard: slab {slab_index} shard {shard_index} START host={host_key} queue_remaining={}",
             hosts.len()
         );
+        Self::notify_host_active(&all_hosts, &host_active_tx, &host_key);
         join_set_spawn!(
             tasks,
             Self::upload_shard(
@@ -298,6 +337,7 @@ impl Uploader {
                 account_key.clone(),
                 data.clone(),
                 write_timeout,
+                shard_complete_tx.clone(),
             )
         );
         let semaphore = permit.semaphore();
@@ -336,8 +376,9 @@ impl Uploader {
                                 };
                                 let (host_key, attempts) = next_host;
                                 debug!("upload_slab_shard: slab {slab_index} shard {shard_index} RETRY host={host_key} attempt={attempts} queue_remaining={}", hosts.len());
+                                Self::notify_host_active(&all_hosts, &host_active_tx, &host_key);
                                 write_timeout = Self::upload_timeout(attempts);
-                                join_set_spawn!(tasks, Self::upload_shard(transport.clone(), hosts.clone(), host_key, account_key.clone(), data.clone(), write_timeout));
+                                join_set_spawn!(tasks, Self::upload_shard(transport.clone(), hosts.clone(), host_key, account_key.clone(), data.clone(), write_timeout, shard_complete_tx.clone()));
                             }
                         }
                     }
@@ -348,6 +389,9 @@ impl Uploader {
                         let transport = transport.clone();
                         let data = data.clone();
                         let account_key = account_key.clone();
+                        let race_all_hosts = all_hosts.clone();
+                        let race_host_active_tx = host_active_tx.clone();
+                        let race_shard_complete_tx = shard_complete_tx.clone();
                         join_set_spawn!(tasks, async move {
                             let _racer = racer; // hold the permit until the task completes
                             let next_host = match hosts.pop_front() {
@@ -359,8 +403,9 @@ impl Uploader {
                             };
                             let (host_key, attempts) = next_host;
                             debug!("upload_slab_shard: slab {slab_index} shard {shard_index} RACE host={host_key} attempt={attempts} queue_remaining={}", hosts.len());
+                            Self::notify_host_active(&race_all_hosts, &race_host_active_tx, &host_key);
                             let write_timeout = Self::upload_timeout(attempts);
-                            Self::upload_shard(transport.clone(), hosts, host_key, account_key, data, write_timeout).await
+                            Self::upload_shard(transport.clone(), hosts, host_key, account_key, data, write_timeout, race_shard_complete_tx).await
                         });
                     }
                 }
@@ -435,6 +480,8 @@ impl Uploader {
             let hosts = hosts.clone();
             let transport = transport.clone();
             let progress_tx = options.shard_uploaded.clone();
+            let host_active_tx = options.host_active.clone();
+            let shard_complete_tx = options.shard_complete.clone();
             let rs = rs.clone();
             let shard_sema = shard_sema.clone();
 
@@ -483,6 +530,9 @@ impl Uploader {
                     let transport = transport.clone();
                     let host_queue = host_queue.clone();
                     let progress_tx = progress_tx.clone();
+                    let host_active_tx = host_active_tx.clone();
+                    let shard_complete_tx = shard_complete_tx.clone();
+                    let shard_hosts = hosts.clone();
                     let initial_host = reserved_hosts[shard_index];
                     // spawn a task to encrypt and upload each shard for this slab.
                     join_set_spawn!(shard_upload_tasks, async move {
@@ -499,11 +549,14 @@ impl Uploader {
                             permit,
                             transport,
                             host_queue,
+                            shard_hosts,
                             app_key,
                             shard.into(),
                             slab_index,
                             shard_index,
                             progress_tx,
+                            host_active_tx,
+                            shard_complete_tx,
                             initial_host,
                         )
                         .await
@@ -666,4 +719,154 @@ impl Uploader {
             }),
         }
     }
+
+    /// Uploads pre-encoded, pre-encrypted shards to hosts. Handles host
+    /// selection, retry, and racing. Returns the resulting Slab metadata.
+    pub async fn upload_encoded_shards(
+        &self,
+        shards: Vec<Vec<u8>>,
+        slab_key: EncryptionKey,
+        data_length: u32,
+        stream_offset: u32,
+        min_shards: u8,
+        options: UploadOptions,
+    ) -> Result<Slab, UploadError> {
+        let total_shards = shards.len();
+        if total_shards == 0 {
+            return Err(UploadError::InvalidOptions("no shards provided".into()));
+        }
+        let hosts = self.hosts.clone();
+        if hosts.available_for_upload() < total_shards {
+            return Err(QueueError::InsufficientHosts.into());
+        }
+
+        let shard_sema = Arc::new(Semaphore::new(options.max_inflight));
+        let host_queue = hosts.upload_queue();
+        let reserved_hosts = host_queue.pop_n(total_shards)?;
+        let app_key = self.app_key.clone();
+        let transport = self.transport.clone();
+        let progress_tx = options.shard_uploaded;
+        let host_active_tx = options.host_active;
+        let shard_complete_tx = options.shard_complete;
+
+        let mut shard_upload_tasks = JoinSet::new();
+        for (shard_index, shard) in shards.into_iter().enumerate() {
+            let permit = shard_sema.clone().acquire_owned().await?;
+            let transport = transport.clone();
+            let host_queue = host_queue.clone();
+            let app_key = app_key.clone();
+            let progress_tx = progress_tx.clone();
+            let host_active_tx = host_active_tx.clone();
+            let shard_complete_tx = shard_complete_tx.clone();
+            let shard_hosts = hosts.clone();
+            let initial_host = reserved_hosts[shard_index];
+            join_set_spawn!(shard_upload_tasks, async move {
+                Self::upload_slab_shard(
+                    permit,
+                    transport,
+                    host_queue,
+                    shard_hosts,
+                    app_key,
+                    shard.into(),
+                    0, // slab_index (single slab)
+                    shard_index,
+                    progress_tx,
+                    host_active_tx,
+                    shard_complete_tx,
+                    initial_host,
+                )
+                .await
+            });
+        }
+
+        let mut slab_sectors = vec![None; total_shards];
+        while let Some(res) = shard_upload_tasks.join_next().await {
+            match res {
+                Ok(Ok((shard_index, sector))) => {
+                    slab_sectors[shard_index] = Some(sector);
+                }
+                Ok(Err(e)) => return Err(e),
+                Err(e) => return Err(e.into()),
+            }
+        }
+
+        Ok(Slab {
+            sectors: slab_sectors.into_iter().map(|s| s.unwrap()).collect(),
+            encryption_key: slab_key,
+            min_shards,
+            offset: stream_offset,
+            length: data_length,
+        })
+    }
+}
+
+/// Result of encoding a slab (compute-only, no networking).
+pub struct EncodedSlab {
+    /// Random encryption key used for slab-level encryption.
+    pub slab_key: EncryptionKey,
+    /// Encrypted shards ready for upload (data shards + parity shards).
+    pub shards: Vec<Vec<u8>>,
+    /// Number of bytes of real data in this slab.
+    pub length: u32,
+    /// Number of data shards (minimum needed for reconstruction).
+    pub min_shards: u8,
+}
+
+/// Encode and encrypt a slab without uploading. This is the compute-only
+/// portion of the upload pipeline, suitable for running in a Web Worker.
+///
+/// Applies object-level encryption (XChaCha20 with data_key + stream_offset),
+/// erasure encodes into data+parity shards, then encrypts each shard with a
+/// random per-slab key.
+pub fn encode_slab(
+    data: &[u8],
+    data_key: &EncryptionKey,
+    stream_offset: u64,
+    data_shards: u8,
+    parity_shards: u8,
+) -> Result<EncodedSlab, UploadError> {
+    use chacha20::cipher::{KeyIvInit, StreamCipher, StreamCipherSeek};
+    use chacha20::XChaCha20;
+
+    let total_shards = data_shards as usize + parity_shards as usize;
+    let rs = ErasureCoder::new(data_shards as usize, parity_shards as usize)
+        .map_err(|e| UploadError::InvalidOptions(e.to_string()))?;
+
+    // Apply object-level encryption (XChaCha20 in-place)
+    let mut encrypted = data.to_vec();
+    let nonce = [0u8; 24];
+    let mut cipher = XChaCha20::new(data_key.as_ref().into(), &nonce.into());
+    cipher.seek(stream_offset);
+    cipher.apply_keystream(&mut encrypted);
+
+    // Stripe into data shards
+    let mut shards = vec![vec![0u8; SECTOR_SIZE]; total_shards];
+    let mut offset = 0;
+    let mut length = 0u32;
+    for i in 0..data_shards as usize {
+        let remaining = encrypted.len().saturating_sub(offset);
+        let n = remaining.min(SECTOR_SIZE);
+        if n > 0 {
+            shards[i][..n].copy_from_slice(&encrypted[offset..offset + n]);
+            offset += n;
+            length += n as u32;
+        }
+    }
+
+    // Erasure encode (generates parity shards)
+    rs.encode_shards(&mut shards)
+        .map_err(|e| UploadError::InvalidOptions(e.to_string()))?;
+
+    // Generate random slab key and encrypt each shard
+    let slab_key: EncryptionKey = rand::random::<[u8; 32]>().into();
+    for (i, shard) in shards.iter_mut().enumerate() {
+        encrypt_shard(&slab_key, i as u8, 0, shard);
+    }
+
+    Ok(EncodedSlab {
+        slab_key,
+        shards,
+        length,
+        min_shards: data_shards,
+    })
 }

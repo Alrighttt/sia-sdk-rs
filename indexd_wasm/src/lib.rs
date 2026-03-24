@@ -67,12 +67,16 @@ impl UploadOptions {
     fn into_indexd(
         self,
         tx: Option<tokio::sync::mpsc::UnboundedSender<()>>,
+        host_active: Option<tokio::sync::mpsc::UnboundedSender<sia::rhp::Host>>,
+        shard_complete: Option<tokio::sync::mpsc::UnboundedSender<indexd::ShardComplete>>,
     ) -> indexd::UploadOptions {
         indexd::UploadOptions {
             data_shards: self.data_shards,
             parity_shards: self.parity_shards,
             max_inflight: self.max_inflight,
             shard_uploaded: tx,
+            host_active,
+            shard_complete,
         }
     }
 }
@@ -142,15 +146,15 @@ fn get_chunk_buffers() -> &'static Mutex<HashMap<usize, (Vec<u8>, usize)>> {
     CHUNK_BUFFERS.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
-/// Global storage for streaming readers
-/// Key: reader_id (usize), Value: Arc<Mutex<ReaderState>>
-static STREAMING_READERS: OnceLock<
-    Mutex<HashMap<usize, Arc<Mutex<indexd::js_chunked_reader::ReaderState>>>>,
+/// Global storage for streaming upload senders.
+/// Key: reader_id (usize), Value: Sender<Bytes>
+static STREAMING_SENDERS: OnceLock<
+    Mutex<HashMap<usize, tokio::sync::mpsc::Sender<bytes::Bytes>>>,
 > = OnceLock::new();
 
-fn get_streaming_readers()
--> &'static Mutex<HashMap<usize, Arc<Mutex<indexd::js_chunked_reader::ReaderState>>>> {
-    STREAMING_READERS.get_or_init(|| Mutex::new(HashMap::new()))
+fn get_streaming_senders()
+-> &'static Mutex<HashMap<usize, tokio::sync::mpsc::Sender<bytes::Bytes>>> {
+    STREAMING_SENDERS.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
 /// Install a panic hook and logging bridge so that Rust panics show a proper
@@ -218,9 +222,9 @@ impl StreamingUpload {
     /// Pushes a chunk of data to the upload.
     /// Pass data as Uint8Array. Call with `null` or `undefined` to signal EOF.
     ///
-    /// **Backpressure**: This method applies backpressure to prevent memory exhaustion.
-    /// It returns a Promise that resolves when the chunk has been queued.
-    /// If the queue is full, it waits until space becomes available.
+    /// **Backpressure**: The underlying channel has a bounded buffer. This method
+    /// returns a Promise that resolves when the chunk has been accepted. If the
+    /// buffer is full, the Promise awaits until space is available.
     ///
     /// **IMPORTANT**: JavaScript MUST await this Promise before pushing the next chunk:
     /// ```javascript
@@ -231,59 +235,23 @@ impl StreamingUpload {
         let reader_id = self.reader_id;
 
         wasm_bindgen_futures::future_to_promise(async move {
-            let readers = get_streaming_readers().lock().map_err(to_js_err)?;
-            let state = readers
-                .get(&reader_id)
-                .ok_or_else(|| JsError::new("Invalid reader ID or upload already finalized"))?
-                .clone();
-            drop(readers); // Release the global lock
-
             match chunk {
                 Some(data) => {
-                    // Wait for space if queue is full (backpressure)
-                    loop {
-                        {
-                            let mut reader_state = state.lock().map_err(to_js_err)?;
+                    let senders = get_streaming_senders().lock().map_err(to_js_err)?;
+                    let tx = senders
+                        .get(&reader_id)
+                        .ok_or_else(|| JsError::new("Invalid reader ID or upload already finalized"))?
+                        .clone();
+                    drop(senders);
 
-                            // Maximum 3 chunks queued = ~384 MB overhead (3 × 128 MB)
-                            if reader_state.chunks.len() < 3 {
-                                // Space available, push the chunk
-                                reader_state.chunks.push_back(data);
-
-                                // Wake the reader if it's waiting
-                                if let Some(waker) = reader_state.waker.take() {
-                                    waker.wake();
-                                }
-                                break;
-                            }
-                            // Queue is full, release lock and wait
-                        }
-
-                        // Wait 50ms for space to become available
-                        let promise = js_sys::Promise::new(&mut |resolve, _reject| {
-                            let global = js_sys::global();
-                            let set_timeout: js_sys::Function =
-                                js_sys::Reflect::get(&global, &"setTimeout".into())
-                                    .unwrap()
-                                    .into();
-                            let _ = set_timeout.call2(
-                                &wasm_bindgen::JsValue::NULL,
-                                &resolve,
-                                &wasm_bindgen::JsValue::from_f64(50.0),
-                            );
-                        });
-                        let _ = wasm_bindgen_futures::JsFuture::from(promise).await;
-                    }
+                    tx.send(bytes::Bytes::from(data))
+                        .await
+                        .map_err(|_| JsError::new("Upload channel closed"))?;
                 }
                 None => {
-                    // Signal EOF - no backpressure needed
-                    let mut reader_state = state.lock().map_err(to_js_err)?;
-                    reader_state.eof = true;
-
-                    // Wake the reader if it's waiting
-                    if let Some(waker) = reader_state.waker.take() {
-                        waker.wake();
-                    }
+                    // Signal EOF by dropping the sender
+                    let mut senders = get_streaming_senders().lock().map_err(to_js_err)?;
+                    senders.remove(&reader_id);
                 }
             }
 
@@ -467,7 +435,7 @@ impl SDK {
         let total_shards = (num_slabs as u32) * options.total_shards_per_slab();
 
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
-        let options = options.into_indexd(Some(tx));
+        let options = options.into_indexd(Some(tx), None, None);
 
         let rt = tokio::runtime::Builder::new_current_thread()
             .build()
@@ -553,6 +521,7 @@ impl SDK {
         options: DownloadOptions,
         on_chunk: &js_sys::Function,
         on_progress: &js_sys::Function,
+        on_host_active: Option<js_sys::Function>,
     ) -> Result<(), JsError> {
         /// Custom AsyncWrite that calls JS callback with each chunk
         struct ChunkWriter {
@@ -594,7 +563,9 @@ impl SDK {
         let total_bytes = obj.size() as f64;
 
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
-        let options = options.into_indexd(Some(tx), None);
+        let (htx, mut hrx) = tokio::sync::mpsc::unbounded_channel::<sia::rhp::Host>();
+        let host_tx = if on_host_active.is_some() { Some(htx) } else { None };
+        let options = options.into_indexd(Some(tx), host_tx);
 
         let mut writer = ChunkWriter {
             callback: on_chunk.clone(),
@@ -614,6 +585,14 @@ impl SDK {
                         );
                     }
                 });
+                if let Some(cb) = on_host_active {
+                    tokio::task::spawn_local(async move {
+                        while let Some(host) = hrx.recv().await {
+                            let js_host = host_to_js(&host);
+                            let _ = cb.call1(&JsValue::NULL, &js_host);
+                        }
+                    });
+                }
                 self.inner.download(&mut writer, &obj, options).await
             })
             .await
@@ -715,6 +694,7 @@ impl SDK {
         stream_offset: f64,
         options: UploadOptions,
         on_progress: &js_sys::Function,
+        on_host_active: Option<js_sys::Function>,
     ) -> Result<String, JsError> {
         let key = sia::encryption::EncryptionKey::try_from(data_key)
             .map_err(|e| JsError::new(&format!("invalid data key: {e}")))?;
@@ -722,7 +702,9 @@ impl SDK {
         let total_shards = options.total_shards_per_slab();
 
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
-        let options = options.into_indexd(Some(tx));
+        let (htx, mut hrx) = tokio::sync::mpsc::unbounded_channel::<sia::rhp::Host>();
+        let host_tx = if on_host_active.is_some() { Some(htx) } else { None };
+        let options = options.into_indexd(Some(tx), host_tx, None);
 
         let rt = tokio::runtime::Builder::new_current_thread()
             .build()
@@ -744,6 +726,14 @@ impl SDK {
                         );
                     }
                 });
+                if let Some(cb) = on_host_active {
+                    tokio::task::spawn_local(async move {
+                        while let Some(host) = hrx.recv().await {
+                            let js_host = host_to_js(&host);
+                            let _ = cb.call1(&JsValue::NULL, &js_host);
+                        }
+                    });
+                }
                 self.inner
                     .upload_slab_raw(data, &key, stream_offset as u64, options)
                     .await
@@ -874,7 +864,7 @@ impl SDK {
         let total_shards = (num_slabs as u32) * options.total_shards_per_slab();
 
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
-        let options = options.into_indexd(Some(tx));
+        let options = options.into_indexd(Some(tx), None, None);
 
         let rt = tokio::runtime::Builder::new_current_thread()
             .build()
@@ -948,13 +938,13 @@ impl SDK {
         // Generate a unique reader ID
         let reader_id = NEXT_ID.fetch_add(1, Ordering::Relaxed);
 
-        // Create the reader
-        let reader = JsChunkedReader::new();
+        // Create the channel-backed reader (buffer 3 chunks = ~384 MB max)
+        let (reader, tx) = JsChunkedReader::new(3);
 
-        // Register the reader state globally so pushChunk can access it
+        // Register the sender globally so pushChunk can access it
         {
-            let mut readers = get_streaming_readers().lock().map_err(to_js_err)?;
-            readers.insert(reader_id, reader.state().clone());
+            let mut senders = get_streaming_senders().lock().map_err(to_js_err)?;
+            senders.insert(reader_id, tx);
         }
 
         // Calculate progress metadata
@@ -968,7 +958,7 @@ impl SDK {
         let total_shards = (num_slabs as u32) * options.total_shards_per_slab();
 
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
-        let options = options.into_indexd(Some(tx));
+        let options = options.into_indexd(Some(tx), None, None);
 
         let on_progress = on_progress.clone();
         let inner = self.inner.clone();
@@ -1002,9 +992,9 @@ impl SDK {
                 .await
                 .map_err(to_js_err)?;
 
-            // Clean up the reader from the global registry
-            let _ = get_streaming_readers().lock().map(|mut readers| {
-                readers.remove(&reader_id);
+            // Clean up the sender from the global registry (may already be removed by EOF)
+            let _ = get_streaming_senders().lock().map(|mut senders| {
+                senders.remove(&reader_id);
             });
 
             let pinned = PinnedObject {
@@ -1207,6 +1197,124 @@ impl SDK {
             inner: Arc::new(Mutex::new(obj)),
         })
     }
+    /// Uploads pre-encoded, pre-encrypted shards to hosts. Use with `encodeSlab()`
+    /// for the compute-worker upload architecture.
+    #[wasm_bindgen(js_name = "uploadEncodedShards")]
+    pub async fn upload_encoded_shards(
+        &self,
+        shards_js: js_sys::Array,
+        slab_key: &[u8],
+        data_length: u32,
+        stream_offset: u32,
+        min_shards: u8,
+        options: UploadOptions,
+        on_progress: Option<js_sys::Function>,
+        on_host_active: Option<js_sys::Function>,
+        on_shard_complete: Option<js_sys::Function>,
+    ) -> Result<String, JsError> {
+        let key = sia::encryption::EncryptionKey::try_from(slab_key)
+            .map_err(|e| JsError::new(&format!("invalid slab key: {e}")))?;
+
+        let mut shards: Vec<Vec<u8>> = Vec::with_capacity(shards_js.length() as usize);
+        for i in 0..shards_js.length() {
+            let val = shards_js.get(i);
+            let arr = js_sys::Uint8Array::new(&val);
+            shards.push(arr.to_vec());
+        }
+        let total_shards = shards.len() as u32;
+
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let (htx, mut hrx) = tokio::sync::mpsc::unbounded_channel::<sia::rhp::Host>();
+        let (sctx, mut scrx) = tokio::sync::mpsc::unbounded_channel::<indexd::ShardComplete>();
+        let host_tx = if on_host_active.is_some() { Some(htx) } else { None };
+        let sc_tx = if on_shard_complete.is_some() { Some(sctx) } else { None };
+        let options = options.into_indexd(Some(tx), host_tx, sc_tx);
+
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .map_err(to_js_err)?;
+        let _guard = rt.enter();
+        let local = tokio::task::LocalSet::new();
+
+        let slab = local
+            .run_until(async {
+                if let Some(on_progress) = on_progress {
+                    tokio::task::spawn_local(async move {
+                        let mut count: u32 = 0;
+                        while rx.recv().await.is_some() {
+                            count += 1;
+                            let _ = on_progress.call2(
+                                &JsValue::NULL,
+                                &JsValue::from(count),
+                                &JsValue::from(total_shards),
+                            );
+                        }
+                    });
+                }
+                if let Some(cb) = on_host_active {
+                    tokio::task::spawn_local(async move {
+                        while let Some(host) = hrx.recv().await {
+                            let js_host = host_to_js(&host);
+                            let _ = cb.call1(&JsValue::NULL, &js_host);
+                        }
+                    });
+                }
+                if let Some(cb) = on_shard_complete {
+                    tokio::task::spawn_local(async move {
+                        while let Some(sc) = scrx.recv().await {
+                            let obj = js_sys::Object::new();
+                            js_sys::Reflect::set(&obj, &"hostKey".into(), &sc.host_key.to_string().into()).unwrap();
+                            js_sys::Reflect::set(&obj, &"elapsedMs".into(), &JsValue::from(sc.elapsed.as_millis() as f64)).unwrap();
+                            js_sys::Reflect::set(&obj, &"bytes".into(), &JsValue::from(sc.bytes as f64)).unwrap();
+                            let _ = cb.call1(&JsValue::NULL, &obj);
+                        }
+                    });
+                }
+                self.inner
+                    .upload_encoded_shards(shards, key, data_length, stream_offset, min_shards, options)
+                    .await
+            })
+            .await
+            .map_err(to_js_err)?;
+
+        serde_json::to_string(&slab).map_err(to_js_err)
+    }
+}
+
+/// Encode and encrypt a slab without uploading. Runs pure computation
+/// (object encryption, erasure coding, slab encryption) with no networking.
+/// Suitable for running in a Web Worker without an SDK instance.
+///
+/// Returns a JSON object: `{ slabKey: base64, shards: [base64, ...], length: u32, minShards: u8 }`
+#[wasm_bindgen(js_name = "encodeSlab")]
+pub fn encode_slab_wasm(
+    data: &[u8],
+    data_key: &[u8],
+    stream_offset: f64,
+    data_shards: u8,
+    parity_shards: u8,
+) -> Result<JsValue, JsError> {
+    let key = sia::encryption::EncryptionKey::try_from(data_key)
+        .map_err(|e| JsError::new(&format!("invalid data key: {e}")))?;
+
+    let result = indexd::encode_slab(data, &key, stream_offset as u64, data_shards, parity_shards)
+        .map_err(to_js_err)?;
+
+    // Return shards as an array of Uint8Array (transferable)
+    let obj = js_sys::Object::new();
+    let slab_key_arr = js_sys::Uint8Array::from(result.slab_key.as_ref() as &[u8]);
+    js_sys::Reflect::set(&obj, &"slabKey".into(), &slab_key_arr).unwrap();
+    js_sys::Reflect::set(&obj, &"length".into(), &JsValue::from(result.length)).unwrap();
+    js_sys::Reflect::set(&obj, &"minShards".into(), &JsValue::from(result.min_shards)).unwrap();
+
+    let shards_arr = js_sys::Array::new_with_length(result.shards.len() as u32);
+    for (i, shard) in result.shards.iter().enumerate() {
+        let arr = js_sys::Uint8Array::from(shard.as_slice());
+        shards_arr.set(i as u32, arr.into());
+    }
+    js_sys::Reflect::set(&obj, &"shards".into(), &shards_arr).unwrap();
+
+    Ok(obj.into())
 }
 
 // ── Builder ─────────────────────────────────────────────────────────────
