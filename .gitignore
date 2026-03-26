@@ -1,6 +1,3 @@
-/target
-indexd_wasm/target
-syncer_wasm/target/
+**/target
 .vscode
 .DS_Store
-sia_sdk/src/test_vectors.json
