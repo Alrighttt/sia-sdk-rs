@@ -42,6 +42,9 @@ pub struct ApprovedState {
 pub struct Builder<S> {
     state: S,
     client: Arc<dyn AppClient>,
+    /// Ephemeral key generated per connection request. Used to sign
+    /// auth/connect, status, and register requests.
+    ephemeral_key: PrivateKey,
 }
 
 /// Errors that can occur during the SDK building process.
@@ -79,6 +82,7 @@ impl Builder<DisconnectedState> {
         Ok(Self {
             state: DisconnectedState,
             client: Arc::new(client),
+            ephemeral_key: PrivateKey::from_seed(&rand::random()),
         })
     }
 
@@ -123,7 +127,10 @@ impl Builder<DisconnectedState> {
         self,
         app: &RegisterAppRequest,
     ) -> Result<Builder<RequestingApprovalState>, BuilderError> {
-        let resp = self.client.request_app_connection(app).await?;
+        let resp = self
+            .client
+            .request_app_connection(&self.ephemeral_key, app)
+            .await?;
         self.with_connection_response(app.app_id, resp)
     }
 
@@ -144,6 +151,7 @@ impl Builder<DisconnectedState> {
                 expiration: response.expiration,
             },
             client: self.client,
+            ephemeral_key: self.ephemeral_key,
         })
     }
 }
@@ -170,7 +178,7 @@ impl Builder<RequestingApprovalState> {
 
             if let Some(user_secret) = self
                 .client
-                .check_request_status(self.state.status_url.clone())
+                .check_request_status(&self.ephemeral_key, self.state.status_url.clone())
                 .await?
             {
                 return Ok(Builder {
@@ -180,6 +188,7 @@ impl Builder<RequestingApprovalState> {
                         user_secret,
                     },
                     client: self.client,
+                    ephemeral_key: self.ephemeral_key,
                 });
             }
             sleep(Duration::from_secs(5)).await;
@@ -204,7 +213,7 @@ impl Builder<ApprovedState> {
     ) -> Result<SDK, BuilderError> {
         let app_key = derive_app_key(mnemonic, &self.state.app_id, &self.state.user_secret)?;
         self.client
-            .register_app(&app_key, self.state.register_url.clone())
+            .register_app(&self.ephemeral_key, &app_key, self.state.register_url.clone())
             .await?;
         SDK::new(self.client, Arc::new(app_key), tls_config).await
     }
@@ -213,7 +222,6 @@ impl Builder<ApprovedState> {
     ///
     /// # Arguments
     /// * `mnemonic` - The user's mnemonic phrase used to derive the application key.
-    /// * `tls_config` - The TLS configuration for secure communication.
     ///
     /// # Errors
     /// Returns [BuilderError] if the registration fails or the SDK cannot be created.
@@ -221,7 +229,7 @@ impl Builder<ApprovedState> {
     pub async fn register(self, mnemonic: &str) -> Result<SDK, BuilderError> {
         let app_key = derive_app_key(mnemonic, &self.state.app_id, &self.state.user_secret)?;
         self.client
-            .register_app(&app_key, self.state.register_url.clone())
+            .register_app(&self.ephemeral_key, &app_key, self.state.register_url.clone())
             .await?;
         SDK::new(self.client, Arc::new(app_key)).await
     }

@@ -12,7 +12,6 @@ use serde_with::serde_as;
 use sia::blake2::Blake2b256;
 use sia::encryption::EncryptionKey;
 use sia::rhp::Host;
-
 use thiserror::Error;
 
 use serde::de::DeserializeOwned;
@@ -22,7 +21,7 @@ use serde::{Deserialize, Serialize};
 use crate::object_encryption::DecryptError;
 use crate::slabs::Sector;
 use crate::{Object, PinnedSlab, SealedObject, Slab};
-use sia::signing::{PrivateKey, PublicKey};
+use sia::signing::{PrivateKey, PublicKey, Signature};
 use sia::types::Hash256;
 use sia::types::v2::Protocol;
 
@@ -101,6 +100,29 @@ pub struct RegisterAppResponse {
     #[serde(rename = "registerURL")]
     pub register_url: String,
     pub expiration: DateTime<Utc>,
+}
+
+/// Request body for registering an app key with the indexer.
+/// The signature proves that the app key holder authorized the
+/// ephemeral key to register on their behalf.
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct RegisterAppKeyRequest {
+    app_key: PublicKey,
+    signature: Signature,
+}
+
+/// Computes the hash signed by the app key when registering.
+/// Matches the Go `registerAppKeyHash` function.
+fn register_app_key_hash(ephemeral_pubkey: &PublicKey, request_id: &str) -> Hash256 {
+    let mut buf = Vec::new();
+    buf.extend_from_slice(b"registerAppKey");
+    buf.extend_from_slice(ephemeral_pubkey.as_ref());
+    buf.extend_from_slice(request_id.as_bytes());
+    let digest = blake2b_simd::Params::new().hash_length(32).hash(&buf);
+    let mut h = [0u8; 32];
+    h.copy_from_slice(digest.as_bytes());
+    Hash256::new(h)
 }
 
 #[derive(Debug, Clone, Serialize, PartialEq)]
@@ -351,12 +373,22 @@ pub trait AppClient: Send + Sync {
 
     async fn request_app_connection(
         &self,
+        ephemeral_key: &PrivateKey,
         opts: &RegisterAppRequest,
     ) -> Result<RegisterAppResponse, Error>;
 
-    async fn check_request_status(&self, status_url: Url) -> Result<Option<Hash256>, Error>;
+    async fn check_request_status(
+        &self,
+        ephemeral_key: &PrivateKey,
+        status_url: Url,
+    ) -> Result<Option<Hash256>, Error>;
 
-    async fn register_app(&self, app_key: &PrivateKey, register_url: Url) -> Result<(), Error>;
+    async fn register_app(
+        &self,
+        ephemeral_key: &PrivateKey,
+        app_key: &PrivateKey,
+        register_url: Url,
+    ) -> Result<(), Error>;
 
     async fn hosts(&self, app_key: &PrivateKey, query: HostQuery) -> Result<Vec<Host>, Error>;
 
@@ -450,9 +482,31 @@ impl AppClient for Client {
     /// Requests an application connection to the indexer.
     async fn request_app_connection(
         &self,
+        ephemeral_key: &PrivateKey,
         opts: &RegisterAppRequest,
     ) -> Result<RegisterAppResponse, Error> {
-        self.post_json("auth/connect", None, Some(opts)).await
+        let body = serde_json::to_vec(opts)?;
+        let url = self.url.join("auth/connect")?;
+        let query_params = self.sign(
+            ephemeral_key,
+            &url,
+            Method::POST,
+            Some(&body),
+            Utc::now() + Duration::from_secs(60),
+        );
+        let resp = self
+            .client
+            .post(url)
+            .timeout(Duration::from_secs(15))
+            .query(&query_params)
+            .header("Content-Type", "application/json")
+            .body(body)
+            .send()
+            .await?;
+        match resp.status() {
+            StatusCode::OK => Ok(resp.json().await?),
+            _ => Err(Error::Api(resp.text().await?)),
+        }
     }
 
     /// Checks if an auth request has been approved.
@@ -461,11 +515,23 @@ impl AppClient for Client {
     /// to derive the application key.
     ///
     /// If the auth request is still pending, it returns None.
-    async fn check_request_status(&self, status_url: Url) -> Result<Option<Hash256>, Error> {
+    async fn check_request_status(
+        &self,
+        ephemeral_key: &PrivateKey,
+        status_url: Url,
+    ) -> Result<Option<Hash256>, Error> {
+        let query_params = self.sign(
+            ephemeral_key,
+            &status_url,
+            Method::GET,
+            None,
+            Utc::now() + Duration::from_secs(60),
+        );
         let resp = self
             .client
             .get(status_url)
             .timeout(Duration::from_secs(15))
+            .query(&query_params)
             .send()
             .await?;
         match resp.status() {
@@ -486,12 +552,38 @@ impl AppClient for Client {
     }
 
     /// Registers the application key with the indexer.
-    async fn register_app(&self, app_key: &PrivateKey, register_url: Url) -> Result<(), Error> {
+    /// The URL signature uses the ephemeral key. The body contains the
+    /// app's public key and a signature proving the app key authorized
+    /// this ephemeral key for this request.
+    async fn register_app(
+        &self,
+        ephemeral_key: &PrivateKey,
+        app_key: &PrivateKey,
+        register_url: Url,
+    ) -> Result<(), Error> {
+        // Extract request ID from the register URL path
+        // e.g. /auth/connect/{request_id}/register
+        let path_segments: Vec<&str> = register_url.path().split('/').collect();
+        let request_id = path_segments
+            .iter()
+            .rev()
+            .nth(1) // second-to-last segment
+            .ok_or_else(|| Error::Api("invalid register URL path".into()))?;
+
+        // App key signs a hash binding the ephemeral key to this request
+        let hash = register_app_key_hash(&ephemeral_key.public_key(), request_id);
+        let body = RegisterAppKeyRequest {
+            app_key: app_key.public_key(),
+            signature: app_key.sign(hash.as_ref()),
+        };
+        let body_bytes = serde_json::to_vec(&body)?;
+
+        // Sign the URL with the ephemeral key
         let query_params = self.sign(
-            app_key,
+            ephemeral_key,
             &register_url,
             Method::POST,
-            None,
+            Some(&body_bytes),
             Utc::now() + Duration::from_secs(60),
         );
         let resp = self
@@ -499,6 +591,8 @@ impl AppClient for Client {
             .post(register_url)
             .timeout(Duration::from_secs(15))
             .query(&query_params)
+            .header("Content-Type", "application/json")
+            .body(body_bytes)
             .send()
             .await?;
         match resp.status() {
