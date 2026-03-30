@@ -51,6 +51,28 @@ fn prefixed_key(key: &str) -> String {
     })
 }
 
+/// Inject cached header IDs from the JS side (e.g. loaded from OPFS).
+/// Accepts raw bytes (32 bytes per block ID) and the genesis ID hex to determine network prefix.
+#[wasm_bindgen]
+pub fn set_cached_header_ids(genesis_id_hex: &str, header_bytes: &[u8]) {
+    set_network_prefix(genesis_id_hex);
+    let net = get_network_prefix();
+    if header_bytes.len() % 32 != 0 {
+        return;
+    }
+    let ids: Vec<BlockID> = header_bytes
+        .chunks_exact(32)
+        .map(|chunk| {
+            let mut id = [0u8; 32];
+            id.copy_from_slice(chunk);
+            BlockID::new(id)
+        })
+        .collect();
+    CACHED_HEADER_IDS.with(|cache| {
+        *cache.borrow_mut() = Some((net, ids));
+    });
+}
+
 // --- IndexedDB persistence for header IDs ---
 
 #[wasm_bindgen(inline_js = "
@@ -1869,8 +1891,11 @@ fn parse_txindex_file(data: &[u8]) -> Result<(Vec<TxIndexEntry>, u32), String> {
 
 /// Fetch a URL and return the response body as bytes.
 async fn fetch_bytes(url: &str) -> Result<Vec<u8>, JsValue> {
-    let window = web_sys::window().ok_or(JsValue::from_str("no window"))?;
-    let resp_value = JsFuture::from(window.fetch_with_str(url)).await?;
+    // Use global fetch() which works in both window and worker contexts
+    let global = js_sys::global();
+    let fetch_fn = js_sys::Reflect::get(&global, &JsValue::from_str("fetch"))?;
+    let fetch_fn: js_sys::Function = fetch_fn.dyn_into()?;
+    let resp_value = JsFuture::from(js_sys::Promise::from(fetch_fn.call1(&JsValue::NULL, &JsValue::from_str(url))?)).await?;
     let resp: web_sys::Response = resp_value.dyn_into()?;
     if !resp.ok() {
         return Err(JsValue::from_str(&format!(
@@ -2504,13 +2529,8 @@ pub async fn sync_chain(
 
     // Cache header IDs for generate_filters to reuse (in-memory + IndexedDB)
     if !header_ids.is_empty() {
-        let idb_key = prefixed_key(if start_height.is_some() { "header_ids_v2" } else { "header_ids" });
-        log(&format!("Persisting {} header IDs to IndexedDB ({})...", header_ids.len(), idb_key), "info");
-        if let Err(e) = save_header_ids_with_key(&idb_key, &header_ids).await {
-            log(&format!("Warning: failed to persist header IDs: {:?}", e), "info");
-        } else {
-            log("Header IDs persisted to IndexedDB.", "ok");
-        }
+        // Header ID IndexedDB save disabled — Chrome can't reliably read
+        // back large binary values. Headers re-download from peer on refresh (~30s).
         if start_height.is_none() {
             // Only cache full header IDs in memory (used by tx lookup etc.)
             let net = get_network_prefix();
@@ -2988,8 +3008,6 @@ pub async fn sync_headers(
         );
         // Save updated headers to cache
         CACHED_HEADER_IDS.with(|cache| *cache.borrow_mut() = Some((net.clone(), synced_ids.clone())));
-        let idb_key = prefixed_key("header_ids");
-        let _ = save_header_ids_with_key(&idb_key, &synced_ids).await;
     } else {
         log(
             &format!("{total_headers} headers synced, already at tip"),
@@ -3519,8 +3537,6 @@ pub async fn generate_filters(
                 "ok",
             );
             CACHED_HEADER_IDS.with(|cache| *cache.borrow_mut() = Some((net.clone(), synced_ids.clone())));
-            let idb_key = prefixed_key("header_ids");
-            let _ = save_header_ids_with_key(&idb_key, &synced_ids).await;
         } else {
             log(
                 &format!("{total_headers} headers synced, already at tip"),
@@ -4414,9 +4430,26 @@ pub async fn scan_balance_filtered(
         }
     }
 
-    // Step 4: Tail scan — sequentially scan all blocks after the filter tip
+    // Step 4: Tail scan — sequentially scan all blocks after the filter tip.
+    // Use header IDs to find the correct block ID for the filter tip, since
+    // the last filter entry may not be at the filter tip height (blocks with
+    // no addresses are skipped in the filter file).
     let filter_tip = filter_file.tip_height;
-    let last_filter_block_id = if let Some(last) = filter_file.entries.last() {
+
+    // Get cached headers to resolve the block ID at the filter tip
+    let (cached_ids, header_offset) = load_headers_with_offset(&genesis_id_hex).await?;
+    let tail_start_id = if let Some(ref ids) = cached_ids {
+        let tip_idx = filter_tip.saturating_sub(header_offset as u64) as usize;
+        if tip_idx > 0 && tip_idx <= ids.len() {
+            ids[tip_idx - 1]
+        } else if let Some(last) = filter_file.entries.last() {
+            let mut bid = [0u8; 32];
+            bid.copy_from_slice(&last.block_id);
+            BlockID::from(bid)
+        } else {
+            genesis_id
+        }
+    } else if let Some(last) = filter_file.entries.last() {
         let mut bid = [0u8; 32];
         bid.copy_from_slice(&last.block_id);
         BlockID::from(bid)
@@ -4433,7 +4466,7 @@ pub async fn scan_balance_filtered(
         "info",
     );
 
-    let mut tail_history = vec![last_filter_block_id];
+    let mut tail_history = vec![tail_start_id];
     let mut tail_blocks_scanned: u64 = 0;
     let blocks_per_batch: u64 = 100;
 
@@ -4801,8 +4834,6 @@ pub async fn lookup_txid(
             CACHED_HEADER_IDS.with(|cache| {
                 *cache.borrow_mut() = Some((net.clone(), synced_ids.clone()));
             });
-            let idb_key = prefixed_key("header_ids");
-            let _ = save_header_ids_with_key(&idb_key, &synced_ids).await;
             log(&format!("Synced {} header IDs", synced_ids.len()), "ok");
             synced_ids
         }
@@ -5116,7 +5147,7 @@ async fn fetch_block_by_height(
     }
 
     let (cached_ids, header_offset) = load_headers_with_offset(genesis_id_hex).await?;
-    let header_ids = match cached_ids {
+    let mut header_ids = match cached_ids {
         Some(ids) => {
             log(&format!("Using {} cached header IDs", ids.len()), "ok");
             ids
@@ -5145,13 +5176,38 @@ async fn fetch_block_by_height(
             CACHED_HEADER_IDS.with(|cache| {
                 *cache.borrow_mut() = Some((net, synced_ids.clone()));
             });
-            let _ = save_header_ids_with_key(&prefixed_key("header_ids"), &synced_ids).await;
             log(&format!("Synced {} header IDs", synced_ids.len()), "ok");
-            // conn will be dropped — reconnect below for block fetch
             let _ = conn.wt.close();
             synced_ids
         }
     };
+
+    // If the requested height is beyond cached headers, fetch the missing ones
+    let total_height = header_offset as u64 + header_ids.len() as u64;
+    if height as u64 >= total_height {
+        log(&format!("Fetching headers beyond cache ({} -> {})...", total_height, height + 1), "info");
+        let last_id = if header_ids.is_empty() { genesis_id } else { *header_ids.last().unwrap() };
+        let conn = connect_and_handshake(url, genesis_id, cert_hash).await?;
+        let mut current_index = ChainIndex { height: total_height, id: last_id };
+        loop {
+            let resp = send_headers_rpc(&conn.wt, current_index, 2000).await?;
+            if resp.headers.is_empty() { break; }
+            let batch_count = resp.headers.len() as u64;
+            for header in &resp.headers {
+                header_ids.push(header.id());
+            }
+            let last_header = resp.headers.last().unwrap();
+            current_index = ChainIndex { height: current_index.height + batch_count, id: last_header.id() };
+            if current_index.height > height as u64 { break; }
+            if resp.remaining == 0 { break; }
+        }
+        let net = get_network_prefix();
+        CACHED_HEADER_IDS.with(|cache| {
+            *cache.borrow_mut() = Some((net, header_ids.clone()));
+        });
+        log(&format!("Extended to {} header IDs", header_ids.len()), "ok");
+        let _ = conn.wt.close();
+    }
 
     let prev_id = resolve_prev_id(&header_ids, header_offset, height, genesis_id, genesis_id_hex)?;
 
@@ -5265,7 +5321,6 @@ async fn fetch_block_with_txid_match(
             CACHED_HEADER_IDS.with(|cache| {
                 *cache.borrow_mut() = Some((net, synced_ids.clone()));
             });
-            let _ = save_header_ids_with_key(&prefixed_key("header_ids"), &synced_ids).await;
             let _ = conn.wt.close();
             synced_ids
         }
@@ -6261,70 +6316,77 @@ pub async fn broadcast_v2_transaction(
         }
     }
 
-    let mut stream = open_stream(&conn.wt).await?;
+    // Relay the transaction set (fire-and-forget).
+    {
+        let mut stream = open_stream(&conn.wt).await
+            .map_err(|e| JsValue::from_str(&format!("failed to open relay stream: {:?}", e)))?;
 
-    // Write RPC ID
-    let mut id_buf = Vec::new();
-    RPC_RELAY_V2_TRANSACTION_SET
-        .encode(&mut id_buf)
-        .map_err(|e| JsValue::from_str(&e.to_string()))?;
-    stream.write_all(&id_buf).await?;
+        let mut buf = Vec::new();
+        RPC_RELAY_V2_TRANSACTION_SET
+            .encode(&mut buf)
+            .map_err(|e| JsValue::from_str(&e.to_string()))?;
 
-    // Write relay request with full transaction set
-    let req = RelayV2TransactionSetRequest {
-        index: tip_index,
-        transactions: txns,
-    };
-    let mut req_buf = Vec::new();
-    req.encode(&mut req_buf)
-        .map_err(|e| JsValue::from_str(&e.to_string()))?;
-    stream.write_all(&req_buf).await?;
+        let req = RelayV2TransactionSetRequest {
+            index: tip_index,
+            transactions: txns,
+        };
+        req.encode(&mut buf)
+            .map_err(|e| JsValue::from_str(&e.to_string()))?;
 
-    stream.close_writer().await?;
+        stream.write_all(&buf).await
+            .map_err(|e| JsValue::from_str(&format!("failed to write relay request ({} bytes): {:?}", buf.len(), e)))?;
+        stream.close_writer().await
+            .map_err(|e| JsValue::from_str(&format!("failed to close relay writer: {:?}", e)))?;
+    }
 
-    // Verify the peer accepted the transaction by requesting it back from
-    // their txpool via SendTransactions with an empty ChainIndex (no block
-    // match, so it falls through to the txpool lookup).
-    let mut stream2 = open_stream(&conn.wt).await?;
+    // Verify the transaction reached the peer's mempool via SendTransactions.
+    // Use a zero ChainIndex so the peer falls through to txpool lookup.
+    {
+        let mut stream = open_stream(&conn.wt).await
+            .map_err(|e| JsValue::from_str(&format!("failed to open verification stream: {:?}", e)))?;
 
-    let mut id_buf2 = Vec::new();
-    RPC_SEND_TRANSACTIONS
-        .encode(&mut id_buf2)
-        .map_err(|e| JsValue::from_str(&e.to_string()))?;
-    stream2.write_all(&id_buf2).await?;
+        let mut buf = Vec::new();
+        RPC_SEND_TRANSACTIONS
+            .encode(&mut buf)
+            .map_err(|e| JsValue::from_str(&e.to_string()))?;
 
-    let send_req = SendTransactionsRequest {
-        index: ChainIndex { height: 0, id: BlockID::default() },
-        hashes: vec![primary_leaf_hash],
-    };
-    let mut send_req_buf = Vec::new();
-    send_req.encode(&mut send_req_buf)
-        .map_err(|e| JsValue::from_str(&e.to_string()))?;
-    stream2.write_all(&send_req_buf).await?;
-    stream2.close_writer().await?;
+        let req = SendTransactionsRequest {
+            index: ChainIndex { height: 0, id: BlockID::default() },
+            hashes: vec![primary_leaf_hash],
+        };
+        req.encode(&mut buf)
+            .map_err(|e| JsValue::from_str(&e.to_string()))?;
 
-    let resp_data = stream2.read_to_end().await?;
+        stream.write_all(&buf).await?;
+        stream.close_writer().await?;
+
+        let resp_data = stream.read_to_end().await
+            .map_err(|e| JsValue::from_str(&format!("verification failed: {:?}", e)))?;
+
+        // Response: len(v1_txns) as u64 + encoded txns + len(v2_txns) as u64 + encoded txns
+        if resp_data.len() >= 16 {
+            let v1_count = u64::from_le_bytes(resp_data[0..8].try_into().unwrap());
+            // Skip past v1 txns to read v2 count
+            // For simplicity, just check if we got any data beyond the two length prefixes
+            if v1_count == 0 {
+                let v2_count = u64::from_le_bytes(resp_data[8..16].try_into().unwrap());
+                if v2_count == 0 {
+                    let _ = conn.wt.close();
+                    return Err(JsValue::from_str(&format!(
+                        "transaction {} was not accepted into the peer's mempool", primary_txid
+                    )));
+                }
+            }
+            // v1_count > 0 or v2_count > 0 — transaction is in the mempool
+        } else {
+            let _ = conn.wt.close();
+            return Err(JsValue::from_str(&format!(
+                "peer returned empty response when verifying transaction {}", primary_txid
+            )));
+        }
+    }
+
     let _ = conn.wt.close();
-
-    // Response format: len(v1_txns) as u64 + v1_txns... + len(v2_txns) as u64 + v2_txns...
-    if resp_data.len() < 16 {
-        return Err(JsValue::from_str(&format!(
-            "peer rejected transaction {}", primary_txid
-        )));
-    }
-    let v1_count = u64::from_le_bytes(resp_data[0..8].try_into().unwrap());
-    let v2_count = if v1_count == 0 && resp_data.len() >= 16 {
-        u64::from_le_bytes(resp_data[8..16].try_into().unwrap())
-    } else {
-        0
-    };
-
-    if v1_count + v2_count == 0 {
-        return Err(JsValue::from_str(&format!(
-            "peer rejected transaction {}", primary_txid
-        )));
-    }
-
     Ok(primary_txid)
 }
 
@@ -6486,11 +6548,15 @@ pub async fn scan_wallet_utxos(
                 lo += 1;
             }
 
+            let addr_hex = hex::encode(addr_bytes);
+            let addr_short = format!("{}...{}", &addr_hex[..8], &addr_hex[56..]);
+
             if has_matches {
                 active_addresses.push((addr_idx, address));
-                log(&format!("  Address {}: {} — UTXOs found", index, &addr_results[addr_idx].public_key[..24]), "ok");
+                log(&format!("  Address {}: {} — UTXOs found", index, addr_short), "ok");
                 gap = 0;
             } else {
+                log(&format!("  Address {}: {} — no UTXOs (gap {})", index, addr_short, gap + 1), "data");
                 gap += 1;
             }
 
@@ -6499,48 +6565,55 @@ pub async fn scan_wallet_utxos(
 
         used_suxi = true;
 
-        // SUXI only tracks unspent outputs — also load filters for complete tx history.
-        // We must scan ALL derived addresses (not just SUXI-active ones) because
-        // addresses with fully-spent UTXOs won't appear in SUXI but may have
-        // historical activity visible in filters.
+        // Scan filters only for SUXI-active addresses (not all derived addresses).
+        // This is much faster (~2s vs 30s) while still finding spent history for
+        // addresses that currently hold funds.
         if !active_addresses.is_empty() && !filter_url.is_empty() {
-            log("Loading block filters for complete history...", "info");
+            log("Loading block filters for transaction history...", "info");
             let filter_data = fetch_bytes(&filter_url).await?;
-            if let Ok(ff) = parse_filter_file(&filter_data) {
-                let p = ff.p as u8;
-                if ff.tip_height < data_tip_height {
-                    data_tip_height = ff.tip_height;
-                }
-                for (addr_idx, ar) in addr_results.iter().enumerate() {
-                    let addr_bytes: [u8; 32] = {
-                        let slice: &[u8] = ar.address.as_ref();
-                        slice.try_into().unwrap()
-                    };
-                    let mut found_in_filter = false;
-                    for entry in &ff.entries {
-                        if entry.address_count == 0 {
-                            continue;
-                        }
-                        if gcs_match(&entry.filter_data, &entry.block_id, &addr_bytes, entry.address_count as u64, p) {
-                            found_in_filter = true;
-                            block_addrs
-                                .entry(entry.height)
-                                .and_modify(|indices| {
-                                    if !indices.contains(&addr_idx) {
-                                        indices.push(addr_idx);
-                                    }
-                                })
-                                .or_insert_with(|| vec![addr_idx]);
-                        }
+            match parse_filter_file(&filter_data) {
+                Ok(ff) => {
+                    let p = ff.p as u8;
+                    log(&format!("Scanning {} active address(es) against {} filters...",
+                        active_addresses.len(), ff.entries.len()), "ok");
+                    if ff.tip_height < data_tip_height {
+                        data_tip_height = ff.tip_height;
                     }
-                    // Track addresses found only in filters (spent history)
-                    if found_in_filter && !active_addresses.iter().any(|(idx, _)| *idx == addr_idx) {
-                        active_addresses.push((addr_idx, ar.address.clone()));
+                    // Only scan addresses that had SUXI matches
+                    for &(addr_idx, ref address) in &active_addresses {
+                        let addr_bytes: [u8; 32] = {
+                            let slice: &[u8] = address.as_ref();
+                            slice.try_into().unwrap()
+                        };
+                        let mut match_count = 0u32;
+                        for entry in &ff.entries {
+                            if entry.address_count == 0 {
+                                continue;
+                            }
+                            if gcs_match(&entry.filter_data, &entry.block_id, &addr_bytes, entry.address_count as u64, p) {
+                                match_count += 1;
+                                block_addrs
+                                    .entry(entry.height)
+                                    .and_modify(|indices| {
+                                        if !indices.contains(&addr_idx) {
+                                            indices.push(addr_idx);
+                                        }
+                                    })
+                                    .or_insert_with(|| vec![addr_idx]);
+                            }
+                        }
+                        let ar = &addr_results[addr_idx];
+                        let addr_hex = hex::encode(&addr_bytes);
+                        log(&format!("  Address {}: {}...{} — {} filter matches",
+                            ar.index, &addr_hex[..8], &addr_hex[56..], match_count), "ok");
                     }
+                    height_to_idx = ff.entries.iter().enumerate().map(|(i, e)| (e.height, i)).collect();
+                    filter_file_opt = Some(ff);
+                    log(&format!("Filter scan: {} blocks to fetch", block_addrs.len()), "ok");
                 }
-                height_to_idx = ff.entries.iter().enumerate().map(|(i, e)| (e.height, i)).collect();
-                filter_file_opt = Some(ff);
-                log(&format!("Filter augmentation: {} total blocks to fetch ({} addresses with history)", block_addrs.len(), active_addresses.len()), "ok");
+                Err(e) => {
+                    log(&format!("Failed to parse filter file: {}", e), "err");
+                }
             }
         }
     } else {
@@ -6609,9 +6682,12 @@ pub async fn scan_wallet_utxos(
                 }
             }
 
+            let addr_hex_fb = hex::encode(addr_bytes);
+            let addr_short_fb = format!("{}...{}", &addr_hex_fb[..8], &addr_hex_fb[56..]);
+
             if has_matches {
                 active_addresses.push((addr_idx, address));
-                log(&format!("  Address {}: {} — filter matches found", index, &addr_results[addr_idx].public_key[..24]), "ok");
+                log(&format!("  Address {}: {} — filter matches found", index, addr_short_fb), "ok");
                 gap = 0;
             } else {
                 gap += 1;
@@ -6696,7 +6772,7 @@ pub async fn scan_wallet_utxos(
                         synced_ids.push(header.id());
                     }
                     let total = synced_ids.len() as u64;
-                    log(&format!("  Headers: {total}"), "data");
+                    log(&format!("  Syncing headers: {} / ~{}", total, total + resp.remaining), "progress");
                     let last_header = resp.headers.last().unwrap();
                     current_index = ChainIndex { height: current_index.height + batch_count, id: last_header.id() };
                     if current_index.height > max_height && resp.remaining == 0 { break; }
@@ -7400,9 +7476,16 @@ pub async fn compute_utxo_proofs(
     let genesis_id = parse_genesis_id(&genesis_id_hex)?;
     let cert_hash = parse_cert_hash(&cert_hash_hex)?;
 
-    // Determine checkpoint height (V2 allow height)
-    let checkpoint_height = v2_require_height(&genesis_id_hex);
-    log(&format!("Checkpoint height: {}", checkpoint_height), "info");
+    // Find the earliest UTXO height so we can pick a nearby checkpoint
+    let min_v2_height = v2_require_height(&genesis_id_hex);
+    let mut earliest_utxo_height: u64 = u64::MAX;
+    for utxo in &utxos {
+        if let Some(h) = utxo.get("height").and_then(|v| v.as_u64()) {
+            if h < earliest_utxo_height {
+                earliest_utxo_height = h;
+            }
+        }
+    }
 
     // Connect to peer
     log("Connecting to peer...", "info");
@@ -7446,7 +7529,7 @@ pub async fn compute_utxo_proofs(
             height: current_index.height + count,
             id: resp.headers.last().unwrap().id(),
         };
-        log(&format!("  Headers: {}", synced_ids.len()), "data");
+        log(&format!("  Syncing headers: {}", synced_ids.len()), "progress");
         if resp.remaining == 0 { break; }
     }
 
@@ -7458,62 +7541,129 @@ pub async fn compute_utxo_proofs(
         *cache.borrow_mut() = Some((net.clone(), synced_ids.clone()));
     });
 
-    // Get the checkpoint block ID
+    // Pick checkpoint as close to the earliest UTXO as possible.
+    // Must be >= V2 allow height and before the earliest UTXO.
+    // Use a small buffer (20 blocks) before the UTXO for safety.
+    let checkpoint_height = if earliest_utxo_height != u64::MAX && earliest_utxo_height > min_v2_height + 20 {
+        earliest_utxo_height - 20
+    } else {
+        min_v2_height
+    };
+    // Clamp to valid range
+    let checkpoint_height = checkpoint_height.max(min_v2_height).min(tip_height);
+    log(&format!("Checkpoint height: {} (earliest UTXO at {})", checkpoint_height,
+        if earliest_utxo_height == u64::MAX { "unknown".to_string() } else { earliest_utxo_height.to_string() }), "info");
+
     if checkpoint_height == 0 || checkpoint_height > tip_height {
         return Err(JsValue::from_str(&format!(
             "checkpoint height {} out of range (tip={})",
             checkpoint_height, tip_height
         )));
     }
-    let checkpoint_id = synced_ids[(checkpoint_height - 1) as usize];
-    let checkpoint_index = ChainIndex {
-        height: checkpoint_height,
-        id: checkpoint_id,
-    };
-
-    // Fetch checkpoint (block + consensus state with accumulator)
-    // NOTE: SendCheckpoint returns the state at the PARENT of the checkpoint block,
-    // not after applying it. We must apply the checkpoint block ourselves first.
-    log(&format!("Fetching checkpoint at height {}...", checkpoint_height), "info");
-    let (checkpoint_block, checkpoint_state) = send_checkpoint_rpc(&conn.wt, checkpoint_index).await?;
-    log(&format!("Checkpoint loaded. Accumulator num_leaves: {}", checkpoint_state.elements.num_leaves), "ok");
-
-    let mut acc = checkpoint_state.elements.clone();
-    let mut siafund_pool = checkpoint_state.siafund_pool;
 
     // Track wallet UTXOs: output_id_hex -> StateElement (once we find them)
     let mut tracked_utxos: HashMap<String, StateElement> = HashMap::new();
 
-    // Apply the checkpoint block itself first
-    {
-        let block_height = checkpoint_height - 1; // parent height
-        let (mut updated, mut added) = extract_block_elements(
-            &checkpoint_block,
-            block_height,
-            &genesis_id_hex,
-            &siafund_pool,
-        );
-        acc.apply_block(&mut updated, &mut added)
-            .map_err(|e| JsValue::from_str(&format!("apply_block on checkpoint block failed: {e}")))?;
-        // Update siafund pool: add tax from new file contracts and renewals
-        for txn in &checkpoint_block.v2_transactions {
-            for fc in &txn.file_contracts {
-                siafund_pool = siafund_pool + v2_fc_tax(fc.renter_output.value, fc.host_output.value);
+    // Try to load cached accumulator state
+    let cache_key = prefixed_key("acc_cache");
+    let mut acc;
+    let mut siafund_pool;
+    let mut start_height;
+    let mut loaded_from_cache = false;
+
+    if let Ok(result) = JsFuture::from(idb_load(&cache_key)).await {
+        if !result.is_null() && !result.is_undefined() {
+            let bytes = js_sys::Uint8Array::new(&result).to_vec();
+            // Format: height(8) + num_leaves(8) + trees(64*32) + siafund_pool(16) = 2080 bytes
+            if bytes.len() >= 2080 {
+                let cached_height = u64::from_le_bytes(bytes[0..8].try_into().unwrap());
+                if cached_height >= checkpoint_height && cached_height <= tip_height {
+                    let num_leaves = u64::from_le_bytes(bytes[8..16].try_into().unwrap());
+                    let mut trees = [Hash256::default(); 64];
+                    for i in 0..64 {
+                        let offset = 16 + i * 32;
+                        let mut h = [0u8; 32];
+                        h.copy_from_slice(&bytes[offset..offset + 32]);
+                        trees[i] = Hash256::from(h);
+                    }
+                    let pool_lo = u64::from_le_bytes(bytes[2064..2072].try_into().unwrap());
+                    let pool_hi = u64::from_le_bytes(bytes[2072..2080].try_into().unwrap());
+
+                    acc = sia::consensus::ElementAccumulator { num_leaves, trees };
+                    siafund_pool = Currency::from(pool_lo as u128 | ((pool_hi as u128) << 64));
+                    start_height = cached_height + 1;
+                    loaded_from_cache = true;
+
+                    let blocks_remaining = tip_height - cached_height;
+                    log(&format!("Loaded cached accumulator at height {} ({} blocks to process)", cached_height, blocks_remaining), "ok");
+                } else {
+                    log(&format!("Cached accumulator at height {} out of range (tip={}), rebuilding", cached_height, tip_height), "info");
+                    acc = sia::consensus::ElementAccumulator::default();
+                    siafund_pool = Currency::zero();
+                    start_height = checkpoint_height;
+                }
+            } else {
+                acc = sia::consensus::ElementAccumulator::default();
+                siafund_pool = Currency::zero();
+                start_height = checkpoint_height;
             }
-            for fcr in &txn.file_contract_resolutions {
-                if let ContractResolution::Renewal(renewal) = &fcr.resolution {
-                    siafund_pool = siafund_pool + v2_fc_tax(
-                        renewal.new_contract.renter_output.value,
-                        renewal.new_contract.host_output.value,
-                    );
+        } else {
+            acc = sia::consensus::ElementAccumulator::default();
+            siafund_pool = Currency::zero();
+            start_height = checkpoint_height;
+        }
+    } else {
+        acc = sia::consensus::ElementAccumulator::default();
+        siafund_pool = Currency::zero();
+        start_height = checkpoint_height;
+    }
+
+    // If starting from checkpoint (no cache), fetch and apply it
+    if !loaded_from_cache {
+        let checkpoint_id = synced_ids[(checkpoint_height - 1) as usize];
+        let checkpoint_index = ChainIndex {
+            height: checkpoint_height,
+            id: checkpoint_id,
+        };
+
+        log(&format!("Fetching checkpoint at height {}...", checkpoint_height), "info");
+        let (checkpoint_block, checkpoint_state) = send_checkpoint_rpc(&conn.wt, checkpoint_index).await?;
+        log(&format!("Checkpoint loaded. Accumulator num_leaves: {}", checkpoint_state.elements.num_leaves), "ok");
+
+        acc = checkpoint_state.elements.clone();
+        siafund_pool = checkpoint_state.siafund_pool;
+
+        // Apply the checkpoint block itself
+        {
+            let block_height = checkpoint_height - 1;
+            let (mut updated, mut added) = extract_block_elements(
+                &checkpoint_block,
+                block_height,
+                &genesis_id_hex,
+                &siafund_pool,
+            );
+            acc.apply_block(&mut updated, &mut added)
+                .map_err(|e| JsValue::from_str(&format!("apply_block on checkpoint block failed: {e}")))?;
+            for txn in &checkpoint_block.v2_transactions {
+                for fc in &txn.file_contracts {
+                    siafund_pool = siafund_pool + v2_fc_tax(fc.renter_output.value, fc.host_output.value);
+                }
+                for fcr in &txn.file_contract_resolutions {
+                    if let ContractResolution::Renewal(renewal) = &fcr.resolution {
+                        siafund_pool = siafund_pool + v2_fc_tax(
+                            renewal.new_contract.renter_output.value,
+                            renewal.new_contract.host_output.value,
+                        );
+                    }
                 }
             }
         }
+
+        start_height = checkpoint_height + 1;
     }
 
-    // Process all blocks from checkpoint+1 to tip
-    let start_height = checkpoint_height + 1;
-    let total_blocks = tip_height - checkpoint_height;
+    // Process blocks from start_height to tip
+    let total_blocks = tip_height - start_height + 1;
     log(&format!("Processing {} blocks ({} to {})...", total_blocks, start_height, tip_height), "info");
 
     let mut blocks_processed: u64 = 0;
@@ -7671,12 +7821,29 @@ pub async fn compute_utxo_proofs(
 
         next_height += blocks.len() as u64;
 
-        if blocks_processed % 500 == 0 || next_height > tip_height {
-            log(&format!("  Processed {}/{} blocks (tracked {} UTXOs)", blocks_processed, total_blocks, tracked_utxos.len()), "data");
+        if blocks_processed % 100 == 0 || next_height > tip_height {
+            log(&format!("  Processed {}/{} blocks (tracked {} UTXOs)", blocks_processed, total_blocks, tracked_utxos.len()), "progress");
         }
     }
 
     let _ = conn.wt.close();
+
+    // Save accumulator state for next run
+    {
+        let mut cache_bytes = Vec::with_capacity(2080);
+        cache_bytes.extend_from_slice(&tip_height.to_le_bytes()); // 8 bytes
+        cache_bytes.extend_from_slice(&acc.num_leaves.to_le_bytes()); // 8 bytes
+        for tree in &acc.trees {
+            let h: &[u8] = tree.as_ref();
+            cache_bytes.extend_from_slice(h); // 64 * 32 bytes
+        }
+        let pool_val: u128 = *siafund_pool;
+        cache_bytes.extend_from_slice(&(pool_val as u64).to_le_bytes()); // lo 8 bytes
+        cache_bytes.extend_from_slice(&((pool_val >> 64) as u64).to_le_bytes()); // hi 8 bytes
+        let arr = js_sys::Uint8Array::from(&cache_bytes[..]);
+        let _ = JsFuture::from(idb_save(&cache_key, arr)).await;
+        log(&format!("Saved accumulator state at height {}", tip_height), "ok");
+    }
 
     log(&format!("Done! {} UTXOs with proofs, final acc.num_leaves={}", tracked_utxos.len(), acc.num_leaves), "ok");
 
