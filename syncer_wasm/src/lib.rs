@@ -3,18 +3,17 @@ use std::io;
 
 use js_sys::{Reflect, Uint8Array};
 use serde_json::json;
+use sia::consensus::UNASSIGNED_LEAF_INDEX;
 use sia::encoding::{SiaDecodable, SiaEncodable, V1SiaDecodable, V1SiaEncodable};
 use sia::types::v1::{self, UnlockConditions};
 use sia::types::v2::{self, ContractResolution};
-use sia::consensus::UNASSIGNED_LEAF_INDEX;
 use sia::types::{Address, BlockID, ChainIndex, Currency, Hash256, StateElement};
 use sia_syncer::encoding::{self, PROTOCOL_VERSION};
 use sia_syncer::rpc::{
-    RPC_DISCOVER_IP, RPC_RELAY_V2_BLOCK_OUTLINE, RPC_RELAY_V2_HEADER,
-    RPC_RELAY_V2_TRANSACTION_SET, RPC_SEND_CHECKPOINT, RPC_SEND_HEADERS,
-    RPC_SEND_TRANSACTIONS, RPC_SEND_V2_BLOCKS,
-    RelayV2HeaderRequest, RelayV2TransactionSetRequest, SendCheckpointRequest,
-    SendHeadersRequest, SendHeadersResponse, SendTransactionsRequest, SendV2BlocksRequest,
+    RPC_DISCOVER_IP, RPC_RELAY_V2_BLOCK_OUTLINE, RPC_RELAY_V2_HEADER, RPC_RELAY_V2_TRANSACTION_SET,
+    RPC_SEND_CHECKPOINT, RPC_SEND_HEADERS, RPC_SEND_TRANSACTIONS, RPC_SEND_V2_BLOCKS,
+    RelayV2HeaderRequest, RelayV2TransactionSetRequest, SendCheckpointRequest, SendHeadersRequest,
+    SendHeadersResponse, SendTransactionsRequest, SendV2BlocksRequest,
 };
 use sia_syncer::types::{Header, PeerInfo};
 use wasm_bindgen::prelude::*;
@@ -47,7 +46,11 @@ fn get_network_prefix() -> String {
 fn prefixed_key(key: &str) -> String {
     NETWORK_PREFIX.with(|p| {
         let prefix = p.borrow();
-        if prefix.is_empty() { key.to_string() } else { format!("{}:{}", *prefix, key) }
+        if prefix.is_empty() {
+            key.to_string()
+        } else {
+            format!("{}:{}", *prefix, key)
+        }
     })
 }
 
@@ -576,15 +579,19 @@ fn block_to_json(block: &DecodedBlock) -> serde_json::Value {
     }).collect();
 
     if let Some(height) = block.v2_height {
-        let v2_txns_json: Vec<serde_json::Value> = block.v2_transactions.iter().map(|txn| {
-            let mut val = serde_json::to_value(txn).unwrap_or(json!({}));
-            if let serde_json::Value::Object(ref mut map) = val {
-                let tid = txn.id();
-                let tid_bytes: &[u8] = tid.as_ref();
-                map.insert("txid".to_string(), json!(hex::encode(tid_bytes)));
-            }
-            val
-        }).collect();
+        let v2_txns_json: Vec<serde_json::Value> = block
+            .v2_transactions
+            .iter()
+            .map(|txn| {
+                let mut val = serde_json::to_value(txn).unwrap_or(json!({}));
+                if let serde_json::Value::Object(ref mut map) = val {
+                    let tid = txn.id();
+                    let tid_bytes: &[u8] = tid.as_ref();
+                    map.insert("txid".to_string(), json!(hex::encode(tid_bytes)));
+                }
+                val
+            })
+            .collect();
         json!({
             "parentID": block.parent_id.to_string(),
             "nonce": block.nonce,
@@ -617,9 +624,7 @@ fn decode_v1_currency(r: &mut &[u8]) -> Result<Currency, JsValue> {
     let io_err = |e: io::Error| JsValue::from_str(&e.to_string());
     let n = u64::decode(r).map_err(|e| JsValue::from_str(&e.to_string()))? as usize;
     if n > 16 {
-        return Err(JsValue::from_str(&format!(
-            "Currency too large: {n} bytes"
-        )));
+        return Err(JsValue::from_str(&format!("Currency too large: {n} bytes")));
     }
     let mut buf = [0u8; 16];
     io::Read::read_exact(r, &mut buf[16 - n..]).map_err(io_err)?;
@@ -707,13 +712,7 @@ fn compute_multiproof_size(leaves: &[(u64, usize)]) -> usize {
         proof_size(i, mid, left) + proof_size(mid, j, right)
     }
 
-    let clear_bits = |x: u64, n: usize| -> u64 {
-        if n >= 64 {
-            0
-        } else {
-            x & !((1u64 << n) - 1)
-        }
-    };
+    let clear_bits = |x: u64, n: usize| -> u64 { if n >= 64 { 0 } else { x & !((1u64 << n) - 1) } };
 
     let mut size = 0;
     for (height, tree_leaves) in trees.iter_mut().enumerate() {
@@ -773,7 +772,10 @@ enum ElementRef {
 
 /// Collect multiproof leaves with back-references into transactions.
 fn collect_multiproof_leaves(txns: &[v2::Transaction]) -> Vec<(MultiproofLeaf, ElementRef)> {
-    use sia::consensus::{siacoin_element_hash, siafund_element_hash, v2_file_contract_element_hash, chain_index_element_hash};
+    use sia::consensus::{
+        chain_index_element_hash, siacoin_element_hash, siafund_element_hash,
+        v2_file_contract_element_hash,
+    };
     use sia::types::SiacoinOutput;
 
     let mut result = Vec::new();
@@ -824,10 +826,8 @@ fn collect_multiproof_leaves(txns: &[v2::Transaction]) -> Vec<(MultiproofLeaf, E
             if se.leaf_index == UNASSIGNED_LEAF_INDEX {
                 continue;
             }
-            let elem_hash = v2_file_contract_element_hash(
-                &rev.parent.id,
-                &rev.parent.v2_file_contract,
-            );
+            let elem_hash =
+                v2_file_contract_element_hash(&rev.parent.id, &rev.parent.v2_file_contract);
             result.push((
                 MultiproofLeaf {
                     leaf_index: se.leaf_index,
@@ -842,10 +842,8 @@ fn collect_multiproof_leaves(txns: &[v2::Transaction]) -> Vec<(MultiproofLeaf, E
             if se.leaf_index == UNASSIGNED_LEAF_INDEX {
                 continue;
             }
-            let elem_hash = v2_file_contract_element_hash(
-                &res.parent.id,
-                &res.parent.v2_file_contract,
-            );
+            let elem_hash =
+                v2_file_contract_element_hash(&res.parent.id, &res.parent.v2_file_contract);
             result.push((
                 MultiproofLeaf {
                     leaf_index: se.leaf_index,
@@ -859,10 +857,8 @@ fn collect_multiproof_leaves(txns: &[v2::Transaction]) -> Vec<(MultiproofLeaf, E
                 if se2.leaf_index == UNASSIGNED_LEAF_INDEX {
                     continue;
                 }
-                let ci_hash = chain_index_element_hash(
-                    &sp.proof_index.id,
-                    &sp.proof_index.chain_index,
-                );
+                let ci_hash =
+                    chain_index_element_hash(&sp.proof_index.id, &sp.proof_index.chain_index);
                 result.push((
                     MultiproofLeaf {
                         leaf_index: se2.leaf_index,
@@ -881,19 +877,33 @@ fn collect_multiproof_leaves(txns: &[v2::Transaction]) -> Vec<(MultiproofLeaf, E
 fn set_proof_value(txns: &mut [v2::Transaction], eref: &ElementRef, level: usize, value: Hash256) {
     match eref {
         ElementRef::SiacoinInput { txn, input } => {
-            txns[*txn].siacoin_inputs[*input].parent.state_element.merkle_proof[level] = value;
+            txns[*txn].siacoin_inputs[*input]
+                .parent
+                .state_element
+                .merkle_proof[level] = value;
         }
         ElementRef::SiafundInput { txn, input } => {
-            txns[*txn].siafund_inputs[*input].parent.state_element.merkle_proof[level] = value;
+            txns[*txn].siafund_inputs[*input]
+                .parent
+                .state_element
+                .merkle_proof[level] = value;
         }
         ElementRef::FileContractRevision { txn, rev } => {
-            txns[*txn].file_contract_revisions[*rev].parent.state_element.merkle_proof[level] = value;
+            txns[*txn].file_contract_revisions[*rev]
+                .parent
+                .state_element
+                .merkle_proof[level] = value;
         }
         ElementRef::FileContractResolution { txn, res } => {
-            txns[*txn].file_contract_resolutions[*res].parent.state_element.merkle_proof[level] = value;
+            txns[*txn].file_contract_resolutions[*res]
+                .parent
+                .state_element
+                .merkle_proof[level] = value;
         }
         ElementRef::StorageProofIndex { txn, res } => {
-            if let v2::ContractResolution::StorageProof(ref mut sp) = txns[*txn].file_contract_resolutions[*res].resolution {
+            if let v2::ContractResolution::StorageProof(ref mut sp) =
+                txns[*txn].file_contract_resolutions[*res].resolution
+            {
                 sp.proof_index.state_element.merkle_proof[level] = value;
             }
         }
@@ -916,9 +926,7 @@ fn expand_multiproof(txns: &mut [v2::Transaction], multiproof: &[Hash256]) {
         }
     }
 
-    let clear_bits = |x: u64, n: usize| -> u64 {
-        if n >= 64 { 0 } else { x & !((1u64 << n) - 1) }
-    };
+    let clear_bits = |x: u64, n: usize| -> u64 { if n >= 64 { 0 } else { x & !((1u64 << n) - 1) } };
 
     let blake_params = blake2b_simd::Params::new().hash_length(32).clone();
     let sum_pair = |left: &Hash256, right: &Hash256| -> Hash256 {
@@ -960,8 +968,26 @@ fn expand_multiproof(txns: &mut [v2::Transaction], multiproof: &[Hash256]) {
         let split = leaf_indices.partition_point(|&idx| all_leaves[idx].0.leaf_index < mid);
         let (left_indices, right_indices) = leaf_indices.split_at(split);
 
-        let left_root = visit(i, mid, left_indices, all_leaves, txns, multiproof, proof_cursor, sum_pair);
-        let right_root = visit(mid, j, right_indices, all_leaves, txns, multiproof, proof_cursor, sum_pair);
+        let left_root = visit(
+            i,
+            mid,
+            left_indices,
+            all_leaves,
+            txns,
+            multiproof,
+            proof_cursor,
+            sum_pair,
+        );
+        let right_root = visit(
+            mid,
+            j,
+            right_indices,
+            all_leaves,
+            txns,
+            multiproof,
+            proof_cursor,
+            sum_pair,
+        );
 
         // Set proof values: right leaves get left_root at this height, left get right_root
         for &idx in right_indices {
@@ -987,8 +1013,14 @@ fn expand_multiproof(txns: &mut [v2::Transaction], multiproof: &[Hash256]) {
             start.wrapping_add(1u64 << height)
         };
         visit(
-            start, end, tree_indices, &all_leaves, txns, multiproof,
-            &mut proof_cursor, &sum_pair,
+            start,
+            end,
+            tree_indices,
+            &all_leaves,
+            txns,
+            multiproof,
+            &mut proof_cursor,
+            &sum_pair,
         );
     }
 }
@@ -1087,15 +1119,16 @@ fn decode_v2_block(r: &mut &[u8], buf_start_len: usize) -> Result<DecodedBlock, 
         )));
     }
     let before_skip = r.len();
-    let (v1_addresses, v1_transactions) = if v1_tx_count > 0 {
-        decode_v1_transactions(r, v1_tx_count)
+    let (v1_addresses, v1_transactions) =
+        if v1_tx_count > 0 {
+            decode_v1_transactions(r, v1_tx_count)
             .map_err(|e| JsValue::from_str(&format!(
                 "v1 parse failed (v1_tx_count={v1_tx_count}, pos={}, parsed {} bytes so far): {}",
                 pos(), before_skip - r.len(), e.as_string().unwrap_or_default()
             )))?
-    } else {
-        (Vec::new(), Vec::new())
-    };
+        } else {
+            (Vec::new(), Vec::new())
+        };
 
     // --- V2BlockData presence: [u8: 0 or 1] ---
     let mut presence = [0u8; 1];
@@ -1105,7 +1138,10 @@ fn decode_v2_block(r: &mut &[u8], buf_start_len: usize) -> Result<DecodedBlock, 
         return Err(JsValue::from_str(&format!(
             "invalid presence byte={} at pos={} (v1_tx_count was {}, {} bytes remaining). \
              first 16 bytes at cursor: {:02x?}",
-            presence[0], pos(), v1_tx_count, r.len(),
+            presence[0],
+            pos(),
+            v1_tx_count,
+            r.len(),
             &r[..std::cmp::min(16, r.len())]
         )));
     }
@@ -1134,15 +1170,14 @@ fn decode_v2_block(r: &mut &[u8], buf_start_len: usize) -> Result<DecodedBlock, 
     let v2_txn_pos = pos();
     // Capture context bytes before decode attempt for debugging
     let context_bytes: Vec<u8> = r[..std::cmp::min(64, r.len())].to_vec();
-    let mut txns: Vec<v2::Transaction> = Vec::decode(r)
-        .map_err(|e| {
-            let hex_ctx: String = context_bytes.iter().map(|b| format!("{:02x}", b)).collect();
-            JsValue::from_str(&format!(
-                "v2 txn decode failed at pos={v2_txn_pos} (v2_height={height}, {} bytes remain): {e}\n\
+    let mut txns: Vec<v2::Transaction> = Vec::decode(r).map_err(|e| {
+        let hex_ctx: String = context_bytes.iter().map(|b| format!("{:02x}", b)).collect();
+        JsValue::from_str(&format!(
+            "v2 txn decode failed at pos={v2_txn_pos} (v2_height={height}, {} bytes remain): {e}\n\
                  first 64 bytes at decode start: {hex_ctx}",
-                context_bytes.len() + r.len()
-            ))
-        })?;
+            context_bytes.len() + r.len()
+        ))
+    })?;
     let num_leaves = u64::decode(r).map_err(dec_err)?;
     set_proof_lengths(&mut txns, num_leaves);
     let leaves = collect_element_leaves(&txns);
@@ -1198,18 +1233,20 @@ async fn send_v2_blocks_rpc(
     let mut cursor: &[u8] = &resp_data;
     let total_len = resp_data.len();
 
-    let block_count = u64::decode(&mut cursor)
-        .map_err(|e| JsValue::from_str(&e.to_string()))? as usize;
+    let block_count =
+        u64::decode(&mut cursor).map_err(|e| JsValue::from_str(&e.to_string()))? as usize;
 
     let mut blocks = Vec::with_capacity(block_count);
     for i in 0..block_count {
         let pre_pos = total_len - cursor.len();
-        let block = decode_v2_block(&mut cursor, total_len)
-            .map_err(|e| JsValue::from_str(&format!(
+        let block = decode_v2_block(&mut cursor, total_len).map_err(|e| {
+            JsValue::from_str(&format!(
                 "block {i}/{block_count} (pos={}, {} bytes remaining): {}",
-                total_len - cursor.len(), cursor.len(),
+                total_len - cursor.len(),
+                cursor.len(),
                 e.as_string().unwrap_or_default()
-            )))?;
+            ))
+        })?;
         let raw = if include_raw {
             let post_pos = total_len - cursor.len();
             resp_data[pre_pos..post_pos].to_vec()
@@ -1219,8 +1256,7 @@ async fn send_v2_blocks_rpc(
         blocks.push((block, raw));
     }
 
-    let remaining = u64::decode(&mut cursor)
-        .map_err(|e| JsValue::from_str(&e.to_string()))?;
+    let remaining = u64::decode(&mut cursor).map_err(|e| JsValue::from_str(&e.to_string()))?;
 
     stream.close_writer().await?;
     Ok((blocks, remaining))
@@ -1254,25 +1290,23 @@ async fn send_checkpoint_rpc(
     let mut cursor: &[u8] = &resp_data;
 
     // Decode V2Block
-    let block = decode_v2_block(&mut cursor, total_len)
-        .map_err(|e| {
-            JsValue::from_str(&format!(
-                "checkpoint block decode failed ({} bytes remaining of {}): {}",
-                cursor.len(),
-                total_len,
-                e.as_string().unwrap_or_default()
-            ))
-        })?;
+    let block = decode_v2_block(&mut cursor, total_len).map_err(|e| {
+        JsValue::from_str(&format!(
+            "checkpoint block decode failed ({} bytes remaining of {}): {}",
+            cursor.len(),
+            total_len,
+            e.as_string().unwrap_or_default()
+        ))
+    })?;
 
     // Decode consensus.State
-    let state = sia::consensus::State::decode(&mut cursor)
-        .map_err(|e| {
-            JsValue::from_str(&format!(
-                "checkpoint state decode failed ({} bytes remaining): {}",
-                cursor.len(),
-                e
-            ))
-        })?;
+    let state = sia::consensus::State::decode(&mut cursor).map_err(|e| {
+        JsValue::from_str(&format!(
+            "checkpoint state decode failed ({} bytes remaining): {}",
+            cursor.len(),
+            e
+        ))
+    })?;
 
     stream.close_writer().await?;
     Ok((block, state))
@@ -1648,8 +1682,7 @@ fn parse_filter_file(data: &[u8]) -> Result<FilterFile, String> {
             }
             let mut block_id = [0u8; 32];
             block_id.copy_from_slice(&data[pos..pos + 32]);
-            let address_count =
-                u16::from_le_bytes(data[pos + 32..pos + 34].try_into().unwrap());
+            let address_count = u16::from_le_bytes(data[pos + 32..pos + 34].try_into().unwrap());
             let filter_len =
                 u16::from_le_bytes(data[pos + 34..pos + 36].try_into().unwrap()) as usize;
             pos += 36;
@@ -1657,7 +1690,11 @@ fn parse_filter_file(data: &[u8]) -> Result<FilterFile, String> {
             if pos + filter_len > data.len() {
                 return Err(format!(
                     "truncated v2 filter data: entry {}, pos {}, filter_len {}, data_len {}, address_count {}",
-                    i, pos, filter_len, data.len(), address_count,
+                    i,
+                    pos,
+                    filter_len,
+                    data.len(),
+                    address_count,
                 ));
             }
             let filter_data = data[pos..pos + filter_len].to_vec();
@@ -1681,8 +1718,7 @@ fn parse_filter_file(data: &[u8]) -> Result<FilterFile, String> {
             let height = u64::from_le_bytes(data[pos..pos + 8].try_into().unwrap());
             let mut block_id = [0u8; 32];
             block_id.copy_from_slice(&data[pos + 8..pos + 40]);
-            let address_count =
-                u16::from_le_bytes(data[pos + 40..pos + 42].try_into().unwrap());
+            let address_count = u16::from_le_bytes(data[pos + 40..pos + 42].try_into().unwrap());
             let filter_len =
                 u32::from_le_bytes(data[pos + 42..pos + 46].try_into().unwrap()) as usize;
             pos += 46;
@@ -1690,7 +1726,11 @@ fn parse_filter_file(data: &[u8]) -> Result<FilterFile, String> {
             if pos + filter_len > data.len() {
                 return Err(format!(
                     "truncated filter data: entry at height {}, pos {}, filter_len {}, data_len {}, address_count {}",
-                    height, pos, filter_len, data.len(), address_count,
+                    height,
+                    pos,
+                    filter_len,
+                    data.len(),
+                    address_count,
                 ));
             }
             let filter_data = data[pos..pos + filter_len].to_vec();
@@ -1734,7 +1774,12 @@ fn serialize_filter_file(entries: &[FilterEntry], p: u32, tip_height: u64) -> Ve
 }
 
 /// Serialize filter entries to SCBF v2 compact format (implicit heights, uint16 data lengths).
-fn serialize_filter_file_v2(entries: &[FilterEntry], p: u32, tip_height: u64, start_height: u64) -> Vec<u8> {
+fn serialize_filter_file_v2(
+    entries: &[FilterEntry],
+    p: u32,
+    tip_height: u64,
+    start_height: u64,
+) -> Vec<u8> {
     let mut buf = Vec::new();
     // Header (32 bytes)
     buf.extend_from_slice(b"SCBF");
@@ -1756,7 +1801,11 @@ fn serialize_filter_file_v2(entries: &[FilterEntry], p: u32, tip_height: u64, st
 /// Append new filter entries to an already-serialized SCBF byte blob in-place,
 /// updating the count and tip_height header fields without re-serializing.
 /// Supports both SCBF v1 (46-byte entries with height) and v2 (36-byte compact).
-fn append_entries_to_filter_bytes(bytes: &mut Vec<u8>, new_entries: &[FilterEntry], tip_height: u64) {
+fn append_entries_to_filter_bytes(
+    bytes: &mut Vec<u8>,
+    new_entries: &[FilterEntry],
+    tip_height: u64,
+) {
     if new_entries.is_empty() || bytes.len() < 24 {
         return;
     }
@@ -1873,7 +1922,11 @@ fn parse_txindex_file(data: &[u8]) -> Result<(Vec<TxIndexEntry>, u32), String> {
 
     let expected_len = 16 + count as usize * 12;
     if data.len() < expected_len {
-        return Err(format!("txindex file truncated: expected {} bytes, got {}", expected_len, data.len()));
+        return Err(format!(
+            "txindex file truncated: expected {} bytes, got {}",
+            expected_len,
+            data.len()
+        ));
     }
 
     let mut entries = Vec::with_capacity(count as usize);
@@ -1895,7 +1948,10 @@ async fn fetch_bytes(url: &str) -> Result<Vec<u8>, JsValue> {
     let global = js_sys::global();
     let fetch_fn = js_sys::Reflect::get(&global, &JsValue::from_str("fetch"))?;
     let fetch_fn: js_sys::Function = fetch_fn.dyn_into()?;
-    let resp_value = JsFuture::from(js_sys::Promise::from(fetch_fn.call1(&JsValue::NULL, &JsValue::from_str(url))?)).await?;
+    let resp_value = JsFuture::from(js_sys::Promise::from(
+        fetch_fn.call1(&JsValue::NULL, &JsValue::from_str(url))?,
+    ))
+    .await?;
     let resp: web_sys::Response = resp_value.dyn_into()?;
     if !resp.ok() {
         return Err(JsValue::from_str(&format!(
@@ -1928,13 +1984,20 @@ struct UtxoDetail {
 
 /// Scan a block for siacoin activity involving the target address.
 /// Returns (received, sent, utxo_details).
-fn scan_block_balance(block: &DecodedBlock, target: &Address) -> (u128, u128, Vec<UtxoDetail>) {
+///
+/// `block_id` must be the correct block ID (from header sync or filter entries).
+/// `DecodedBlock::id()` is wrong for v1 blocks (uses zero commitment instead of
+/// the v1 merkle root), so callers must provide the authoritative ID.
+fn scan_block_balance(
+    block: &DecodedBlock,
+    block_id: &BlockID,
+    target: &Address,
+) -> (u128, u128, Vec<UtxoDetail>) {
     let mut received: u128 = 0;
     let mut sent: u128 = 0;
     let mut details = Vec::new();
 
     // Check miner payouts
-    let block_id = block.id();
     for (i, payout) in block.miner_payouts.iter().enumerate() {
         if payout.address == *target {
             received += *payout.value;
@@ -1946,63 +2009,6 @@ fn scan_block_balance(block: &DecodedBlock, target: &Address) -> (u128, u128, Ve
                 txid: String::new(),
                 addresses: Vec::new(), // coinbase — no other addresses
             });
-        }
-    }
-
-    // Check V1 transactions
-    for txn in &block.v1_transactions {
-        let txid = txn.id();
-        let txid_str = txid.to_string();
-
-        // Collect other addresses in this transaction
-        let mut txn_addrs = Vec::new();
-        let mut seen = std::collections::HashSet::new();
-        for input in &txn.siacoin_inputs {
-            let addr = input.unlock_conditions.address();
-            if addr != *target {
-                let s = addr.to_string();
-                if seen.insert(s.clone()) {
-                    txn_addrs.push(s);
-                }
-            }
-        }
-        for output in &txn.siacoin_outputs {
-            if output.address != *target {
-                let s = output.address.to_string();
-                if seen.insert(s.clone()) {
-                    txn_addrs.push(s);
-                }
-            }
-        }
-
-        for (i, output) in txn.siacoin_outputs.iter().enumerate() {
-            if output.address == *target {
-                let value: u128 = *output.value;
-                received += value;
-                details.push(UtxoDetail {
-                    direction: "received",
-                    amount: value,
-                    source: "v1_output".into(),
-                    output_id: txn.siacoin_output_id(i).to_string(),
-                    txid: txid_str.clone(),
-                    addresses: txn_addrs.clone(),
-                });
-            }
-        }
-        for input in &txn.siacoin_inputs {
-            let addr = input.unlock_conditions.address();
-            if addr == *target {
-                // V1 inputs reference a parent output ID but don't carry the spent value.
-                // Mark as sent with 0 so the history shows the activity.
-                details.push(UtxoDetail {
-                    direction: "sent",
-                    amount: 0,
-                    source: "v1_input".into(),
-                    output_id: input.parent_id.to_string(),
-                    txid: txid_str.clone(),
-                    addresses: txn_addrs.clone(),
-                });
-            }
         }
     }
 
@@ -2146,7 +2152,10 @@ fn scan_block_balance(block: &DecodedBlock, target: &Address) -> (u128, u128, Ve
         let txid = txn.id();
         let txid_str = txid.to_string();
 
-        let is_sender = txn.siacoin_inputs.iter().any(|input| input.unlock_conditions.address() == *target);
+        let is_sender = txn
+            .siacoin_inputs
+            .iter()
+            .any(|input| input.unlock_conditions.address() == *target);
 
         // Collect all unique addresses (excluding target)
         let mut v1_addrs = Vec::new();
@@ -2185,20 +2194,44 @@ fn scan_block_balance(block: &DecodedBlock, target: &Address) -> (u128, u128, Ve
             }
         }
 
-        // If we're a sender, total sent = sum(all outputs) + fees
+        // If we're a sender, track each input's parent_id to mark UTXOs as spent.
+        // V1 inputs don't carry their value inline, so we compute the total from
+        // outputs + fees and split it across matching inputs.
         if is_sender {
             let total_output_value: u128 = txn.siacoin_outputs.iter().map(|o| *o.value).sum();
             let total_fees: u128 = txn.miner_fees.iter().map(|f| **f).sum();
             let total_sent = total_output_value + total_fees;
-            sent += total_sent;
-            details.push(UtxoDetail {
-                direction: "sent",
-                amount: total_sent,
-                source: "v1_input".into(),
-                output_id: String::new(),
-                txid: txid_str.clone(),
-                addresses: v1_addrs.clone(),
-            });
+
+            // Count how many inputs belong to the target address
+            let matching_inputs: Vec<_> = txn
+                .siacoin_inputs
+                .iter()
+                .filter(|input| input.unlock_conditions.address() == *target)
+                .collect();
+            let num_matching = matching_inputs.len() as u128;
+
+            if num_matching > 0 {
+                // Split total evenly across inputs; assign remainder to the last one
+                let per_input = total_sent / num_matching;
+                let remainder = total_sent % num_matching;
+
+                for (i, input) in matching_inputs.iter().enumerate() {
+                    let amount = if i as u128 == num_matching - 1 {
+                        per_input + remainder
+                    } else {
+                        per_input
+                    };
+                    details.push(UtxoDetail {
+                        direction: "sent",
+                        amount,
+                        source: "v1_input".into(),
+                        output_id: input.parent_id.to_string(),
+                        txid: txid_str.clone(),
+                        addresses: v1_addrs.clone(),
+                    });
+                }
+                sent += total_sent;
+            }
         }
     }
 
@@ -2331,7 +2364,9 @@ fn parse_cert_hash(cert_hash_hex: &Option<String>) -> Result<Option<Vec<u8>>, Js
         Some(h) if !h.is_empty() => {
             let bytes = hex_to_bytes(h)?;
             if bytes.len() != 32 {
-                return Err(JsValue::from_str("cert_hash must be 64 hex characters (SHA-256)"));
+                return Err(JsValue::from_str(
+                    "cert_hash must be 64 hex characters (SHA-256)",
+                ));
             }
             Ok(Some(bytes))
         }
@@ -2405,8 +2440,10 @@ pub async fn sync_chain(
     let cert_hash = parse_cert_hash(&cert_hash_hex)?;
 
     // V2 checkpoint block IDs (block before V2 require height)
-    const V2_CHECKPOINT_MAINNET: &str = "0000000000000000b3b69b56214c974ce293a310d5fcfedb85f2e6b039e5bac0"; // height 529999
-    const V2_CHECKPOINT_ZEN: &str = "0000000863c1e1191775e601ead23feeae6f5bab166eb1da538b091c6613be72"; // height 49
+    const V2_CHECKPOINT_MAINNET: &str =
+        "0000000000000000b3b69b56214c974ce293a310d5fcfedb85f2e6b039e5bac0"; // height 529999
+    const V2_CHECKPOINT_ZEN: &str =
+        "0000000863c1e1191775e601ead23feeae6f5bab166eb1da538b091c6613be72"; // height 49
 
     log("Connecting...", "info");
     let conn = connect_and_handshake(&url, genesis_id, cert_hash.as_deref()).await?;
@@ -2425,7 +2462,9 @@ pub async fn sync_chain(
 
     // Determine starting chain index
     let start_index = if let Some(sh) = start_height {
-        let checkpoint_hex = if genesis_id_hex == "25f6e3b9295a61f69fcb956aca9f0076234ecf2e02d399db5448b6e22f26e81c" {
+        let checkpoint_hex = if genesis_id_hex
+            == "25f6e3b9295a61f69fcb956aca9f0076234ecf2e02d399db5448b6e22f26e81c"
+        {
             V2_CHECKPOINT_MAINNET
         } else {
             V2_CHECKPOINT_ZEN
@@ -2434,7 +2473,10 @@ pub async fn sync_chain(
             .map_err(|e| JsValue::from_str(&format!("bad checkpoint hex: {e}")))?;
         let mut id = [0u8; 32];
         id.copy_from_slice(&checkpoint_bytes);
-        log(&format!("Starting header sync from V2 require height (height {sh})"), "info");
+        log(
+            &format!("Starting header sync from V2 require height (height {sh})"),
+            "info",
+        );
         ChainIndex {
             height: sh.saturating_sub(1),
             id: BlockID::new(id),
@@ -2474,7 +2516,9 @@ pub async fn sync_chain(
                 retries += 1;
                 if retries > MAX_RETRIES {
                     log(
-                        &format!("  Failed after {MAX_RETRIES} retries at {total_headers} headers, continuing with what we have"),
+                        &format!(
+                            "  Failed after {MAX_RETRIES} retries at {total_headers} headers, continuing with what we have"
+                        ),
                         "info",
                     );
                     break;
@@ -2486,7 +2530,8 @@ pub async fn sync_chain(
                     "info",
                 );
                 let _ = wt.close();
-                let new_conn = connect_and_handshake(&url, genesis_id, cert_hash.as_deref()).await?;
+                let new_conn =
+                    connect_and_handshake(&url, genesis_id, cert_hash.as_deref()).await?;
                 wt = new_conn.wt;
                 log("  Reconnected, resuming...", "ok");
                 continue;
@@ -2554,7 +2599,8 @@ pub async fn sync_chain(
         log("", "info");
         log("Fetching tip block via SendV2Blocks...", "info");
 
-        let block_json_value = match send_v2_blocks_rpc(&wt, vec![header.parent_id], 1, false).await {
+        let block_json_value = match send_v2_blocks_rpc(&wt, vec![header.parent_id], 1, false).await
+        {
             Ok((blocks, remaining)) if !blocks.is_empty() => {
                 let block_json = block_to_json(&blocks[0].0);
                 log(
@@ -2649,9 +2695,7 @@ pub async fn scan_balance(
 
     if start_height > 0 {
         log(
-            &format!(
-                "Syncing headers to height {target_header_height} to find starting block..."
-            ),
+            &format!("Syncing headers to height {target_header_height} to find starting block..."),
             "info",
         );
 
@@ -2668,8 +2712,7 @@ pub async fn scan_balance(
                 break;
             }
             let batch_size = std::cmp::min(max_per_batch, remaining_to_target);
-            let resp =
-                send_headers_rpc(&conn.wt, current_index, batch_size).await?;
+            let resp = send_headers_rpc(&conn.wt, current_index, batch_size).await?;
             let batch_count = resp.headers.len() as u64;
             if batch_count == 0 {
                 return Err(JsValue::from_str(&format!(
@@ -2739,8 +2782,7 @@ pub async fn scan_balance(
     let mut wt = conn.wt;
 
     loop {
-        let rpc_result =
-            send_v2_blocks_rpc(&wt, history.clone(), blocks_per_batch, false).await;
+        let rpc_result = send_v2_blocks_rpc(&wt, history.clone(), blocks_per_batch, false).await;
 
         let (blocks_with_raw, remaining) = match rpc_result {
             Ok(result) => result,
@@ -2752,7 +2794,8 @@ pub async fn scan_balance(
                     "info",
                 );
                 let _ = wt.close();
-                let new_conn = connect_and_handshake(&url, genesis_id, cert_hash.as_deref()).await?;
+                let new_conn =
+                    connect_and_handshake(&url, genesis_id, cert_hash.as_deref()).await?;
                 wt = new_conn.wt;
                 log("  Reconnected, resuming scan...", "ok");
 
@@ -2776,7 +2819,8 @@ pub async fn scan_balance(
 
         for (block, _raw) in &blocks_with_raw {
             let height = block.v2_height.unwrap_or(current_height);
-            let (received, sent, _details) = scan_block_balance(block, &target);
+            let block_id = block.id(); // correct for v2; v1 miner payouts will have wrong output IDs
+            let (received, sent, _details) = scan_block_balance(block, &block_id, &target);
 
             if received > 0 || sent > 0 {
                 txns_found += 1;
@@ -2834,8 +2878,14 @@ pub async fn scan_balance(
     log("Scan complete!", "ok");
     log(&format!("  Blocks scanned:  {blocks_scanned}"), "data");
     log(&format!("  Transactions:    {txns_found}"), "data");
-    log(&format!("  Total received:  {}", format_sc(total_received)), "data");
-    log(&format!("  Total sent:      {}", format_sc(total_sent)), "data");
+    log(
+        &format!("  Total received:  {}", format_sc(total_received)),
+        "data",
+    );
+    log(
+        &format!("  Total sent:      {}", format_sc(total_sent)),
+        "data",
+    );
     log(&format!("  Net balance:     {}", format_sc(net)), "ok");
 
     let result = json!({
@@ -2889,11 +2939,15 @@ pub async fn sync_headers(
 
     // Load cached header IDs (memory cache or IndexedDB) as starting point
     let net = get_network_prefix();
-    let mut synced_ids: Vec<BlockID> = CACHED_HEADER_IDS.with(|cache| {
-        cache.borrow().as_ref().and_then(|(n, ids)| {
-            if *n == net { Some(ids.clone()) } else { None }
+    let mut synced_ids: Vec<BlockID> = CACHED_HEADER_IDS
+        .with(|cache| {
+            cache.borrow().as_ref().and_then(
+                |(n, ids)| {
+                    if *n == net { Some(ids.clone()) } else { None }
+                },
+            )
         })
-    }).unwrap_or_default();
+        .unwrap_or_default();
 
     if synced_ids.is_empty() {
         if let Ok(Some(ids)) = load_header_ids().await {
@@ -2949,9 +3003,7 @@ pub async fn sync_headers(
                 retries += 1;
                 if retries > MAX_RETRIES {
                     log(
-                        &format!(
-                            "Failed after {MAX_RETRIES} retries at {total_headers} headers"
-                        ),
+                        &format!("Failed after {MAX_RETRIES} retries at {total_headers} headers"),
                         "err",
                     );
                     break;
@@ -3007,13 +3059,15 @@ pub async fn sync_headers(
             "ok",
         );
         // Save updated headers to cache
-        CACHED_HEADER_IDS.with(|cache| *cache.borrow_mut() = Some((net.clone(), synced_ids.clone())));
+        CACHED_HEADER_IDS
+            .with(|cache| *cache.borrow_mut() = Some((net.clone(), synced_ids.clone())));
     } else {
         log(
             &format!("{total_headers} headers synced, already at tip"),
             "ok",
         );
-        CACHED_HEADER_IDS.with(|cache| *cache.borrow_mut() = Some((net.clone(), synced_ids.clone())));
+        CACHED_HEADER_IDS
+            .with(|cache| *cache.borrow_mut() = Some((net.clone(), synced_ids.clone())));
     }
 
     let ids = synced_ids;
@@ -3085,10 +3139,7 @@ pub async fn generate_filters_chunk(
     // Connect
     log("Connecting...", "info");
     let conn = connect_and_handshake(&url, genesis_id, cert_hash.as_deref()).await?;
-    log(
-        &format!("Connected (peer {})", conn.peer_info.addr),
-        "ok",
-    );
+    log(&format!("Connected (peer {})", conn.peer_info.addr), "ok");
     let mut wt = conn.wt;
 
     let mut filter_entries: Vec<FilterEntry> = Vec::new();
@@ -3310,9 +3361,7 @@ pub async fn generate_filters_chunk(
             100
         };
         log(
-            &format!(
-                "  {blocks_processed}/{max_blocks} ({pct}%) | {total_addresses} addrs"
-            ),
+            &format!("  {blocks_processed}/{max_blocks} ({pct}%) | {total_addresses} addrs"),
             "data",
         );
 
@@ -3421,26 +3470,42 @@ pub async fn generate_filters(
 
     // Hardcoded checkpoint block IDs for V2-only mode (block before V2 require height)
     // These allow skipping the full header sync by jumping directly to V2 blocks.
-    const V2_CHECKPOINT_MAINNET: &str = "0000000000000000b3b69b56214c974ce293a310d5fcfedb85f2e6b039e5bac0"; // height 529999
-    const V2_CHECKPOINT_ZEN: &str = "0000000863c1e1191775e601ead23feeae6f5bab166eb1da538b091c6613be72"; // height 49
+    const V2_CHECKPOINT_MAINNET: &str =
+        "0000000000000000b3b69b56214c974ce293a310d5fcfedb85f2e6b039e5bac0"; // height 529999
+    const V2_CHECKPOINT_ZEN: &str =
+        "0000000863c1e1191775e601ead23feeae6f5bab166eb1da538b091c6613be72"; // height 49
 
-    let cache_key = prefixed_key(if start_height.is_some() { "filter_entries_v2" } else { "filter_entries" });
+    let cache_key = prefixed_key(if start_height.is_some() {
+        "filter_entries_v2"
+    } else {
+        "filter_entries"
+    });
     let start_offset: u64 = start_height.map(|h| h.saturating_sub(1)).unwrap_or(0);
     let mut wt = conn.wt;
     let mut tip_height: u64 = 0;
 
     // Step 2: Get header IDs (skip entirely for V2-only mode)
     let header_ids: Vec<BlockID> = if start_height.is_some() {
-        log(&format!("V2-only mode: skipping header sync, starting from height {}", start_offset + 1), "info");
+        log(
+            &format!(
+                "V2-only mode: skipping header sync, starting from height {}",
+                start_offset + 1
+            ),
+            "info",
+        );
         Vec::new() // not needed — v2 blocks have correct block.id()
     } else {
         // Full mode: load cached headers and sync new ones from peer
         let net = get_network_prefix();
-        let mut synced_ids: Vec<BlockID> = CACHED_HEADER_IDS.with(|cache| {
-            cache.borrow().as_ref().and_then(|(n, ids)| {
-                if *n == net { Some(ids.clone()) } else { None }
+        let mut synced_ids: Vec<BlockID> = CACHED_HEADER_IDS
+            .with(|cache| {
+                cache.borrow().as_ref().and_then(
+                    |(n, ids)| {
+                        if *n == net { Some(ids.clone()) } else { None }
+                    },
+                )
             })
-        }).unwrap_or_default();
+            .unwrap_or_default();
 
         if synced_ids.is_empty() {
             if let Ok(Some(ids)) = load_header_ids().await {
@@ -3484,7 +3549,9 @@ pub async fn generate_filters(
                     retries += 1;
                     if retries > MAX_RETRIES {
                         log(
-                            &format!("  Failed after {MAX_RETRIES} retries at {total_headers} headers, continuing with what we have"),
+                            &format!(
+                                "  Failed after {MAX_RETRIES} retries at {total_headers} headers, continuing with what we have"
+                            ),
                             "info",
                         );
                         break;
@@ -3496,7 +3563,8 @@ pub async fn generate_filters(
                         "info",
                     );
                     let _ = wt.close();
-                    let new_conn = connect_and_handshake(&url, genesis_id, cert_hash.as_deref()).await?;
+                    let new_conn =
+                        connect_and_handshake(&url, genesis_id, cert_hash.as_deref()).await?;
                     wt = new_conn.wt;
                     log("  Reconnected, resuming...", "ok");
                     continue;
@@ -3536,13 +3604,15 @@ pub async fn generate_filters(
                 &format!("Fetched {new_headers} new headers (total: {total_headers})"),
                 "ok",
             );
-            CACHED_HEADER_IDS.with(|cache| *cache.borrow_mut() = Some((net.clone(), synced_ids.clone())));
+            CACHED_HEADER_IDS
+                .with(|cache| *cache.borrow_mut() = Some((net.clone(), synced_ids.clone())));
         } else {
             log(
                 &format!("{total_headers} headers synced, already at tip"),
                 "ok",
             );
-            CACHED_HEADER_IDS.with(|cache| *cache.borrow_mut() = Some((net.clone(), synced_ids.clone())));
+            CACHED_HEADER_IDS
+                .with(|cache| *cache.borrow_mut() = Some((net.clone(), synced_ids.clone())));
         }
 
         tip_height = synced_ids.len() as u64;
@@ -3584,11 +3654,9 @@ pub async fn generate_filters(
                             ),
                             "err",
                         );
-                        let _ = JsFuture::from(idb_save(
-                            &cache_key,
-                            Uint8Array::new_with_length(0),
-                        ))
-                        .await;
+                        let _ =
+                            JsFuture::from(idb_save(&cache_key, Uint8Array::new_with_length(0)))
+                                .await;
                     } else {
                         log(
                             &format!(
@@ -3599,7 +3667,13 @@ pub async fn generate_filters(
                         );
                         total_addresses = addr_total;
                         blocks_downloaded = last_height;
-                        tip_height = if cached_tip > 0 { cached_tip } else if last_height > 0 { last_height } else { tip_height };
+                        tip_height = if cached_tip > 0 {
+                            cached_tip
+                        } else if last_height > 0 {
+                            last_height
+                        } else {
+                            tip_height
+                        };
                         idb_bytes = raw;
                         resume_block_id = Some(last_bid);
                     }
@@ -3615,7 +3689,9 @@ pub async fn generate_filters(
         vec![BlockID::new(bid)]
     } else if start_height.is_some() {
         // V2-only: use hardcoded checkpoint to skip to V2 require height
-        let checkpoint_hex = if genesis_id_hex == "25f6e3b9295a61f69fcb956aca9f0076234ecf2e02d399db5448b6e22f26e81c" {
+        let checkpoint_hex = if genesis_id_hex
+            == "25f6e3b9295a61f69fcb956aca9f0076234ecf2e02d399db5448b6e22f26e81c"
+        {
             V2_CHECKPOINT_MAINNET
         } else {
             V2_CHECKPOINT_ZEN
@@ -3648,7 +3724,8 @@ pub async fn generate_filters(
                     "info",
                 );
                 let _ = wt.close();
-                let new_conn = connect_and_handshake(&url, genesis_id, cert_hash.as_deref()).await?;
+                let new_conn =
+                    connect_and_handshake(&url, genesis_id, cert_hash.as_deref()).await?;
                 wt = new_conn.wt;
                 log("  Reconnected, resuming...", "ok");
                 if history.is_empty() && blocks_downloaded > 0 {
@@ -3720,9 +3797,7 @@ pub async fn generate_filters(
             100
         };
         log(
-            &format!(
-                "  Blocks: {processed} / ~{total_est} ({pct}%) | {total_addresses} addresses",
-            ),
+            &format!("  Blocks: {processed} / ~{total_est} ({pct}%) | {total_addresses} addresses",),
             "data",
         );
 
@@ -3789,18 +3864,9 @@ pub async fn generate_filters(
     log("", "info");
     log("Filter generation complete!", "ok");
     let total_processed = blocks_downloaded.saturating_sub(start_offset);
-    log(
-        &format!("  Blocks processed: {total_processed}"),
-        "data",
-    );
-    log(
-        &format!("  Total addresses:  {total_addresses}"),
-        "data",
-    );
-    log(
-        &format!("  Tip height:       {tip_height}"),
-        "data",
-    );
+    log(&format!("  Blocks processed: {total_processed}"), "data");
+    log(&format!("  Total addresses:  {total_addresses}"), "data");
+    log(&format!("  Tip height:       {tip_height}"), "data");
     log(
         &format!(
             "  File size:        {:.1} KB",
@@ -3849,8 +3915,10 @@ pub async fn generate_txindex(
     let cert_hash = parse_cert_hash(&cert_hash_hex)?;
 
     // V2 checkpoint block IDs (block before V2 require height)
-    const V2_CHECKPOINT_MAINNET: &str = "0000000000000000b3b69b56214c974ce293a310d5fcfedb85f2e6b039e5bac0"; // height 529999
-    const V2_CHECKPOINT_ZEN: &str = "0000000863c1e1191775e601ead23feeae6f5bab166eb1da538b091c6613be72"; // height 49
+    const V2_CHECKPOINT_MAINNET: &str =
+        "0000000000000000b3b69b56214c974ce293a310d5fcfedb85f2e6b039e5bac0"; // height 529999
+    const V2_CHECKPOINT_ZEN: &str =
+        "0000000863c1e1191775e601ead23feeae6f5bab166eb1da538b091c6613be72"; // height 49
 
     log("Connecting to peer...", "info");
     let conn = connect_and_handshake(&url, genesis_id, cert_hash.as_deref()).await?;
@@ -3862,7 +3930,11 @@ pub async fn generate_txindex(
         "ok",
     );
 
-    let cache_key = prefixed_key(if start_height.is_some() { "txindex_entries_v2" } else { "txindex_entries" });
+    let cache_key = prefixed_key(if start_height.is_some() {
+        "txindex_entries_v2"
+    } else {
+        "txindex_entries"
+    });
     let checkpoint_key = format!("{}_checkpoint", cache_key);
     let start_offset: u64 = start_height.map(|h| h.saturating_sub(1)).unwrap_or(0);
     let mut wt = conn.wt;
@@ -3879,24 +3951,36 @@ pub async fn generate_txindex(
             let cached_bytes = arr.to_vec();
             if let Ok((cached_entries, cached_tip)) = parse_txindex_file(&cached_bytes) {
                 let cached_count = cached_entries.len() as u64;
-                max_cached_height = cached_entries.iter().map(|e| e.height as u64).max().unwrap_or(0);
+                max_cached_height = cached_entries
+                    .iter()
+                    .map(|e| e.height as u64)
+                    .max()
+                    .unwrap_or(0);
                 // Corruption detection: max height unreasonably far from start
                 // (bogus heights from count-based era). Note: count-based check
                 // doesn't work for txindex since there can be many txns per block.
-                let height_too_high = start_height.is_some() && max_cached_height > start_offset + 200_000;
+                let height_too_high =
+                    start_height.is_some() && max_cached_height > start_offset + 200_000;
                 if height_too_high {
                     log(
-                        &format!("Txindex cache corrupted: {} entries, max height {} (start {}) — discarding",
-                            cached_count, max_cached_height, start_offset),
+                        &format!(
+                            "Txindex cache corrupted: {} entries, max height {} (start {}) — discarding",
+                            cached_count, max_cached_height, start_offset
+                        ),
                         "err",
                     );
                     max_cached_height = 0;
-                    let _ = JsFuture::from(idb_save(&cache_key, Uint8Array::new_with_length(0))).await;
-                    let _ = JsFuture::from(idb_save(&checkpoint_key, Uint8Array::new_with_length(0))).await;
+                    let _ =
+                        JsFuture::from(idb_save(&cache_key, Uint8Array::new_with_length(0))).await;
+                    let _ =
+                        JsFuture::from(idb_save(&checkpoint_key, Uint8Array::new_with_length(0)))
+                            .await;
                 } else {
                     log(
-                        &format!("Loaded {} cached txindex entries from IndexedDB (up to height {}, tip {})",
-                            cached_count, max_cached_height, cached_tip),
+                        &format!(
+                            "Loaded {} cached txindex entries from IndexedDB (up to height {}, tip {})",
+                            cached_count, max_cached_height, cached_tip
+                        ),
                         "ok",
                     );
                     total_txns = cached_count;
@@ -3926,18 +4010,25 @@ pub async fn generate_txindex(
                     bid.copy_from_slice(&ckpt_bytes[8..40]);
                     // Only trust checkpoint if its height is reasonable
                     // (between max_cached_height and max_cached_height + a reasonable gap)
-                    if ckpt_blocks >= max_cached_height && ckpt_blocks <= max_cached_height + 10000 {
+                    if ckpt_blocks >= max_cached_height && ckpt_blocks <= max_cached_height + 10000
+                    {
                         blocks_downloaded = ckpt_blocks;
                         log(
-                            &format!("Resuming from checkpoint: height {}, last block ID {}..{}",
-                                blocks_downloaded, &hex::encode(&bid)[..8], &hex::encode(&bid)[56..]),
+                            &format!(
+                                "Resuming from checkpoint: height {}, last block ID {}..{}",
+                                blocks_downloaded,
+                                &hex::encode(&bid)[..8],
+                                &hex::encode(&bid)[56..]
+                            ),
                             "ok",
                         );
                         resume_block_id = Some(BlockID::new(bid));
                     } else {
                         log(
-                            &format!("Ignoring stale checkpoint (height {} vs cached {})",
-                                ckpt_blocks, max_cached_height),
+                            &format!(
+                                "Ignoring stale checkpoint (height {} vs cached {})",
+                                ckpt_blocks, max_cached_height
+                            ),
                             "info",
                         );
                     }
@@ -3949,19 +4040,32 @@ pub async fn generate_txindex(
     // If no valid checkpoint but we have cached entries, try to get a resume block_id
     // from the filter cache (filter entries store block_ids by height)
     if resume_block_id.is_none() && max_cached_height > 0 {
-        let filter_key = prefixed_key(if start_height.is_some() { "filter_entries_v2" } else { "filter_entries" });
+        let filter_key = prefixed_key(if start_height.is_some() {
+            "filter_entries_v2"
+        } else {
+            "filter_entries"
+        });
         if let Ok(result) = JsFuture::from(idb_load(&filter_key)).await {
             if !result.is_null() && !result.is_undefined() {
                 let arr = Uint8Array::from(result);
                 let filter_bytes = arr.to_vec();
                 if let Ok(filter_file) = parse_filter_file(&filter_bytes) {
                     // Find the filter entry closest to max_cached_height
-                    if let Some(entry) = filter_file.entries.iter().rev().find(|e| e.height <= max_cached_height) {
+                    if let Some(entry) = filter_file
+                        .entries
+                        .iter()
+                        .rev()
+                        .find(|e| e.height <= max_cached_height)
+                    {
                         resume_block_id = Some(BlockID::new(entry.block_id));
                         blocks_downloaded = entry.height;
                         log(
-                            &format!("Resuming from filter entry at height {} (block {}..{})",
-                                entry.height, &hex::encode(&entry.block_id)[..8], &hex::encode(&entry.block_id)[56..]),
+                            &format!(
+                                "Resuming from filter entry at height {} (block {}..{})",
+                                entry.height,
+                                &hex::encode(&entry.block_id)[..8],
+                                &hex::encode(&entry.block_id)[56..]
+                            ),
                             "ok",
                         );
                     }
@@ -3974,7 +4078,9 @@ pub async fn generate_txindex(
     let mut history: Vec<BlockID> = if let Some(bid) = resume_block_id {
         vec![bid]
     } else if start_height.is_some() {
-        let checkpoint_hex = if genesis_id_hex == "25f6e3b9295a61f69fcb956aca9f0076234ecf2e02d399db5448b6e22f26e81c" {
+        let checkpoint_hex = if genesis_id_hex
+            == "25f6e3b9295a61f69fcb956aca9f0076234ecf2e02d399db5448b6e22f26e81c"
+        {
             V2_CHECKPOINT_MAINNET
         } else {
             V2_CHECKPOINT_ZEN
@@ -3985,13 +4091,19 @@ pub async fn generate_txindex(
         id.copy_from_slice(&checkpoint_bytes);
         // Reset blocks_downloaded to start_offset since we're starting from V2 checkpoint
         blocks_downloaded = start_offset;
-        log(&format!("V2-only mode: starting from height {}", start_offset + 1), "info");
+        log(
+            &format!("V2-only mode: starting from height {}", start_offset + 1),
+            "info",
+        );
         vec![BlockID::new(id)]
     } else {
         Vec::new()
     };
 
-    log("Downloading blocks and building transaction index...", "info");
+    log(
+        "Downloading blocks and building transaction index...",
+        "info",
+    );
 
     let blocks_per_batch: u64 = 100;
     let save_interval: u64 = 1000;
@@ -4011,7 +4123,8 @@ pub async fn generate_txindex(
                     "info",
                 );
                 let _ = wt.close();
-                let new_conn = connect_and_handshake(&url, genesis_id, cert_hash.as_deref()).await?;
+                let new_conn =
+                    connect_and_handshake(&url, genesis_id, cert_hash.as_deref()).await?;
                 wt = new_conn.wt;
                 log("  Reconnected, resuming...", "ok");
                 if history.is_empty() && blocks_downloaded > 0 {
@@ -4077,9 +4190,7 @@ pub async fn generate_txindex(
             100
         };
         log(
-            &format!(
-                "  Blocks: {processed} / ~{total_est} ({pct}%) | {total_txns} transactions",
-            ),
+            &format!("  Blocks: {processed} / ~{total_est} ({pct}%) | {total_txns} transactions",),
             "data",
         );
 
@@ -4131,18 +4242,9 @@ pub async fn generate_txindex(
     log("", "info");
     log("Transaction index generation complete!", "ok");
     let total_processed = blocks_downloaded.saturating_sub(start_offset);
-    log(
-        &format!("  Blocks processed: {total_processed}"),
-        "data",
-    );
-    log(
-        &format!("  Transactions:     {total_txns}"),
-        "data",
-    );
-    log(
-        &format!("  Tip height:       {tip_height}"),
-        "data",
-    );
+    log(&format!("  Blocks processed: {total_processed}"), "data");
+    log(&format!("  Transactions:     {total_txns}"), "data");
+    log(&format!("  Tip height:       {tip_height}"), "data");
     log(
         &format!(
             "  File size:        {:.1} KB ({:.1} MB)",
@@ -4187,7 +4289,9 @@ pub async fn scan_balance_filtered(
     let target = parse_address(&target_address)?;
     let target_bytes: [u8; 32] = {
         let slice: &[u8] = target.as_ref();
-        slice.try_into().map_err(|_| JsValue::from_str("address must be 32 bytes"))?
+        slice
+            .try_into()
+            .map_err(|_| JsValue::from_str("address must be 32 bytes"))?
     };
 
     // Step 1: Load filter file
@@ -4275,7 +4379,8 @@ pub async fn scan_balance_filtered(
     let mut all_utxos: Vec<serde_json::Value> = Vec::new();
     let mut wt = conn.wt;
 
-    for (i, (height, _block_id)) in matches.iter().enumerate() {
+    for (i, (height, match_block_id)) in matches.iter().enumerate() {
+        let block_id = BlockID::from(*match_block_id);
         // Try cache first
         if let Ok(Some(cached)) = load_cached_block(*height).await {
             log(
@@ -4283,7 +4388,7 @@ pub async fn scan_balance_filtered(
                 "data",
             );
             let block = &cached;
-            let (received, sent, details) = scan_block_balance(block, &target);
+            let (received, sent, details) = scan_block_balance(block, &block_id, &target);
             if received > 0 || sent > 0 {
                 txns_found += 1;
                 total_received += received;
@@ -4302,11 +4407,21 @@ pub async fn scan_balance_filtered(
                     }));
                 }
                 let mut parts = Vec::new();
-                if received > 0 { parts.push(format!("+{}", format_sc(received))); }
-                if sent > 0 { parts.push(format!("-{}", format_sc(sent))); }
+                if received > 0 {
+                    parts.push(format!("+{}", format_sc(received)));
+                }
+                if sent > 0 {
+                    parts.push(format!("-{}", format_sc(sent)));
+                }
                 log(
-                    &format!("  [{}/{}] Height {}: {} => balance: {}",
-                        i + 1, matches.len(), height, parts.join(", "), format_sc(net)),
+                    &format!(
+                        "  [{}/{}] Height {}: {} => balance: {}",
+                        i + 1,
+                        matches.len(),
+                        height,
+                        parts.join(", "),
+                        format_sc(net)
+                    ),
                     "ok",
                 );
             } else {
@@ -4328,7 +4443,10 @@ pub async fn scan_balance_filtered(
                 }
                 None => {
                     log(
-                        &format!("  Warning: no filter entry for height {}, skipping", height - 1),
+                        &format!(
+                            "  Warning: no filter entry for height {}, skipping",
+                            height - 1
+                        ),
                         "err",
                     );
                     continue;
@@ -4347,11 +4465,22 @@ pub async fn scan_balance_filtered(
                 }
                 Err(e) => {
                     if attempt == max_retries {
-                        log(&format!("  Failed after {} retries at height {}: {:?}", max_retries, height, e), "err");
+                        log(
+                            &format!(
+                                "  Failed after {} retries at height {}: {:?}",
+                                max_retries, height, e
+                            ),
+                            "err",
+                        );
                         break;
                     }
                     log(
-                        &format!("  Connection lost at height {} (attempt {}/{}), reconnecting...", height, attempt + 1, max_retries),
+                        &format!(
+                            "  Connection lost at height {} (attempt {}/{}), reconnecting...",
+                            height,
+                            attempt + 1,
+                            max_retries
+                        ),
                         "info",
                     );
                     let _ = wt.close();
@@ -4376,7 +4505,7 @@ pub async fn scan_balance_filtered(
         if let Some((block, raw)) = blocks_with_raw.first() {
             // Cache the block
             let _ = cache_block(*height, raw).await;
-            let (received, sent, details) = scan_block_balance(block, &target);
+            let (received, sent, details) = scan_block_balance(block, &block_id, &target);
             if received > 0 || sent > 0 {
                 txns_found += 1;
                 total_received += received;
@@ -4485,7 +4614,8 @@ pub async fn scan_balance_filtered(
                     "info",
                 );
                 let _ = wt.close();
-                let new_conn = connect_and_handshake(&url, genesis_id, cert_hash.as_deref()).await?;
+                let new_conn =
+                    connect_and_handshake(&url, genesis_id, cert_hash.as_deref()).await?;
                 wt = new_conn.wt;
                 log("  Reconnected, resuming tail scan...", "ok");
                 if tail_history.is_empty() {
@@ -4503,9 +4633,12 @@ pub async fn scan_balance_filtered(
         let last_block_id = blocks_with_raw.last().unwrap().0.id();
 
         for (block, raw) in &blocks_with_raw {
-            let height = block.v2_height.unwrap_or(filter_tip + 1 + tail_blocks_scanned);
+            let height = block
+                .v2_height
+                .unwrap_or(filter_tip + 1 + tail_blocks_scanned);
             let _ = cache_block(height, raw).await;
-            let (received, sent, details) = scan_block_balance(block, &target);
+            let block_id = block.id(); // tail blocks are v2, id() is correct
+            let (received, sent, details) = scan_block_balance(block, &block_id, &target);
 
             if received > 0 || sent > 0 {
                 txns_found += 1;
@@ -4568,7 +4701,10 @@ pub async fn scan_balance_filtered(
         log("  No new blocks beyond filter tip.", "info");
     } else {
         log(
-            &format!("  Tail scan complete: {} blocks scanned", tail_blocks_scanned),
+            &format!(
+                "  Tail scan complete: {} blocks scanned",
+                tail_blocks_scanned
+            ),
             "ok",
         );
     }
@@ -4582,20 +4718,14 @@ pub async fn scan_balance_filtered(
         &format!("  Filters checked:  {}", filter_file.entries.len()),
         "data",
     );
-    log(
-        &format!("  Filter matches:   {}", matches.len()),
-        "data",
-    );
+    log(&format!("  Filter matches:   {}", matches.len()), "data");
     log(&format!("  Blocks fetched:   {blocks_fetched}"), "data");
     log(
         &format!("  Tail blocks:      {tail_blocks_scanned}"),
         "data",
     );
     log(&format!("  False positives:  {false_positives}"), "data");
-    log(
-        &format!("  Transactions:     {txns_found}"),
-        "data",
-    );
+    log(&format!("  Transactions:     {txns_found}"), "data");
     log(
         &format!("  Total received:   {}", format_sc(total_received)),
         "data",
@@ -4604,10 +4734,7 @@ pub async fn scan_balance_filtered(
         &format!("  Total sent:       {}", format_sc(total_sent)),
         "data",
     );
-    log(
-        &format!("  Net balance:      {}", format_sc(net)),
-        "ok",
-    );
+    log(&format!("  Net balance:      {}", format_sc(net)), "ok");
 
     let result = json!({
         "blocksScanned": blocks_fetched,
@@ -4674,7 +4801,9 @@ fn search_txindex(data: &[u8], target_prefix: &[u8; 8]) -> Vec<u32> {
         }
         let h = u32::from_le_bytes(entries[offset + 8..offset + 12].try_into().unwrap());
         heights.push(h);
-        if i == 0 { break; }
+        if i == 0 {
+            break;
+        }
         i -= 1;
     }
     // Scan right (excluding mid)
@@ -4735,14 +4864,18 @@ pub async fn lookup_txid(
     }
     let version = u32::from_le_bytes(index_data[4..8].try_into().unwrap());
     if version != 1 {
-        return Err(JsValue::from_str(&format!("unsupported txindex version: {version}")));
+        return Err(JsValue::from_str(&format!(
+            "unsupported txindex version: {version}"
+        )));
     }
     let count = u32::from_le_bytes(index_data[8..12].try_into().unwrap());
     let tip_height = u32::from_le_bytes(index_data[12..16].try_into().unwrap());
     log(
         &format!(
             "Loaded txindex: {} transactions, tip height {}, {:.1} MB",
-            count, tip_height, index_data.len() as f64 / 1024.0 / 1024.0
+            count,
+            tip_height,
+            index_data.len() as f64 / 1024.0 / 1024.0
         ),
         "ok",
     );
@@ -4763,7 +4896,8 @@ pub async fn lookup_txid(
         log(
             &format!(
                 "Prefix collision: {} candidate blocks {:?}, checking each...",
-                candidates.len(), candidates
+                candidates.len(),
+                candidates
             ),
             "info",
         );
@@ -4781,7 +4915,9 @@ pub async fn lookup_txid(
                 Some(ids) => {
                     // V2 headers start at V2_REQUIRE_HEIGHT
                     // Detect network from genesis ID
-                    header_offset = if genesis_id_hex == "25f6e3b9295a61f69fcb956aca9f0076234ecf2e02d399db5448b6e22f26e81c" {
+                    header_offset = if genesis_id_hex
+                        == "25f6e3b9295a61f69fcb956aca9f0076234ecf2e02d399db5448b6e22f26e81c"
+                    {
                         530000 // mainnet
                     } else {
                         50 // zen
@@ -4789,9 +4925,10 @@ pub async fn lookup_txid(
                     Some(ids)
                 }
                 None => CACHED_HEADER_IDS.with(|cache| {
-                    cache.borrow().as_ref().and_then(|(n, ids)| {
-                        if *n == net { Some(ids.clone()) } else { None }
-                    })
+                    cache
+                        .borrow()
+                        .as_ref()
+                        .and_then(|(n, ids)| if *n == net { Some(ids.clone()) } else { None })
                 }),
             }
         }
@@ -4799,36 +4936,55 @@ pub async fn lookup_txid(
 
     log("Connecting to peer...", "info");
     let conn = connect_and_handshake(&url, genesis_id, cert_hash.as_deref()).await?;
-    log(
-        &format!("Connected to {}", conn.peer_info.addr),
-        "ok",
-    );
+    log(&format!("Connected to {}", conn.peer_info.addr), "ok");
 
     let header_ids = match cached_ids {
         Some(ids) => {
-            log(&format!("Using {} cached header IDs (offset {})", ids.len(), header_offset), "ok");
+            log(
+                &format!(
+                    "Using {} cached header IDs (offset {})",
+                    ids.len(),
+                    header_offset
+                ),
+                "ok",
+            );
             ids
         }
         None => {
             log("Header IDs not cached, syncing headers...", "info");
             let max_height = *candidates.iter().max().unwrap_or(&0) as u64;
-            let mut current_index = ChainIndex { height: 0, id: genesis_id };
+            let mut current_index = ChainIndex {
+                height: 0,
+                id: genesis_id,
+            };
             let mut synced_ids: Vec<BlockID> = Vec::new();
             let max_per_batch: u64 = 2000;
             header_offset = 0; // syncing from genesis
             loop {
                 let resp = send_headers_rpc(&conn.wt, current_index, max_per_batch).await?;
                 let batch_count = resp.headers.len() as u64;
-                if batch_count == 0 { break; }
+                if batch_count == 0 {
+                    break;
+                }
                 for header in &resp.headers {
                     synced_ids.push(header.id());
                 }
                 let total = synced_ids.len() as u64;
-                log(&format!("  Headers: {total} / ~{}", total + resp.remaining), "data");
+                log(
+                    &format!("  Headers: {total} / ~{}", total + resp.remaining),
+                    "data",
+                );
                 let last_header = resp.headers.last().unwrap();
-                current_index = ChainIndex { height: current_index.height + batch_count, id: last_header.id() };
-                if current_index.height > max_height && resp.remaining == 0 { break; }
-                if resp.remaining == 0 { break; }
+                current_index = ChainIndex {
+                    height: current_index.height + batch_count,
+                    id: last_header.id(),
+                };
+                if current_index.height > max_height && resp.remaining == 0 {
+                    break;
+                }
+                if resp.remaining == 0 {
+                    break;
+                }
             }
             // Cache for future use
             CACHED_HEADER_IDS.with(|cache| {
@@ -4846,7 +5002,10 @@ pub async fn lookup_txid(
     for &block_height in &candidates {
         if block_height <= header_offset {
             log(
-                &format!("Block height {} is before header offset {}, skipping", block_height, header_offset),
+                &format!(
+                    "Block height {} is before header offset {}, skipping",
+                    block_height, header_offset
+                ),
                 "info",
             );
             continue;
@@ -4854,8 +5013,12 @@ pub async fn lookup_txid(
         let idx = (block_height - header_offset - 1) as usize;
         if idx >= header_ids.len() {
             log(
-                &format!("Block height {} out of range (have {} headers from offset {}), skipping",
-                    block_height, header_ids.len(), header_offset),
+                &format!(
+                    "Block height {} out of range (have {} headers from offset {}), skipping",
+                    block_height,
+                    header_ids.len(),
+                    header_offset
+                ),
                 "info",
             );
             continue;
@@ -4867,7 +5030,9 @@ pub async fn lookup_txid(
                 genesis_id
             } else {
                 // For V2 headers, the parent of the first block is the checkpoint block
-                let checkpoint_hex = if genesis_id_hex == "25f6e3b9295a61f69fcb956aca9f0076234ecf2e02d399db5448b6e22f26e81c" {
+                let checkpoint_hex = if genesis_id_hex
+                    == "25f6e3b9295a61f69fcb956aca9f0076234ecf2e02d399db5448b6e22f26e81c"
+                {
                     "0000000000000000b3b69b56214c974ce293a310d5fcfedb85f2e6b039e5bac0"
                 } else {
                     "0000000863c1e1191775e601ead23feeae6f5bab166eb1da538b091c6613be72"
@@ -4880,9 +5045,13 @@ pub async fn lookup_txid(
         } else {
             header_ids[idx - 1]
         };
-        let (blocks_with_raw, _remaining) = send_v2_blocks_rpc(&conn.wt, vec![prev_id], 1, true).await?;
+        let (blocks_with_raw, _remaining) =
+            send_v2_blocks_rpc(&conn.wt, vec![prev_id], 1, true).await?;
         if blocks_with_raw.is_empty() {
-            log(&format!("Block {} — peer returned no data, skipping", block_height), "info");
+            log(
+                &format!("Block {} — peer returned no data, skipping", block_height),
+                "info",
+            );
             continue;
         }
 
@@ -4932,15 +5101,21 @@ pub async fn lookup_txid(
             }
             result_json = Some(result);
             log(
-                &format!("Transaction {} confirmed in block {} ({})",
-                    &txid_hex[..16], block_height,
-                    chrono_timestamp(block.timestamp)),
+                &format!(
+                    "Transaction {} confirmed in block {} ({})",
+                    &txid_hex[..16],
+                    block_height,
+                    chrono_timestamp(block.timestamp)
+                ),
                 "ok",
             );
             break;
         } else {
             log(
-                &format!("Block {} — prefix collision, txid not in this block", block_height),
+                &format!(
+                    "Block {} — prefix collision, txid not in this block",
+                    block_height
+                ),
                 "info",
             );
         }
@@ -4951,7 +5126,10 @@ pub async fn lookup_txid(
     match result_json {
         Some(r) => Ok(JsValue::from_str(&serde_json::to_string(&r).unwrap())),
         None => {
-            log("Transaction not found in any candidate block (possible V1 collision).", "err");
+            log(
+                "Transaction not found in any candidate block (possible V1 collision).",
+                "err",
+            );
             Ok(JsValue::from_str("not_found"))
         }
     }
@@ -4990,19 +5168,30 @@ pub async fn explore_query(
     // Address: 76 hex chars (32-byte hash + 6-byte checksum)
     if is_hex && query.len() == 76 {
         log("Detected address input", "info");
-        return Ok(JsValue::from_str(&serde_json::to_string(&json!({
-            "type": "address",
-            "address": query,
-        })).unwrap()));
+        return Ok(JsValue::from_str(
+            &serde_json::to_string(&json!({
+                "type": "address",
+                "address": query,
+            }))
+            .unwrap(),
+        ));
     }
 
     // Block height: pure numeric
     if is_numeric {
-        let height: u64 = query.parse().map_err(|_| JsValue::from_str("invalid block height"))?;
+        let height: u64 = query
+            .parse()
+            .map_err(|_| JsValue::from_str("invalid block height"))?;
         log(&format!("Looking up block at height {}...", height), "info");
         let result = fetch_block_by_height(
-            &url, genesis_id, &genesis_id_hex, cert_hash.as_deref(), height as u32, &log,
-        ).await?;
+            &url,
+            genesis_id,
+            &genesis_id_hex,
+            cert_hash.as_deref(),
+            height as u32,
+            &log,
+        )
+        .await?;
         return Ok(JsValue::from_str(&serde_json::to_string(&result).unwrap()));
     }
 
@@ -5020,12 +5209,22 @@ pub async fn explore_query(
                 if index_data.len() >= 16 && &index_data[0..4] == b"STXI" {
                     let candidates = search_txindex(&index_data, &txid_prefix);
                     if !candidates.is_empty() {
-                        log(&format!("Found {} candidate block(s) in txindex", candidates.len()), "ok");
+                        log(
+                            &format!("Found {} candidate block(s) in txindex", candidates.len()),
+                            "ok",
+                        );
                         // Fetch block and match txid — reuse lookup_txid logic
                         let result = fetch_block_with_txid_match(
-                            &url, genesis_id, &genesis_id_hex, cert_hash.as_deref(),
-                            &txid_bytes, &query, &candidates, &log,
-                        ).await?;
+                            &url,
+                            genesis_id,
+                            &genesis_id_hex,
+                            cert_hash.as_deref(),
+                            &txid_bytes,
+                            &query,
+                            &candidates,
+                            &log,
+                        )
+                        .await?;
                         if let Some(r) = result {
                             return Ok(JsValue::from_str(&serde_json::to_string(&r).unwrap()));
                         }
@@ -5041,8 +5240,14 @@ pub async fn explore_query(
         // Try as block ID — search header IDs
         log("Searching for block ID...", "info");
         let result = fetch_block_by_id(
-            &url, genesis_id, &genesis_id_hex, cert_hash.as_deref(), &query, &log,
-        ).await?;
+            &url,
+            genesis_id,
+            &genesis_id_hex,
+            cert_hash.as_deref(),
+            &query,
+            &log,
+        )
+        .await?;
         if let Some(r) = result {
             return Ok(JsValue::from_str(&serde_json::to_string(&r).unwrap()));
         }
@@ -5065,23 +5270,25 @@ async fn load_headers_with_offset(
     let mut header_offset: u32 = 0;
     let cached_ids = match load_header_ids().await? {
         Some(ids) => Some(ids),
-        None => {
-            match load_header_ids_with_key(&prefixed_key("header_ids_v2")).await? {
-                Some(ids) => {
-                    header_offset = if genesis_id_hex == "25f6e3b9295a61f69fcb956aca9f0076234ecf2e02d399db5448b6e22f26e81c" {
-                        530000
-                    } else {
-                        50
-                    };
-                    Some(ids)
-                }
-                None => CACHED_HEADER_IDS.with(|cache| {
-                    cache.borrow().as_ref().and_then(|(n, ids)| {
-                        if *n == net { Some(ids.clone()) } else { None }
-                    })
-                }),
+        None => match load_header_ids_with_key(&prefixed_key("header_ids_v2")).await? {
+            Some(ids) => {
+                header_offset = if genesis_id_hex
+                    == "25f6e3b9295a61f69fcb956aca9f0076234ecf2e02d399db5448b6e22f26e81c"
+                {
+                    530000
+                } else {
+                    50
+                };
+                Some(ids)
             }
-        }
+            None => CACHED_HEADER_IDS.with(|cache| {
+                cache.borrow().as_ref().and_then(
+                    |(n, ids)| {
+                        if *n == net { Some(ids.clone()) } else { None }
+                    },
+                )
+            }),
+        },
     };
     Ok((cached_ids, header_offset))
 }
@@ -5096,21 +5303,26 @@ fn resolve_prev_id(
 ) -> Result<BlockID, JsValue> {
     if height <= header_offset {
         return Err(JsValue::from_str(&format!(
-            "Block height {} is before header offset {}", height, header_offset
+            "Block height {} is before header offset {}",
+            height, header_offset
         )));
     }
     let idx = (height - header_offset - 1) as usize;
     if idx >= header_ids.len() {
         return Err(JsValue::from_str(&format!(
             "Block height {} out of range (have {} headers from offset {})",
-            height, header_ids.len(), header_offset
+            height,
+            header_ids.len(),
+            header_offset
         )));
     }
     if idx == 0 {
         if header_offset == 0 {
             Ok(genesis_id)
         } else {
-            let checkpoint_hex = if genesis_id_hex == "25f6e3b9295a61f69fcb956aca9f0076234ecf2e02d399db5448b6e22f26e81c" {
+            let checkpoint_hex = if genesis_id_hex
+                == "25f6e3b9295a61f69fcb956aca9f0076234ecf2e02d399db5448b6e22f26e81c"
+            {
                 "0000000000000000b3b69b56214c974ce293a310d5fcfedb85f2e6b039e5bac0"
             } else {
                 "0000000863c1e1191775e601ead23feeae6f5bab166eb1da538b091c6613be72"
@@ -5156,21 +5368,36 @@ async fn fetch_block_by_height(
             // Sync headers up to the requested height
             log("Header IDs not cached, syncing headers...", "info");
             let conn = connect_and_handshake(url, genesis_id, cert_hash).await?;
-            let mut current_index = ChainIndex { height: 0, id: genesis_id };
+            let mut current_index = ChainIndex {
+                height: 0,
+                id: genesis_id,
+            };
             let mut synced_ids: Vec<BlockID> = Vec::new();
             loop {
                 let resp = send_headers_rpc(&conn.wt, current_index, 2000).await?;
-                if resp.headers.is_empty() { break; }
+                if resp.headers.is_empty() {
+                    break;
+                }
                 let batch_count = resp.headers.len() as u64;
                 for header in &resp.headers {
                     synced_ids.push(header.id());
                 }
                 let total = synced_ids.len() as u64;
-                log(&format!("  Headers: {total} / ~{}", total + resp.remaining), "data");
+                log(
+                    &format!("  Headers: {total} / ~{}", total + resp.remaining),
+                    "data",
+                );
                 let last_header = resp.headers.last().unwrap();
-                current_index = ChainIndex { height: current_index.height + batch_count, id: last_header.id() };
-                if current_index.height > height as u64 && resp.remaining == 0 { break; }
-                if resp.remaining == 0 { break; }
+                current_index = ChainIndex {
+                    height: current_index.height + batch_count,
+                    id: last_header.id(),
+                };
+                if current_index.height > height as u64 && resp.remaining == 0 {
+                    break;
+                }
+                if resp.remaining == 0 {
+                    break;
+                }
             }
             let net = get_network_prefix();
             CACHED_HEADER_IDS.with(|cache| {
@@ -5185,31 +5412,63 @@ async fn fetch_block_by_height(
     // If the requested height is beyond cached headers, fetch the missing ones
     let total_height = header_offset as u64 + header_ids.len() as u64;
     if height as u64 >= total_height {
-        log(&format!("Fetching headers beyond cache ({} -> {})...", total_height, height + 1), "info");
-        let last_id = if header_ids.is_empty() { genesis_id } else { *header_ids.last().unwrap() };
+        log(
+            &format!(
+                "Fetching headers beyond cache ({} -> {})...",
+                total_height,
+                height + 1
+            ),
+            "info",
+        );
+        let last_id = if header_ids.is_empty() {
+            genesis_id
+        } else {
+            *header_ids.last().unwrap()
+        };
         let conn = connect_and_handshake(url, genesis_id, cert_hash).await?;
-        let mut current_index = ChainIndex { height: total_height, id: last_id };
+        let mut current_index = ChainIndex {
+            height: total_height,
+            id: last_id,
+        };
         loop {
             let resp = send_headers_rpc(&conn.wt, current_index, 2000).await?;
-            if resp.headers.is_empty() { break; }
+            if resp.headers.is_empty() {
+                break;
+            }
             let batch_count = resp.headers.len() as u64;
             for header in &resp.headers {
                 header_ids.push(header.id());
             }
             let last_header = resp.headers.last().unwrap();
-            current_index = ChainIndex { height: current_index.height + batch_count, id: last_header.id() };
-            if current_index.height > height as u64 { break; }
-            if resp.remaining == 0 { break; }
+            current_index = ChainIndex {
+                height: current_index.height + batch_count,
+                id: last_header.id(),
+            };
+            if current_index.height > height as u64 {
+                break;
+            }
+            if resp.remaining == 0 {
+                break;
+            }
         }
         let net = get_network_prefix();
         CACHED_HEADER_IDS.with(|cache| {
             *cache.borrow_mut() = Some((net, header_ids.clone()));
         });
-        log(&format!("Extended to {} header IDs", header_ids.len()), "ok");
+        log(
+            &format!("Extended to {} header IDs", header_ids.len()),
+            "ok",
+        );
         let _ = conn.wt.close();
     }
 
-    let prev_id = resolve_prev_id(&header_ids, header_offset, height, genesis_id, genesis_id_hex)?;
+    let prev_id = resolve_prev_id(
+        &header_ids,
+        header_offset,
+        height,
+        genesis_id,
+        genesis_id_hex,
+    )?;
 
     log("Connecting to peer...", "info");
     let conn = connect_and_handshake(url, genesis_id, cert_hash).await?;
@@ -5219,15 +5478,26 @@ async fn fetch_block_by_height(
     let _ = conn.wt.close();
 
     if blocks_with_raw.is_empty() {
-        return Err(JsValue::from_str(&format!("Peer returned no data for block {}", height)));
+        return Err(JsValue::from_str(&format!(
+            "Peer returned no data for block {}",
+            height
+        )));
     }
 
     let (block, raw) = &blocks_with_raw[0];
     let _ = cache_block(height as u64, raw).await;
     let block_json = block_to_json(block);
 
-    log(&format!("Block {} loaded ({} v1 + {} v2 transactions, {})",
-        height, block.v1_transactions.len(), block.v2_transactions.len(), chrono_timestamp(block.timestamp)), "ok");
+    log(
+        &format!(
+            "Block {} loaded ({} v1 + {} v2 transactions, {})",
+            height,
+            block.v1_transactions.len(),
+            block.v2_transactions.len(),
+            chrono_timestamp(block.timestamp)
+        ),
+        "ok",
+    );
 
     Ok(json!({
         "type": "block",
@@ -5254,7 +5524,10 @@ async fn fetch_block_by_id(
     let header_ids = match cached_ids {
         Some(ids) => ids,
         None => {
-            log("No cached header IDs — cannot search by block ID without syncing first", "err");
+            log(
+                "No cached header IDs — cannot search by block ID without syncing first",
+                "err",
+            );
             return Ok(None);
         }
     };
@@ -5272,7 +5545,9 @@ async fn fetch_block_by_id(
     match found_height {
         Some(height) => {
             log(&format!("Block ID found at height {}", height), "ok");
-            let result = fetch_block_by_height(url, genesis_id, genesis_id_hex, cert_hash, height, log).await?;
+            let result =
+                fetch_block_by_height(url, genesis_id, genesis_id_hex, cert_hash, height, log)
+                    .await?;
             Ok(Some(result))
         }
         None => {
@@ -5303,19 +5578,36 @@ async fn fetch_block_with_txid_match(
             log("Header IDs not cached, syncing...", "info");
             let conn = connect_and_handshake(url, genesis_id, cert_hash).await?;
             let max_height = *candidates.iter().max().unwrap_or(&0) as u64;
-            let mut current_index = ChainIndex { height: 0, id: genesis_id };
+            let mut current_index = ChainIndex {
+                height: 0,
+                id: genesis_id,
+            };
             let mut synced_ids: Vec<BlockID> = Vec::new();
             loop {
                 let resp = send_headers_rpc(&conn.wt, current_index, 2000).await?;
-                if resp.headers.is_empty() { break; }
+                if resp.headers.is_empty() {
+                    break;
+                }
                 let batch_count = resp.headers.len() as u64;
-                for header in &resp.headers { synced_ids.push(header.id()); }
+                for header in &resp.headers {
+                    synced_ids.push(header.id());
+                }
                 let total = synced_ids.len() as u64;
-                log(&format!("  Headers: {total} / ~{}", total + resp.remaining), "data");
+                log(
+                    &format!("  Headers: {total} / ~{}", total + resp.remaining),
+                    "data",
+                );
                 let last_header = resp.headers.last().unwrap();
-                current_index = ChainIndex { height: current_index.height + batch_count, id: last_header.id() };
-                if current_index.height > max_height && resp.remaining == 0 { break; }
-                if resp.remaining == 0 { break; }
+                current_index = ChainIndex {
+                    height: current_index.height + batch_count,
+                    id: last_header.id(),
+                };
+                if current_index.height > max_height && resp.remaining == 0 {
+                    break;
+                }
+                if resp.remaining == 0 {
+                    break;
+                }
             }
             let net = get_network_prefix();
             CACHED_HEADER_IDS.with(|cache| {
@@ -5331,12 +5623,20 @@ async fn fetch_block_with_txid_match(
     log(&format!("Connected to {}", conn.peer_info.addr), "ok");
 
     for &block_height in candidates {
-        let prev_id = match resolve_prev_id(&header_ids, header_offset, block_height, genesis_id, genesis_id_hex) {
+        let prev_id = match resolve_prev_id(
+            &header_ids,
+            header_offset,
+            block_height,
+            genesis_id,
+            genesis_id_hex,
+        ) {
             Ok(id) => id,
             Err(_) => continue,
         };
         let (blocks_with_raw, _) = send_v2_blocks_rpc(&conn.wt, vec![prev_id], 1, true).await?;
-        if blocks_with_raw.is_empty() { continue; }
+        if blocks_with_raw.is_empty() {
+            continue;
+        }
 
         let (block, raw) = &blocks_with_raw[0];
         let _ = cache_block(block_height as u64, raw).await;
@@ -5377,8 +5677,14 @@ async fn fetch_block_with_txid_match(
             if let Some(idx) = matched_v1_tx_index {
                 result["v1TxIndex"] = json!(idx);
             }
-            log(&format!("Transaction found in block {} ({})",
-                block_height, chrono_timestamp(block.timestamp)), "ok");
+            log(
+                &format!(
+                    "Transaction found in block {} ({})",
+                    block_height,
+                    chrono_timestamp(block.timestamp)
+                ),
+                "ok",
+            );
             let _ = conn.wt.close();
             return Ok(Some(result));
         }
@@ -5416,7 +5722,9 @@ pub async fn lookup_utxos(
     let target = parse_address(&address_hex)?;
     let target_bytes: [u8; 32] = {
         let slice: &[u8] = target.as_ref();
-        slice.try_into().map_err(|_| JsValue::from_str("address must be 32 bytes"))?
+        slice
+            .try_into()
+            .map_err(|_| JsValue::from_str("address must be 32 bytes"))?
     };
     let mut addr_prefix = [0u8; 8];
     addr_prefix.copy_from_slice(&target_bytes[..8]);
@@ -5429,12 +5737,17 @@ pub async fn lookup_utxos(
     }
     let version = u32::from_le_bytes(index_data[4..8].try_into().unwrap());
     if version != 1 {
-        return Err(JsValue::from_str(&format!("unsupported UTXO index version: {version}")));
+        return Err(JsValue::from_str(&format!(
+            "unsupported UTXO index version: {version}"
+        )));
     }
     let count = u32::from_le_bytes(index_data[8..12].try_into().unwrap()) as usize;
     let tip_height = u32::from_le_bytes(index_data[12..16].try_into().unwrap());
     log(
-        &format!("Loaded UTXO index: {} entries, tip height {}", count, tip_height),
+        &format!(
+            "Loaded UTXO index: {} entries, tip height {}",
+            count, tip_height
+        ),
         "ok",
     );
 
@@ -5473,7 +5786,10 @@ pub async fn lookup_utxos(
         return Ok(JsValue::from_str("[]"));
     }
     log(
-        &format!("Found {} UTXO index entries, fetching block details...", matches.len()),
+        &format!(
+            "Found {} UTXO index entries, fetching block details...",
+            matches.len()
+        ),
         "ok",
     );
 
@@ -5487,28 +5803,37 @@ pub async fn lookup_utxos(
     let mut header_offset: u32 = 0;
     let cached_ids = match load_header_ids().await? {
         Some(ids) => Some(ids),
-        None => {
-            match load_header_ids_with_key(&prefixed_key("header_ids_v2")).await? {
-                Some(ids) => {
-                    header_offset = if genesis_id_hex == "25f6e3b9295a61f69fcb956aca9f0076234ecf2e02d399db5448b6e22f26e81c" {
-                        530000
-                    } else {
-                        50
-                    };
-                    Some(ids)
-                }
-                None => CACHED_HEADER_IDS.with(|cache| {
-                    cache.borrow().as_ref().and_then(|(n, ids)| {
-                        if *n == net { Some(ids.clone()) } else { None }
-                    })
-                }),
+        None => match load_header_ids_with_key(&prefixed_key("header_ids_v2")).await? {
+            Some(ids) => {
+                header_offset = if genesis_id_hex
+                    == "25f6e3b9295a61f69fcb956aca9f0076234ecf2e02d399db5448b6e22f26e81c"
+                {
+                    530000
+                } else {
+                    50
+                };
+                Some(ids)
             }
-        }
+            None => CACHED_HEADER_IDS.with(|cache| {
+                cache.borrow().as_ref().and_then(
+                    |(n, ids)| {
+                        if *n == net { Some(ids.clone()) } else { None }
+                    },
+                )
+            }),
+        },
     };
 
     let header_ids = match cached_ids {
         Some(ids) => {
-            log(&format!("Using {} cached header IDs (offset {})", ids.len(), header_offset), "ok");
+            log(
+                &format!(
+                    "Using {} cached header IDs (offset {})",
+                    ids.len(),
+                    header_offset
+                ),
+                "ok",
+            );
             ids
         }
         None => {
@@ -5516,22 +5841,34 @@ pub async fn lookup_utxos(
             log("Header IDs not cached, syncing headers...", "info");
             let max_height = *unique_heights.iter().max().unwrap_or(&0) as u64;
             let conn_tmp = connect_and_handshake(&url, genesis_id, cert_hash.as_deref()).await?;
-            let mut current_index = ChainIndex { height: 0, id: genesis_id };
+            let mut current_index = ChainIndex {
+                height: 0,
+                id: genesis_id,
+            };
             let mut synced_ids: Vec<BlockID> = Vec::new();
             let max_per_batch: u64 = 2000;
             loop {
                 let resp = send_headers_rpc(&conn_tmp.wt, current_index, max_per_batch).await?;
                 let batch_count = resp.headers.len() as u64;
-                if batch_count == 0 { break; }
+                if batch_count == 0 {
+                    break;
+                }
                 for header in &resp.headers {
                     synced_ids.push(header.id());
                 }
                 let total = synced_ids.len() as u64;
                 log(&format!("  Headers: {total}"), "data");
                 let last_header = resp.headers.last().unwrap();
-                current_index = ChainIndex { height: current_index.height + batch_count, id: last_header.id() };
-                if current_index.height > max_height && resp.remaining == 0 { break; }
-                if resp.remaining == 0 { break; }
+                current_index = ChainIndex {
+                    height: current_index.height + batch_count,
+                    id: last_header.id(),
+                };
+                if current_index.height > max_height && resp.remaining == 0 {
+                    break;
+                }
+                if resp.remaining == 0 {
+                    break;
+                }
             }
             CACHED_HEADER_IDS.with(|cache| {
                 *cache.borrow_mut() = Some((net.clone(), synced_ids.clone()));
@@ -5554,23 +5891,41 @@ pub async fn lookup_utxos(
         // Try cache first
         let block = if let Ok(Some(cached)) = load_cached_block(block_height as u64).await {
             log(
-                &format!("  [{}/{}] Height {}: cached", i + 1, unique_heights.len(), block_height),
+                &format!(
+                    "  [{}/{}] Height {}: cached",
+                    i + 1,
+                    unique_heights.len(),
+                    block_height
+                ),
                 "data",
             );
             cached
         } else {
             if block_height <= header_offset {
-                log(&format!("  Height {} before header offset {}, skipping", block_height, header_offset), "info");
+                log(
+                    &format!(
+                        "  Height {} before header offset {}, skipping",
+                        block_height, header_offset
+                    ),
+                    "info",
+                );
                 continue;
             }
             let idx = (block_height - header_offset - 1) as usize;
             if idx >= header_ids.len() {
-                log(&format!("  Height {} out of range, skipping", block_height), "info");
+                log(
+                    &format!("  Height {} out of range, skipping", block_height),
+                    "info",
+                );
                 continue;
             }
             let prev_id = if idx == 0 {
-                if header_offset == 0 { genesis_id } else {
-                    let checkpoint_hex = if genesis_id_hex == "25f6e3b9295a61f69fcb956aca9f0076234ecf2e02d399db5448b6e22f26e81c" {
+                if header_offset == 0 {
+                    genesis_id
+                } else {
+                    let checkpoint_hex = if genesis_id_hex
+                        == "25f6e3b9295a61f69fcb956aca9f0076234ecf2e02d399db5448b6e22f26e81c"
+                    {
                         "0000000000000000b3b69b56214c974ce293a310d5fcfedb85f2e6b039e5bac0"
                     } else {
                         "0000000863c1e1191775e601ead23feeae6f5bab166eb1da538b091c6613be72"
@@ -5588,9 +5943,16 @@ pub async fn lookup_utxos(
             let blocks_with_raw = match rpc_result {
                 Ok((blocks, _)) => blocks,
                 Err(_) => {
-                    log(&format!("  Connection lost at height {}, reconnecting...", block_height), "info");
+                    log(
+                        &format!(
+                            "  Connection lost at height {}, reconnecting...",
+                            block_height
+                        ),
+                        "info",
+                    );
                     let _ = wt.close();
-                    let new_conn = connect_and_handshake(&url, genesis_id, cert_hash.as_deref()).await?;
+                    let new_conn =
+                        connect_and_handshake(&url, genesis_id, cert_hash.as_deref()).await?;
                     wt = new_conn.wt;
                     match send_v2_blocks_rpc(&wt, vec![prev_id], 1, true).await {
                         Ok((blocks, _)) => blocks,
@@ -5606,7 +5968,12 @@ pub async fn lookup_utxos(
                 Some((block, raw)) => {
                     let _ = cache_block(block_height as u64, &raw).await;
                     log(
-                        &format!("  [{}/{}] Height {}: fetched", i + 1, unique_heights.len(), block_height),
+                        &format!(
+                            "  [{}/{}] Height {}: fetched",
+                            i + 1,
+                            unique_heights.len(),
+                            block_height
+                        ),
                         "data",
                     );
                     block
@@ -5619,7 +5986,21 @@ pub async fn lookup_utxos(
         };
 
         // Scan block for outputs matching the full target address
-        let (received, _sent, details) = scan_block_balance(&block, &target);
+        // Use header_ids for correct block ID (handles both v1 and v2 blocks)
+        let block_id = {
+            let bh = block_height as u32;
+            if bh > header_offset {
+                let idx = (bh - header_offset - 1) as usize;
+                if idx < header_ids.len() {
+                    header_ids[idx]
+                } else {
+                    block.id()
+                }
+            } else {
+                block.id()
+            }
+        };
+        let (received, _sent, details) = scan_block_balance(&block, &block_id, &target);
         for d in &details {
             if d.direction == "received" {
                 results.push(json!({
@@ -5637,7 +6018,10 @@ pub async fn lookup_utxos(
     let _ = wt.close();
 
     log(
-        &format!("UTXO lookup complete: {} unspent outputs found", results.len()),
+        &format!(
+            "UTXO lookup complete: {} unspent outputs found",
+            results.len()
+        ),
         if results.is_empty() { "info" } else { "ok" },
     );
 
@@ -5666,15 +6050,14 @@ pub fn generate_mnemonic(word_count: u32) -> Result<String, JsValue> {
 
 #[wasm_bindgen]
 pub fn mnemonic_to_entropy(phrase: &str) -> Result<String, JsValue> {
-    let m = sia::hd::HdMnemonic::from_phrase(phrase)
-        .map_err(|e| JsValue::from_str(&e.to_string()))?;
+    let m =
+        sia::hd::HdMnemonic::from_phrase(phrase).map_err(|e| JsValue::from_str(&e.to_string()))?;
     Ok(hex::encode(m.entropy()))
 }
 
 #[wasm_bindgen]
 pub fn entropy_to_mnemonic(entropy_hex: &str) -> Result<String, JsValue> {
-    let entropy =
-        hex::decode(entropy_hex).map_err(|e| JsValue::from_str(&e.to_string()))?;
+    let entropy = hex::decode(entropy_hex).map_err(|e| JsValue::from_str(&e.to_string()))?;
     let m = sia::hd::HdMnemonic::from_entropy(&entropy)
         .map_err(|e| JsValue::from_str(&e.to_string()))?;
     Ok(m.phrase())
@@ -5682,16 +6065,13 @@ pub fn entropy_to_mnemonic(entropy_hex: &str) -> Result<String, JsValue> {
 
 #[wasm_bindgen]
 pub fn encrypt_entropy(entropy_hex: &str, password: &str) -> Result<String, JsValue> {
-    use chacha20poly1305::{
-        ChaCha20Poly1305, KeyInit,
-        aead::Aead,
-        aead::generic_array::GenericArray,
-    };
+    use chacha20poly1305::aead::Aead;
+    use chacha20poly1305::aead::generic_array::GenericArray;
+    use chacha20poly1305::{ChaCha20Poly1305, KeyInit};
     use pbkdf2::pbkdf2_hmac;
     use sha2::Sha512;
 
-    let entropy =
-        hex::decode(entropy_hex).map_err(|e| JsValue::from_str(&e.to_string()))?;
+    let entropy = hex::decode(entropy_hex).map_err(|e| JsValue::from_str(&e.to_string()))?;
 
     // Generate random salt and nonce
     let mut salt = [0u8; 16];
@@ -5720,16 +6100,13 @@ pub fn encrypt_entropy(entropy_hex: &str, password: &str) -> Result<String, JsVa
 
 #[wasm_bindgen]
 pub fn decrypt_entropy(encrypted_hex: &str, password: &str) -> Result<String, JsValue> {
-    use chacha20poly1305::{
-        ChaCha20Poly1305, KeyInit,
-        aead::Aead,
-        aead::generic_array::GenericArray,
-    };
+    use chacha20poly1305::aead::Aead;
+    use chacha20poly1305::aead::generic_array::GenericArray;
+    use chacha20poly1305::{ChaCha20Poly1305, KeyInit};
     use pbkdf2::pbkdf2_hmac;
     use sha2::Sha512;
 
-    let data =
-        hex::decode(encrypted_hex).map_err(|e| JsValue::from_str(&e.to_string()))?;
+    let data = hex::decode(encrypted_hex).map_err(|e| JsValue::from_str(&e.to_string()))?;
     if data.len() < 16 + 12 + 16 {
         // salt + nonce + minimum tag
         return Err(JsValue::from_str("encrypted data too short"));
@@ -5779,13 +6156,12 @@ pub fn attestation_key_hash(key: &str) -> String {
 
 #[wasm_bindgen]
 pub fn derive_addresses(entropy_hex: &str, start: u32, count: u32) -> Result<String, JsValue> {
-    use sia::hd::{HdMnemonic, ExtendedPrivateKey};
+    use sia::hd::{ExtendedPrivateKey, HdMnemonic};
     use sia::types::v2::SpendPolicy;
 
-    let entropy =
-        hex::decode(entropy_hex).map_err(|e| JsValue::from_str(&e.to_string()))?;
-    let mnemonic = HdMnemonic::from_entropy(&entropy)
-        .map_err(|e| JsValue::from_str(&e.to_string()))?;
+    let entropy = hex::decode(entropy_hex).map_err(|e| JsValue::from_str(&e.to_string()))?;
+    let mnemonic =
+        HdMnemonic::from_entropy(&entropy).map_err(|e| JsValue::from_str(&e.to_string()))?;
     let seed = mnemonic.to_seed("");
     let master = ExtendedPrivateKey::from_bip39_seed(&seed);
 
@@ -5814,7 +6190,7 @@ pub fn derive_addresses(entropy_hex: &str, start: u32, count: u32) -> Result<Str
 /// Helper to build a minimal ChainState at a post-v2 height for the given network.
 /// This is sufficient for computing attestation sig hashes (only the replay prefix matters).
 fn manifest_chain_state(network: &str) -> Result<sia::consensus::ChainState, JsValue> {
-    use sia::consensus::{ChainState, Network, State, ElementAccumulator};
+    use sia::consensus::{ChainState, ElementAccumulator, Network, State};
     use sia::types::Work;
 
     let net = match network {
@@ -5827,7 +6203,10 @@ fn manifest_chain_state(network: &str) -> Result<sia::consensus::ChainState, JsV
     let epoch = ::chrono::DateTime::<::chrono::Utc>::UNIX_EPOCH;
     Ok(ChainState {
         state: State {
-            index: ChainIndex { height, id: BlockID::default() },
+            index: ChainIndex {
+                height,
+                id: BlockID::default(),
+            },
             prev_timestamps: [epoch; 11],
             depth: BlockID::default(),
             child_target: BlockID::default(),
@@ -5850,18 +6229,21 @@ fn manifest_chain_state(network: &str) -> Result<sia::consensus::ChainState, JsV
 ///
 /// Returns JSON: `{ publicKey, account, path }`
 #[wasm_bindgen]
-pub fn derive_manifest_info(entropy_hex: &str, account: u32, index: u32) -> Result<String, JsValue> {
+pub fn derive_manifest_info(
+    entropy_hex: &str,
+    account: u32,
+    index: u32,
+) -> Result<String, JsValue> {
     use sia::hd::HdMnemonic;
     use sia::manifest::derive_manifest;
 
-    let entropy =
-        hex::decode(entropy_hex).map_err(|e| JsValue::from_str(&e.to_string()))?;
-    let mnemonic = HdMnemonic::from_entropy(&entropy)
-        .map_err(|e| JsValue::from_str(&e.to_string()))?;
+    let entropy = hex::decode(entropy_hex).map_err(|e| JsValue::from_str(&e.to_string()))?;
+    let mnemonic =
+        HdMnemonic::from_entropy(&entropy).map_err(|e| JsValue::from_str(&e.to_string()))?;
     let master = mnemonic.to_extended_key("");
 
-    let (_enc_key, signing_key) = derive_manifest(&master, account, index)
-        .map_err(|e| JsValue::from_str(&e.to_string()))?;
+    let (_enc_key, signing_key) =
+        derive_manifest(&master, account, index).map_err(|e| JsValue::from_str(&e.to_string()))?;
 
     let pk = signing_key.public_key();
     let result = serde_json::json!({
@@ -5891,10 +6273,9 @@ pub fn build_private_manifest_transaction(
     use sia::manifest;
     use std::str::FromStr;
 
-    let entropy =
-        hex::decode(entropy_hex).map_err(|e| JsValue::from_str(&e.to_string()))?;
-    let mnemonic = HdMnemonic::from_entropy(&entropy)
-        .map_err(|e| JsValue::from_str(&e.to_string()))?;
+    let entropy = hex::decode(entropy_hex).map_err(|e| JsValue::from_str(&e.to_string()))?;
+    let mnemonic =
+        HdMnemonic::from_entropy(&entropy).map_err(|e| JsValue::from_str(&e.to_string()))?;
     let master = mnemonic.to_extended_key("");
 
     let (enc_key, signing_key) = manifest::derive_manifest(&master, account, index)
@@ -5925,10 +6306,9 @@ pub fn build_public_manifest_transaction(
     use sia::manifest;
     use std::str::FromStr;
 
-    let entropy =
-        hex::decode(entropy_hex).map_err(|e| JsValue::from_str(&e.to_string()))?;
-    let mnemonic = HdMnemonic::from_entropy(&entropy)
-        .map_err(|e| JsValue::from_str(&e.to_string()))?;
+    let entropy = hex::decode(entropy_hex).map_err(|e| JsValue::from_str(&e.to_string()))?;
+    let mnemonic =
+        HdMnemonic::from_entropy(&entropy).map_err(|e| JsValue::from_str(&e.to_string()))?;
     let seed = mnemonic.to_seed("");
     let master = ExtendedPrivateKey::from_bip39_seed(&seed);
     let signing_key = master
@@ -5962,10 +6342,9 @@ pub fn build_channel_manifest_transaction(
     use sia::manifest;
     use std::str::FromStr;
 
-    let entropy =
-        hex::decode(entropy_hex).map_err(|e| JsValue::from_str(&e.to_string()))?;
-    let mnemonic = HdMnemonic::from_entropy(&entropy)
-        .map_err(|e| JsValue::from_str(&e.to_string()))?;
+    let entropy = hex::decode(entropy_hex).map_err(|e| JsValue::from_str(&e.to_string()))?;
+    let mnemonic =
+        HdMnemonic::from_entropy(&entropy).map_err(|e| JsValue::from_str(&e.to_string()))?;
     let seed = mnemonic.to_seed("");
     let master = ExtendedPrivateKey::from_bip39_seed(&seed);
     let signing_key = master
@@ -5984,7 +6363,12 @@ pub fn build_channel_manifest_transaction(
     let cs = manifest_chain_state(network)?;
 
     let txn = manifest::channel_manifest_transaction(
-        &signing_key, channel_name, &channel_key, url, miner_fee, &cs,
+        &signing_key,
+        channel_name,
+        &channel_key,
+        url,
+        miner_fee,
+        &cs,
     );
 
     serde_json::to_string_pretty(&txn).map_err(|e| JsValue::from_str(&e.to_string()))
@@ -6006,10 +6390,9 @@ pub fn build_group_manifest_transaction(
     use sia::manifest;
     use std::str::FromStr;
 
-    let entropy =
-        hex::decode(entropy_hex).map_err(|e| JsValue::from_str(&e.to_string()))?;
-    let mnemonic = HdMnemonic::from_entropy(&entropy)
-        .map_err(|e| JsValue::from_str(&e.to_string()))?;
+    let entropy = hex::decode(entropy_hex).map_err(|e| JsValue::from_str(&e.to_string()))?;
+    let mnemonic =
+        HdMnemonic::from_entropy(&entropy).map_err(|e| JsValue::from_str(&e.to_string()))?;
     let seed = mnemonic.to_seed("");
     let master = ExtendedPrivateKey::from_bip39_seed(&seed);
     let signing_key = master
@@ -6027,9 +6410,8 @@ pub fn build_group_manifest_transaction(
         .map_err(|_| JsValue::from_str("invalid miner fee"))?;
     let cs = manifest_chain_state(network)?;
 
-    let txn = manifest::group_manifest_transaction(
-        &signing_key, &group_secret, url, miner_fee, &cs,
-    );
+    let txn =
+        manifest::group_manifest_transaction(&signing_key, &group_secret, url, miner_fee, &cs);
 
     serde_json::to_string_pretty(&txn).map_err(|e| JsValue::from_str(&e.to_string()))
 }
@@ -6038,21 +6420,24 @@ pub fn build_group_manifest_transaction(
 ///
 /// Returns the URL string, or an error if decryption fails.
 #[wasm_bindgen]
-pub fn open_private_manifest(entropy_hex: &str, account: u32, index: u32, value_hex: &str) -> Result<String, JsValue> {
+pub fn open_private_manifest(
+    entropy_hex: &str,
+    account: u32,
+    index: u32,
+    value_hex: &str,
+) -> Result<String, JsValue> {
     use sia::hd::HdMnemonic;
     use sia::manifest;
 
-    let entropy =
-        hex::decode(entropy_hex).map_err(|e| JsValue::from_str(&e.to_string()))?;
-    let mnemonic = HdMnemonic::from_entropy(&entropy)
-        .map_err(|e| JsValue::from_str(&e.to_string()))?;
+    let entropy = hex::decode(entropy_hex).map_err(|e| JsValue::from_str(&e.to_string()))?;
+    let mnemonic =
+        HdMnemonic::from_entropy(&entropy).map_err(|e| JsValue::from_str(&e.to_string()))?;
     let master = mnemonic.to_extended_key("");
 
     let (enc_key, _) = manifest::derive_manifest(&master, account, index)
         .map_err(|e| JsValue::from_str(&e.to_string()))?;
 
-    let value = hex::decode(value_hex)
-        .map_err(|e| JsValue::from_str(&e.to_string()))?;
+    let value = hex::decode(value_hex).map_err(|e| JsValue::from_str(&e.to_string()))?;
 
     manifest::open_private_url(&enc_key, &value)
         .ok_or_else(|| JsValue::from_str("decryption failed"))
@@ -6070,11 +6455,9 @@ pub fn open_channel_manifest(channel_key_hex: &str, value_hex: &str) -> Result<S
         .map_err(|_| JsValue::from_str("channel key must be 32 bytes"))?;
     let key = EncryptionKey::from(key_bytes);
 
-    let value = hex::decode(value_hex)
-        .map_err(|e| JsValue::from_str(&e.to_string()))?;
+    let value = hex::decode(value_hex).map_err(|e| JsValue::from_str(&e.to_string()))?;
 
-    manifest::open_channel_url(&key, &value)
-        .ok_or_else(|| JsValue::from_str("decryption failed"))
+    manifest::open_channel_url(&key, &value).ok_or_else(|| JsValue::from_str("decryption failed"))
 }
 
 /// Decrypt a group manifest attestation value.
@@ -6089,11 +6472,9 @@ pub fn open_group_manifest(group_secret_hex: &str, value_hex: &str) -> Result<St
         .map_err(|_| JsValue::from_str("group secret must be 32 bytes"))?;
     let key = EncryptionKey::from(key_bytes);
 
-    let value = hex::decode(value_hex)
-        .map_err(|e| JsValue::from_str(&e.to_string()))?;
+    let value = hex::decode(value_hex).map_err(|e| JsValue::from_str(&e.to_string()))?;
 
-    manifest::open_group_url(&key, &value)
-        .ok_or_else(|| JsValue::from_str("decryption failed"))
+    manifest::open_group_url(&key, &value).ok_or_else(|| JsValue::from_str("decryption failed"))
 }
 
 /// Build, sign, and return a V2 siacoin transaction as JSON.
@@ -6153,7 +6534,8 @@ pub fn build_v2_transaction(
             .ok_or_else(|| JsValue::from_str("input missing 'value'"))?;
         let maturity_height = input["maturityHeight"].as_u64().unwrap_or(0);
         let leaf_index = input["leafIndex"].as_u64().unwrap_or_else(|| {
-            input["leafIndex"].as_str()
+            input["leafIndex"]
+                .as_str()
                 .and_then(|s| s.parse::<u64>().ok())
                 .unwrap_or(0)
         });
@@ -6172,24 +6554,23 @@ pub fn build_v2_transaction(
         total_input = total_input + value;
 
         // Parse optional merkle proof
-        let merkle_proof: Vec<Hash256> =
-            if let Some(proof_arr) = input["merkleProof"].as_array() {
-                proof_arr
-                    .iter()
-                    .map(|v| {
-                        let h = v
-                            .as_str()
-                            .ok_or_else(|| JsValue::from_str("merkle proof element must be hex string"))?;
-                        let bytes: [u8; 32] = hex::decode(h)
-                            .map_err(|e| JsValue::from_str(&format!("bad merkle proof hex: {}", e)))?
-                            .try_into()
-                            .map_err(|_| JsValue::from_str("merkle proof element must be 32 bytes"))?;
-                        Ok(Hash256::from(bytes))
-                    })
-                    .collect::<Result<Vec<_>, JsValue>>()?
-            } else {
-                Vec::new()
-            };
+        let merkle_proof: Vec<Hash256> = if let Some(proof_arr) = input["merkleProof"].as_array() {
+            proof_arr
+                .iter()
+                .map(|v| {
+                    let h = v.as_str().ok_or_else(|| {
+                        JsValue::from_str("merkle proof element must be hex string")
+                    })?;
+                    let bytes: [u8; 32] = hex::decode(h)
+                        .map_err(|e| JsValue::from_str(&format!("bad merkle proof hex: {}", e)))?
+                        .try_into()
+                        .map_err(|_| JsValue::from_str("merkle proof element must be 32 bytes"))?;
+                    Ok(Hash256::from(bytes))
+                })
+                .collect::<Result<Vec<_>, JsValue>>()?
+        } else {
+            Vec::new()
+        };
 
         // Derive the child key for this UTXO
         let child = account_key
@@ -6300,7 +6681,10 @@ pub async fn broadcast_v2_transaction(
     let conn = connect_and_handshake(&url, genesis_id, cert_hash.as_deref()).await?;
 
     // Discover the chain tip by requesting headers in batches
-    let mut tip_index = ChainIndex { height: 0, id: genesis_id };
+    let mut tip_index = ChainIndex {
+        height: 0,
+        id: genesis_id,
+    };
     loop {
         let resp = send_headers_rpc(&conn.wt, tip_index, 10000).await?;
         if resp.headers.is_empty() {
@@ -6318,7 +6702,8 @@ pub async fn broadcast_v2_transaction(
 
     // Relay the transaction set (fire-and-forget).
     {
-        let mut stream = open_stream(&conn.wt).await
+        let mut stream = open_stream(&conn.wt)
+            .await
             .map_err(|e| JsValue::from_str(&format!("failed to open relay stream: {:?}", e)))?;
 
         let mut buf = Vec::new();
@@ -6333,17 +6718,25 @@ pub async fn broadcast_v2_transaction(
         req.encode(&mut buf)
             .map_err(|e| JsValue::from_str(&e.to_string()))?;
 
-        stream.write_all(&buf).await
-            .map_err(|e| JsValue::from_str(&format!("failed to write relay request ({} bytes): {:?}", buf.len(), e)))?;
-        stream.close_writer().await
+        stream.write_all(&buf).await.map_err(|e| {
+            JsValue::from_str(&format!(
+                "failed to write relay request ({} bytes): {:?}",
+                buf.len(),
+                e
+            ))
+        })?;
+        stream
+            .close_writer()
+            .await
             .map_err(|e| JsValue::from_str(&format!("failed to close relay writer: {:?}", e)))?;
     }
 
     // Verify the transaction reached the peer's mempool via SendTransactions.
     // Use a zero ChainIndex so the peer falls through to txpool lookup.
     {
-        let mut stream = open_stream(&conn.wt).await
-            .map_err(|e| JsValue::from_str(&format!("failed to open verification stream: {:?}", e)))?;
+        let mut stream = open_stream(&conn.wt).await.map_err(|e| {
+            JsValue::from_str(&format!("failed to open verification stream: {:?}", e))
+        })?;
 
         let mut buf = Vec::new();
         RPC_SEND_TRANSACTIONS
@@ -6351,7 +6744,10 @@ pub async fn broadcast_v2_transaction(
             .map_err(|e| JsValue::from_str(&e.to_string()))?;
 
         let req = SendTransactionsRequest {
-            index: ChainIndex { height: 0, id: BlockID::default() },
+            index: ChainIndex {
+                height: 0,
+                id: BlockID::default(),
+            },
             hashes: vec![primary_leaf_hash],
         };
         req.encode(&mut buf)
@@ -6360,7 +6756,9 @@ pub async fn broadcast_v2_transaction(
         stream.write_all(&buf).await?;
         stream.close_writer().await?;
 
-        let resp_data = stream.read_to_end().await
+        let resp_data = stream
+            .read_to_end()
+            .await
             .map_err(|e| JsValue::from_str(&format!("verification failed: {:?}", e)))?;
 
         // Response: len(v1_txns) as u64 + encoded txns + len(v2_txns) as u64 + encoded txns
@@ -6373,7 +6771,8 @@ pub async fn broadcast_v2_transaction(
                 if v2_count == 0 {
                     let _ = conn.wt.close();
                     return Err(JsValue::from_str(&format!(
-                        "transaction {} was not accepted into the peer's mempool", primary_txid
+                        "transaction {} was not accepted into the peer's mempool",
+                        primary_txid
                     )));
                 }
             }
@@ -6381,7 +6780,8 @@ pub async fn broadcast_v2_transaction(
         } else {
             let _ = conn.wt.close();
             return Err(JsValue::from_str(&format!(
-                "peer returned empty response when verifying transaction {}", primary_txid
+                "peer returned empty response when verifying transaction {}",
+                primary_txid
             )));
         }
     }
@@ -6401,9 +6801,9 @@ pub async fn scan_wallet_utxos(
     log_fn: js_sys::Function,
     cert_hash_hex: Option<String>,
 ) -> Result<JsValue, JsValue> {
-    use std::collections::BTreeMap;
-    use sia::hd::{HdMnemonic, ExtendedPrivateKey};
+    use sia::hd::{ExtendedPrivateKey, HdMnemonic};
     use sia::types::v2::SpendPolicy;
+    use std::collections::BTreeMap;
 
     console_error_panic_hook::set_once();
 
@@ -6421,8 +6821,8 @@ pub async fn scan_wallet_utxos(
 
     // Derive account key from entropy
     let entropy = hex::decode(&entropy_hex).map_err(|e| JsValue::from_str(&e.to_string()))?;
-    let mnemonic = HdMnemonic::from_entropy(&entropy)
-        .map_err(|e| JsValue::from_str(&e.to_string()))?;
+    let mnemonic =
+        HdMnemonic::from_entropy(&entropy).map_err(|e| JsValue::from_str(&e.to_string()))?;
     let seed = mnemonic.to_seed("");
     let master = ExtendedPrivateKey::from_bip39_seed(&seed);
     let account_key = master
@@ -6468,13 +6868,18 @@ pub async fn scan_wallet_utxos(
         }
         let version = u32::from_le_bytes(index_data[4..8].try_into().unwrap());
         if version != 1 {
-            return Err(JsValue::from_str(&format!("unsupported UTXO index version: {version}")));
+            return Err(JsValue::from_str(&format!(
+                "unsupported UTXO index version: {version}"
+            )));
         }
         let count = u32::from_le_bytes(index_data[8..12].try_into().unwrap()) as usize;
         let tip_height = u32::from_le_bytes(index_data[12..16].try_into().unwrap());
         data_tip_height = tip_height as u64;
         log(
-            &format!("Loaded UTXO index: {} entries, tip height {}", count, tip_height),
+            &format!(
+                "Loaded UTXO index: {} entries, tip height {}",
+                count, tip_height
+            ),
             "ok",
         );
 
@@ -6496,7 +6901,9 @@ pub async fn scan_wallet_utxos(
             let address = SpendPolicy::PublicKey(pk).address();
             let addr_bytes: [u8; 32] = {
                 let slice: &[u8] = address.as_ref();
-                slice.try_into().map_err(|_| JsValue::from_str("address must be 32 bytes"))?
+                slice
+                    .try_into()
+                    .map_err(|_| JsValue::from_str("address must be 32 bytes"))?
             };
             let mut addr_prefix = [0u8; 8];
             addr_prefix.copy_from_slice(&addr_bytes[..8]);
@@ -6535,7 +6942,8 @@ pub async fn scan_wallet_utxos(
                 has_matches = true;
                 let mut oid_prefix = [0u8; 8];
                 oid_prefix.copy_from_slice(&index_data[off + 8..off + 16]);
-                let height = u32::from_le_bytes(index_data[off + 16..off + 20].try_into().unwrap()) as u64;
+                let height =
+                    u32::from_le_bytes(index_data[off + 16..off + 20].try_into().unwrap()) as u64;
                 suxi_entries.push((addr_idx, oid_prefix, height));
                 block_addrs
                     .entry(height)
@@ -6553,10 +6961,21 @@ pub async fn scan_wallet_utxos(
 
             if has_matches {
                 active_addresses.push((addr_idx, address));
-                log(&format!("  Address {}: {} — UTXOs found", index, addr_short), "ok");
+                log(
+                    &format!("  Address {}: {} — UTXOs found", index, addr_short),
+                    "ok",
+                );
                 gap = 0;
             } else {
-                log(&format!("  Address {}: {} — no UTXOs (gap {})", index, addr_short, gap + 1), "data");
+                log(
+                    &format!(
+                        "  Address {}: {} — no UTXOs (gap {})",
+                        index,
+                        addr_short,
+                        gap + 1
+                    ),
+                    "data",
+                );
                 gap += 1;
             }
 
@@ -6574,8 +6993,14 @@ pub async fn scan_wallet_utxos(
             match parse_filter_file(&filter_data) {
                 Ok(ff) => {
                     let p = ff.p as u8;
-                    log(&format!("Scanning {} active address(es) against {} filters...",
-                        active_addresses.len(), ff.entries.len()), "ok");
+                    log(
+                        &format!(
+                            "Scanning {} active address(es) against {} filters...",
+                            active_addresses.len(),
+                            ff.entries.len()
+                        ),
+                        "ok",
+                    );
                     if ff.tip_height < data_tip_height {
                         data_tip_height = ff.tip_height;
                     }
@@ -6590,7 +7015,13 @@ pub async fn scan_wallet_utxos(
                             if entry.address_count == 0 {
                                 continue;
                             }
-                            if gcs_match(&entry.filter_data, &entry.block_id, &addr_bytes, entry.address_count as u64, p) {
+                            if gcs_match(
+                                &entry.filter_data,
+                                &entry.block_id,
+                                &addr_bytes,
+                                entry.address_count as u64,
+                                p,
+                            ) {
                                 match_count += 1;
                                 block_addrs
                                     .entry(entry.height)
@@ -6604,12 +7035,28 @@ pub async fn scan_wallet_utxos(
                         }
                         let ar = &addr_results[addr_idx];
                         let addr_hex = hex::encode(&addr_bytes);
-                        log(&format!("  Address {}: {}...{} — {} filter matches",
-                            ar.index, &addr_hex[..8], &addr_hex[56..], match_count), "ok");
+                        log(
+                            &format!(
+                                "  Address {}: {}...{} — {} filter matches",
+                                ar.index,
+                                &addr_hex[..8],
+                                &addr_hex[56..],
+                                match_count
+                            ),
+                            "ok",
+                        );
                     }
-                    height_to_idx = ff.entries.iter().enumerate().map(|(i, e)| (e.height, i)).collect();
+                    height_to_idx = ff
+                        .entries
+                        .iter()
+                        .enumerate()
+                        .map(|(i, e)| (e.height, i))
+                        .collect();
                     filter_file_opt = Some(ff);
-                    log(&format!("Filter scan: {} blocks to fetch", block_addrs.len()), "ok");
+                    log(
+                        &format!("Filter scan: {} blocks to fetch", block_addrs.len()),
+                        "ok",
+                    );
                 }
                 Err(e) => {
                     log(&format!("Failed to parse filter file: {}", e), "err");
@@ -6621,8 +7068,15 @@ pub async fn scan_wallet_utxos(
         log("Loading block filters...", "info");
         let filter_data = fetch_bytes(&filter_url).await?;
         log(
-            &format!("Loaded {} bytes, magic: {:?}", filter_data.len(),
-                if filter_data.len() >= 4 { std::str::from_utf8(&filter_data[..4]).unwrap_or("???") } else { "???" }),
+            &format!(
+                "Loaded {} bytes, magic: {:?}",
+                filter_data.len(),
+                if filter_data.len() >= 4 {
+                    std::str::from_utf8(&filter_data[..4]).unwrap_or("???")
+                } else {
+                    "???"
+                }
+            ),
             "data",
         );
         let filter_file = parse_filter_file(&filter_data)
@@ -6630,7 +7084,11 @@ pub async fn scan_wallet_utxos(
         let p = filter_file.p as u8;
         data_tip_height = filter_file.tip_height;
         log(
-            &format!("Loaded {} block filters ({:.1} KB)", filter_file.entries.len(), filter_data.len() as f64 / 1024.0),
+            &format!(
+                "Loaded {} block filters ({:.1} KB)",
+                filter_file.entries.len(),
+                filter_data.len() as f64 / 1024.0
+            ),
             "ok",
         );
 
@@ -6655,7 +7113,9 @@ pub async fn scan_wallet_utxos(
             let address = SpendPolicy::PublicKey(pk).address();
             let addr_bytes: [u8; 32] = {
                 let slice: &[u8] = address.as_ref();
-                slice.try_into().map_err(|_| JsValue::from_str("address must be 32 bytes"))?
+                slice
+                    .try_into()
+                    .map_err(|_| JsValue::from_str("address must be 32 bytes"))?
             };
 
             let addr_idx = addr_results.len();
@@ -6673,7 +7133,13 @@ pub async fn scan_wallet_utxos(
                 if entry.address_count == 0 {
                     continue;
                 }
-                if gcs_match(&entry.filter_data, &entry.block_id, &addr_bytes, entry.address_count as u64, p) {
+                if gcs_match(
+                    &entry.filter_data,
+                    &entry.block_id,
+                    &addr_bytes,
+                    entry.address_count as u64,
+                    p,
+                ) {
                     has_matches = true;
                     block_addrs
                         .entry(entry.height)
@@ -6687,7 +7153,13 @@ pub async fn scan_wallet_utxos(
 
             if has_matches {
                 active_addresses.push((addr_idx, address));
-                log(&format!("  Address {}: {} — filter matches found", index, addr_short_fb), "ok");
+                log(
+                    &format!(
+                        "  Address {}: {} — filter matches found",
+                        index, addr_short_fb
+                    ),
+                    "ok",
+                );
                 gap = 0;
             } else {
                 gap += 1;
@@ -6733,50 +7205,74 @@ pub async fn scan_wallet_utxos(
         let net = get_network_prefix();
         let cached_ids = match load_header_ids().await? {
             Some(ids) => Some(ids),
-            None => {
-                match load_header_ids_with_key(&prefixed_key("header_ids_v2")).await? {
-                    Some(ids) => {
-                        header_offset = if genesis_id_hex == "25f6e3b9295a61f69fcb956aca9f0076234ecf2e02d399db5448b6e22f26e81c" {
-                            530000
-                        } else {
-                            50
-                        };
-                        Some(ids)
-                    }
-                    None => CACHED_HEADER_IDS.with(|cache| {
-                        cache.borrow().as_ref().and_then(|(n, ids)| {
-                            if *n == net { Some(ids.clone()) } else { None }
-                        })
-                    }),
+            None => match load_header_ids_with_key(&prefixed_key("header_ids_v2")).await? {
+                Some(ids) => {
+                    header_offset = if genesis_id_hex
+                        == "25f6e3b9295a61f69fcb956aca9f0076234ecf2e02d399db5448b6e22f26e81c"
+                    {
+                        530000
+                    } else {
+                        50
+                    };
+                    Some(ids)
                 }
-            }
+                None => CACHED_HEADER_IDS.with(|cache| {
+                    cache
+                        .borrow()
+                        .as_ref()
+                        .and_then(|(n, ids)| if *n == net { Some(ids.clone()) } else { None })
+                }),
+            },
         };
 
         header_ids = match cached_ids {
             Some(ids) => {
-                log(&format!("Using {} cached header IDs (offset {})", ids.len(), header_offset), "ok");
+                log(
+                    &format!(
+                        "Using {} cached header IDs (offset {})",
+                        ids.len(),
+                        header_offset
+                    ),
+                    "ok",
+                );
                 ids
             }
             None => {
                 log("Header IDs not cached, syncing headers...", "info");
                 let max_height = block_addrs.keys().last().copied().unwrap_or(0);
-                let conn_tmp = connect_and_handshake(&url, genesis_id, cert_hash.as_deref()).await?;
-                let mut current_index = ChainIndex { height: 0, id: genesis_id };
+                let conn_tmp =
+                    connect_and_handshake(&url, genesis_id, cert_hash.as_deref()).await?;
+                let mut current_index = ChainIndex {
+                    height: 0,
+                    id: genesis_id,
+                };
                 let mut synced_ids: Vec<BlockID> = Vec::new();
                 let max_per_batch: u64 = 2000;
                 loop {
                     let resp = send_headers_rpc(&conn_tmp.wt, current_index, max_per_batch).await?;
                     let batch_count = resp.headers.len() as u64;
-                    if batch_count == 0 { break; }
+                    if batch_count == 0 {
+                        break;
+                    }
                     for header in &resp.headers {
                         synced_ids.push(header.id());
                     }
                     let total = synced_ids.len() as u64;
-                    log(&format!("  Syncing headers: {} / ~{}", total, total + resp.remaining), "progress");
+                    log(
+                        &format!("  Syncing headers: {} / ~{}", total, total + resp.remaining),
+                        "progress",
+                    );
                     let last_header = resp.headers.last().unwrap();
-                    current_index = ChainIndex { height: current_index.height + batch_count, id: last_header.id() };
-                    if current_index.height > max_height && resp.remaining == 0 { break; }
-                    if resp.remaining == 0 { break; }
+                    current_index = ChainIndex {
+                        height: current_index.height + batch_count,
+                        id: last_header.id(),
+                    };
+                    if current_index.height > max_height && resp.remaining == 0 {
+                        break;
+                    }
+                    if resp.remaining == 0 {
+                        break;
+                    }
                 }
                 CACHED_HEADER_IDS.with(|cache| {
                     *cache.borrow_mut() = Some((net.clone(), synced_ids.clone()));
@@ -6798,7 +7294,10 @@ pub async fn scan_wallet_utxos(
     let mut blocks_fetched = 0u32;
     for (i, (height, addr_indices)) in block_addrs.iter().enumerate() {
         let block = if let Ok(Some(cached)) = load_cached_block(*height).await {
-            log(&format!("  [{}/{}] Height {}: cached", i + 1, total_blocks, height), "data");
+            log(
+                &format!("  [{}/{}] Height {}: cached", i + 1, total_blocks, height),
+                "data",
+            );
             cached
         } else {
             // Get previous block ID — use header IDs (SUXI) or filter entries (filter)
@@ -6807,16 +7306,27 @@ pub async fn scan_wallet_utxos(
             } else if used_suxi {
                 let h = *height as u32;
                 if h <= header_offset {
-                    log(&format!("  Height {} before header offset {}, skipping", height, header_offset), "info");
+                    log(
+                        &format!(
+                            "  Height {} before header offset {}, skipping",
+                            height, header_offset
+                        ),
+                        "info",
+                    );
                     continue;
                 }
                 let idx = (h - header_offset - 1) as usize;
                 if idx >= header_ids.len() {
-                    log(&format!("  Height {} out of range, skipping", height), "info");
+                    log(
+                        &format!("  Height {} out of range, skipping", height),
+                        "info",
+                    );
                     continue;
                 }
                 if idx == 0 && header_offset > 0 {
-                    let checkpoint_hex = if genesis_id_hex == "25f6e3b9295a61f69fcb956aca9f0076234ecf2e02d399db5448b6e22f26e81c" {
+                    let checkpoint_hex = if genesis_id_hex
+                        == "25f6e3b9295a61f69fcb956aca9f0076234ecf2e02d399db5448b6e22f26e81c"
+                    {
                         "0000000000000000b3b69b56214c974ce293a310d5fcfedb85f2e6b039e5bac0"
                     } else {
                         "0000000863c1e1191775e601ead23feeae6f5bab166eb1da538b091c6613be72"
@@ -6837,7 +7347,13 @@ pub async fn scan_wallet_utxos(
                         BlockID::from(bid)
                     }
                     None => {
-                        log(&format!("  Warning: no filter entry for height {}, skipping", height - 1), "err");
+                        log(
+                            &format!(
+                                "  Warning: no filter entry for height {}, skipping",
+                                height - 1
+                            ),
+                            "err",
+                        );
                         continue;
                     }
                 }
@@ -6847,9 +7363,13 @@ pub async fn scan_wallet_utxos(
             let blocks_with_raw = match rpc_result {
                 Ok((blocks, _)) => blocks,
                 Err(_) => {
-                    log(&format!("  Connection lost at block {}, reconnecting...", height), "info");
+                    log(
+                        &format!("  Connection lost at block {}, reconnecting...", height),
+                        "info",
+                    );
                     let _ = wt.close();
-                    let new_conn = connect_and_handshake(&url, genesis_id, cert_hash.as_deref()).await?;
+                    let new_conn =
+                        connect_and_handshake(&url, genesis_id, cert_hash.as_deref()).await?;
                     wt = new_conn.wt;
                     match send_v2_blocks_rpc(&wt, vec![prev_block_id], 1, true).await {
                         Ok((blocks, _)) => blocks,
@@ -6871,12 +7391,36 @@ pub async fn scan_wallet_utxos(
 
         blocks_fetched += 1;
 
+        // Compute correct block ID from header IDs or filter entries
+        let block_id = if used_suxi {
+            let h = *height as u32;
+            if h > header_offset {
+                let idx = (h - header_offset - 1) as usize;
+                if idx < header_ids.len() {
+                    header_ids[idx]
+                } else {
+                    block.id()
+                }
+            } else {
+                block.id()
+            }
+        } else {
+            match height_to_idx.get(height) {
+                Some(&idx) => {
+                    let ff = filter_file_opt.as_ref().unwrap();
+                    BlockID::from(ff.entries[idx].block_id)
+                }
+                None => block.id(),
+            }
+        };
+
         // Scan block for ALL active addresses (not just the ones that triggered
         // the fetch). A block may contain spends of addresses that didn't match
         // the filter/SUXI for this block — e.g., address #0 spent as input in a
         // block that only matched address #3 as output.
         for &(addr_idx, _) in &active_addresses {
-            let (received, sent, details) = scan_block_balance(&block, &addr_results[addr_idx].address);
+            let (received, sent, details) =
+                scan_block_balance(&block, &block_id, &addr_results[addr_idx].address);
             if received > 0 || sent > 0 {
                 addr_results[addr_idx].received += received;
                 addr_results[addr_idx].sent += sent;
@@ -6896,7 +7440,10 @@ pub async fn scan_wallet_utxos(
         }
 
         if (i + 1) % 10 == 0 || i + 1 == total_blocks {
-            log(&format!("  Fetched {}/{} blocks", i + 1, total_blocks), "data");
+            log(
+                &format!("  Fetched {}/{} blocks", i + 1, total_blocks),
+                "data",
+            );
         }
     }
 
@@ -6927,44 +7474,82 @@ pub async fn scan_wallet_utxos(
     };
 
     // Tail-scan all derived addresses (any could have new UTXOs in recent blocks)
-    let tail_addresses: Vec<(usize, Address)> =
-        addr_results.iter().enumerate().map(|(i, ar)| (i, ar.address.clone())).collect();
+    let tail_addresses: Vec<(usize, Address)> = addr_results
+        .iter()
+        .enumerate()
+        .map(|(i, ar)| (i, ar.address.clone()))
+        .collect();
 
-    log(&format!("Scanning {} addresses in blocks after tip (height {})...", tail_addresses.len(), tail_tip), "info");
-    log(&format!("  Tail anchor: {}", hex::encode(last_known_block_id.as_ref() as &[u8])), "data");
+    log(
+        &format!(
+            "Scanning {} addresses in blocks after tip (height {})...",
+            tail_addresses.len(),
+            tail_tip
+        ),
+        "info",
+    );
+    log(
+        &format!(
+            "  Tail anchor: {}",
+            hex::encode(last_known_block_id.as_ref() as &[u8])
+        ),
+        "data",
+    );
 
     let mut tail_history = vec![last_known_block_id];
     let mut tail_blocks_scanned: u64 = 0;
     let blocks_per_batch: u64 = 100;
 
     loop {
-        let rpc_result = send_v2_blocks_rpc(&wt, tail_history.clone(), blocks_per_batch, true).await;
+        let rpc_result =
+            send_v2_blocks_rpc(&wt, tail_history.clone(), blocks_per_batch, true).await;
         let (blocks_with_raw, remaining) = match rpc_result {
             Ok(result) => {
-                log(&format!("  Tail RPC: {} blocks, {} remaining", result.0.len(), result.1), "data");
+                log(
+                    &format!(
+                        "  Tail RPC: {} blocks, {} remaining",
+                        result.0.len(),
+                        result.1
+                    ),
+                    "data",
+                );
                 result
             }
             Err(e) => {
                 log(&format!("  Tail RPC error: {:?}", e), "err");
-                log(&format!("  Connection lost after {} tail blocks, reconnecting...", tail_blocks_scanned), "info");
+                log(
+                    &format!(
+                        "  Connection lost after {} tail blocks, reconnecting...",
+                        tail_blocks_scanned
+                    ),
+                    "info",
+                );
                 let _ = wt.close();
-                let new_conn = connect_and_handshake(&url, genesis_id, cert_hash.as_deref()).await?;
+                let new_conn =
+                    connect_and_handshake(&url, genesis_id, cert_hash.as_deref()).await?;
                 wt = new_conn.wt;
-                if tail_history.is_empty() { break; }
+                if tail_history.is_empty() {
+                    break;
+                }
                 continue;
             }
         };
 
-        if blocks_with_raw.is_empty() { break; }
+        if blocks_with_raw.is_empty() {
+            break;
+        }
 
         let last_block_id = blocks_with_raw.last().unwrap().0.id();
 
         for (block, raw) in &blocks_with_raw {
-            let height = block.v2_height.unwrap_or(tail_tip + 1 + tail_blocks_scanned);
+            let height = block
+                .v2_height
+                .unwrap_or(tail_tip + 1 + tail_blocks_scanned);
             let _ = cache_block(height, raw).await;
+            let block_id = block.id(); // tail blocks are v2, id() is correct
 
             for &(addr_idx, ref address) in &tail_addresses {
-                let (received, sent, details) = scan_block_balance(block, address);
+                let (received, sent, details) = scan_block_balance(block, &block_id, address);
                 if received > 0 || sent > 0 {
                     addr_results[addr_idx].received += received;
                     addr_results[addr_idx].sent += sent;
@@ -6986,9 +7571,17 @@ pub async fn scan_wallet_utxos(
         }
         blocks_fetched += blocks_with_raw.len() as u32;
 
-        log(&format!("  Tail scan: {} blocks after tip | {} remaining", tail_blocks_scanned, remaining), "data");
+        log(
+            &format!(
+                "  Tail scan: {} blocks after tip | {} remaining",
+                tail_blocks_scanned, remaining
+            ),
+            "data",
+        );
 
-        if remaining == 0 { break; }
+        if remaining == 0 {
+            break;
+        }
         tail_history = vec![last_block_id];
     }
 
@@ -7014,7 +7607,10 @@ pub async fn scan_wallet_utxos(
                 // Check if this received UTXO matches a SUXI entry
                 let oid_bytes = hex::decode(oid.replace(":", "")).unwrap_or_default();
                 let matches_suxi = suxi_entries.iter().any(|(si, oid_prefix, sh)| {
-                    *si == addr_idx && *sh == height && oid_bytes.len() >= 8 && oid_bytes[..8] == oid_prefix[..]
+                    *si == addr_idx
+                        && *sh == height
+                        && oid_bytes.len() >= 8
+                        && oid_bytes[..8] == oid_prefix[..]
                 });
                 if matches_suxi {
                     unspent_output_ids.push(oid.to_string());
@@ -7061,10 +7657,22 @@ pub async fn scan_wallet_utxos(
     };
     log("", "info");
     log("Wallet scan complete!", "ok");
-    log(&format!("  Addresses scanned:     {}", total_scanned), "data");
-    log(&format!("  Addresses with activity: {}", addresses_with_activity), "data");
-    log(&format!("  Blocks fetched:        {}", blocks_fetched), "data");
-    log(&format!("  Total balance:         {}", format_sc(total_balance)), "ok");
+    log(
+        &format!("  Addresses scanned:     {}", total_scanned),
+        "data",
+    );
+    log(
+        &format!("  Addresses with activity: {}", addresses_with_activity),
+        "data",
+    );
+    log(
+        &format!("  Blocks fetched:        {}", blocks_fetched),
+        "data",
+    );
+    log(
+        &format!("  Total balance:         {}", format_sc(total_balance)),
+        "ok",
+    );
 
     let result = json!({
         "addresses": addr_json,
@@ -7087,8 +7695,8 @@ pub async fn scan_wallet_utxos(
 // =============================================================================
 
 use sia::consensus::{
-    siacoin_element_hash, siafund_element_hash, v2_file_contract_element_hash,
-    chain_index_element_hash, attestation_element_hash, ElementLeaf,
+    ElementLeaf, attestation_element_hash, chain_index_element_hash, siacoin_element_hash,
+    siafund_element_hash, v2_file_contract_element_hash,
 };
 use sia::types::SiacoinOutput;
 use std::collections::HashMap;
@@ -7165,13 +7773,19 @@ fn extract_block_elements(
     let mut attestation_elems: Vec<ElementLeaf> = Vec::new();
 
     // Helper: record or retrieve a siacoin element by ID
-    let record_sce = |id_bytes: [u8; 32], elems: &mut Vec<ElementLeaf>, index: &mut HashMap<[u8; 32], usize>| -> usize {
+    let record_sce = |id_bytes: [u8; 32],
+                      elems: &mut Vec<ElementLeaf>,
+                      index: &mut HashMap<[u8; 32], usize>|
+     -> usize {
         if let Some(&idx) = index.get(&id_bytes) {
             idx
         } else {
             let idx = elems.len();
             elems.push(ElementLeaf {
-                state_element: StateElement { leaf_index: UNASSIGNED_LEAF_INDEX, merkle_proof: Vec::new() },
+                state_element: StateElement {
+                    leaf_index: UNASSIGNED_LEAF_INDEX,
+                    merkle_proof: Vec::new(),
+                },
                 element_hash: Hash256::default(),
                 spent: false,
             });
@@ -7181,13 +7795,19 @@ fn extract_block_elements(
     };
 
     // Helper: record or retrieve a v2 file contract element by ID
-    let record_v2fce = |id_bytes: [u8; 32], elems: &mut Vec<ElementLeaf>, index: &mut HashMap<[u8; 32], usize>| -> usize {
+    let record_v2fce = |id_bytes: [u8; 32],
+                        elems: &mut Vec<ElementLeaf>,
+                        index: &mut HashMap<[u8; 32], usize>|
+     -> usize {
         if let Some(&idx) = index.get(&id_bytes) {
             idx
         } else {
             let idx = elems.len();
             elems.push(ElementLeaf {
-                state_element: StateElement { leaf_index: UNASSIGNED_LEAF_INDEX, merkle_proof: Vec::new() },
+                state_element: StateElement {
+                    leaf_index: UNASSIGNED_LEAF_INDEX,
+                    merkle_proof: Vec::new(),
+                },
                 element_hash: Hash256::default(),
                 spent: false,
             });
@@ -7228,7 +7848,9 @@ fn extract_block_elements(
             if let Some(&idx) = sfe_index.get(&sf_id_bytes) {
                 siafund_elems[idx].state_element = sfi.parent.state_element.clone();
                 siafund_elems[idx].element_hash = siafund_element_hash(
-                    &sfi.parent.id, &sfi.parent.siafund_output, &sfi.parent.claim_start,
+                    &sfi.parent.id,
+                    &sfi.parent.siafund_output,
+                    &sfi.parent.claim_start,
                 );
                 siafund_elems[idx].spent = true;
             } else {
@@ -7236,7 +7858,9 @@ fn extract_block_elements(
                 siafund_elems.push(ElementLeaf {
                     state_element: sfi.parent.state_element.clone(),
                     element_hash: siafund_element_hash(
-                        &sfi.parent.id, &sfi.parent.siafund_output, &sfi.parent.claim_start,
+                        &sfi.parent.id,
+                        &sfi.parent.siafund_output,
+                        &sfi.parent.claim_start,
                     ),
                     spent: true,
                 });
@@ -7256,7 +7880,8 @@ fn extract_block_elements(
             };
             let claim_id_bytes: [u8; 32] = id_to_bytes(&claim_id);
             let cidx = record_sce(claim_id_bytes, &mut siacoin_elems, &mut sce_index);
-            siacoin_elems[cidx].element_hash = siacoin_element_hash(&claim_id, &claim_output, mat_height);
+            siacoin_elems[cidx].element_hash =
+                siacoin_element_hash(&claim_id, &claim_output, mat_height);
         }
 
         // 4. Siafund outputs (created, added)
@@ -7270,7 +7895,10 @@ fn extract_block_elements(
             } else {
                 let idx = siafund_elems.len();
                 siafund_elems.push(ElementLeaf {
-                    state_element: StateElement { leaf_index: UNASSIGNED_LEAF_INDEX, merkle_proof: Vec::new() },
+                    state_element: StateElement {
+                        leaf_index: UNASSIGNED_LEAF_INDEX,
+                        merkle_proof: Vec::new(),
+                    },
                     element_hash: siafund_element_hash(&id, sfo, siafund_pool),
                     spent: false,
                 });
@@ -7292,7 +7920,8 @@ fn extract_block_elements(
             let idx = record_v2fce(id_bytes, &mut v2fc_elems, &mut v2fce_index);
             // Use the revision for the hash (Go: if rev != nil { fc = *rev })
             v2fc_elems[idx].state_element = fcr.parent.state_element.clone();
-            v2fc_elems[idx].element_hash = v2_file_contract_element_hash(&fcr.parent.id, &fcr.revision);
+            v2fc_elems[idx].element_hash =
+                v2_file_contract_element_hash(&fcr.parent.id, &fcr.revision);
             // Don't mark spent — only resolution marks spent
         }
 
@@ -7316,8 +7945,12 @@ fn extract_block_elements(
                     let renewal_id = fcr.parent.id.v2_renewal_id();
                     let rid_bytes: [u8; 32] = id_to_bytes(&renewal_id);
                     let ridx = record_v2fce(rid_bytes, &mut v2fc_elems, &mut v2fce_index);
-                    v2fc_elems[ridx].element_hash = v2_file_contract_element_hash(&renewal_id, &renewal.new_contract);
-                    (renewal.final_renter_output.clone(), renewal.final_host_output.clone())
+                    v2fc_elems[ridx].element_hash =
+                        v2_file_contract_element_hash(&renewal_id, &renewal.new_contract);
+                    (
+                        renewal.final_renter_output.clone(),
+                        renewal.final_host_output.clone(),
+                    )
                 }
                 ContractResolution::StorageProof(_) => {
                     (fc.renter_output.clone(), fc.host_output.clone())
@@ -7335,13 +7968,15 @@ fn extract_block_elements(
             let renter_id = fcr.parent.id.v2_renter_output_id();
             let rid_bytes: [u8; 32] = id_to_bytes(&renter_id);
             let ridx = record_sce(rid_bytes, &mut siacoin_elems, &mut sce_index);
-            siacoin_elems[ridx].element_hash = siacoin_element_hash(&renter_id, &renter_output, mat_height);
+            siacoin_elems[ridx].element_hash =
+                siacoin_element_hash(&renter_id, &renter_output, mat_height);
 
             // Create immature host payout
             let host_id = fcr.parent.id.v2_host_output_id();
             let hid_bytes: [u8; 32] = id_to_bytes(&host_id);
             let hidx = record_sce(hid_bytes, &mut siacoin_elems, &mut sce_index);
-            siacoin_elems[hidx].element_hash = siacoin_element_hash(&host_id, &host_output, mat_height);
+            siacoin_elems[hidx].element_hash =
+                siacoin_element_hash(&host_id, &host_output, mat_height);
         }
 
         // 8. Attestations (created, added — always unique)
@@ -7349,7 +7984,10 @@ fn extract_block_elements(
             let id = txid.v2_attestation_id(i);
             let att_hash = attestation_element_hash(&id, att);
             attestation_elems.push(ElementLeaf {
-                state_element: StateElement { leaf_index: UNASSIGNED_LEAF_INDEX, merkle_proof: Vec::new() },
+                state_element: StateElement {
+                    leaf_index: UNASSIGNED_LEAF_INDEX,
+                    merkle_proof: Vec::new(),
+                },
                 element_hash: att_hash,
                 spent: false,
             });
@@ -7370,13 +8008,26 @@ fn extract_block_elements(
 
     // Foundation subsidy (if applicable)
     {
-        let (foundation_height, primary_address, blocks_per_month) = if genesis_id_hex.starts_with("25f6e3b9") {
-            (298_000u64, "053b2def3cbdd078c19d62ce2b4f0b1a3c5e0ffbeeff01280efb1f8969b2f5bb4fdc680f0807", 4380u64)
-        } else if genesis_id_hex.starts_with("172fb3d5") {
-            (30u64, "053b2def3cbdd078c19d62ce2b4f0b1a3c5e0ffbeeff01280efb1f8969b2f5bb4fdc680f0807", 4380u64)
-        } else {
-            (30u64, "241352c83da002e61f57e96b14f3a5f8b5de22156ce83b753ea495e64f1affebae88736b2347", 4380u64)
-        };
+        let (foundation_height, primary_address, blocks_per_month) =
+            if genesis_id_hex.starts_with("25f6e3b9") {
+                (
+                    298_000u64,
+                    "053b2def3cbdd078c19d62ce2b4f0b1a3c5e0ffbeeff01280efb1f8969b2f5bb4fdc680f0807",
+                    4380u64,
+                )
+            } else if genesis_id_hex.starts_with("172fb3d5") {
+                (
+                    30u64,
+                    "053b2def3cbdd078c19d62ce2b4f0b1a3c5e0ffbeeff01280efb1f8969b2f5bb4fdc680f0807",
+                    4380u64,
+                )
+            } else {
+                (
+                    30u64,
+                    "241352c83da002e61f57e96b14f3a5f8b5de22156ce83b753ea495e64f1affebae88736b2347",
+                    4380u64,
+                )
+            };
 
         let child_height = block_height + 1;
         if child_height >= foundation_height
@@ -7471,7 +8122,10 @@ pub async fn compute_utxo_proofs(
             utxo_ids.insert(id.to_string(), i);
         }
     }
-    log(&format!("Computing proofs for {} UTXOs", utxo_ids.len()), "info");
+    log(
+        &format!("Computing proofs for {} UTXOs", utxo_ids.len()),
+        "info",
+    );
 
     let genesis_id = parse_genesis_id(&genesis_id_hex)?;
     let cert_hash = parse_cert_hash(&cert_hash_hex)?;
@@ -7496,11 +8150,15 @@ pub async fn compute_utxo_proofs(
     log("Syncing headers...", "info");
     let net = get_network_prefix();
 
-    let mut synced_ids: Vec<BlockID> = CACHED_HEADER_IDS.with(|cache| {
-        cache.borrow().as_ref().and_then(|(n, ids)| {
-            if *n == net { Some(ids.clone()) } else { None }
+    let mut synced_ids: Vec<BlockID> = CACHED_HEADER_IDS
+        .with(|cache| {
+            cache.borrow().as_ref().and_then(
+                |(n, ids)| {
+                    if *n == net { Some(ids.clone()) } else { None }
+                },
+            )
         })
-    }).unwrap_or_default();
+        .unwrap_or_default();
 
     if synced_ids.is_empty() {
         if let Ok(Some(ids)) = load_header_ids().await {
@@ -7510,7 +8168,10 @@ pub async fn compute_utxo_proofs(
 
     // Sync remaining headers
     let mut current_index = if synced_ids.is_empty() {
-        ChainIndex { height: 0, id: genesis_id }
+        ChainIndex {
+            height: 0,
+            id: genesis_id,
+        }
     } else {
         ChainIndex {
             height: synced_ids.len() as u64,
@@ -7520,7 +8181,9 @@ pub async fn compute_utxo_proofs(
 
     loop {
         let resp = send_headers_rpc(&conn.wt, current_index, 2000).await?;
-        if resp.headers.is_empty() { break; }
+        if resp.headers.is_empty() {
+            break;
+        }
         for header in &resp.headers {
             synced_ids.push(header.id());
         }
@@ -7529,8 +8192,13 @@ pub async fn compute_utxo_proofs(
             height: current_index.height + count,
             id: resp.headers.last().unwrap().id(),
         };
-        log(&format!("  Syncing headers: {}", synced_ids.len()), "progress");
-        if resp.remaining == 0 { break; }
+        log(
+            &format!("  Syncing headers: {}", synced_ids.len()),
+            "progress",
+        );
+        if resp.remaining == 0 {
+            break;
+        }
     }
 
     let tip_height = synced_ids.len() as u64;
@@ -7544,15 +8212,26 @@ pub async fn compute_utxo_proofs(
     // Pick checkpoint as close to the earliest UTXO as possible.
     // Must be >= V2 allow height and before the earliest UTXO.
     // Use a small buffer (20 blocks) before the UTXO for safety.
-    let checkpoint_height = if earliest_utxo_height != u64::MAX && earliest_utxo_height > min_v2_height + 20 {
-        earliest_utxo_height - 20
-    } else {
-        min_v2_height
-    };
+    let checkpoint_height =
+        if earliest_utxo_height != u64::MAX && earliest_utxo_height > min_v2_height + 20 {
+            earliest_utxo_height - 20
+        } else {
+            min_v2_height
+        };
     // Clamp to valid range
     let checkpoint_height = checkpoint_height.max(min_v2_height).min(tip_height);
-    log(&format!("Checkpoint height: {} (earliest UTXO at {})", checkpoint_height,
-        if earliest_utxo_height == u64::MAX { "unknown".to_string() } else { earliest_utxo_height.to_string() }), "info");
+    log(
+        &format!(
+            "Checkpoint height: {} (earliest UTXO at {})",
+            checkpoint_height,
+            if earliest_utxo_height == u64::MAX {
+                "unknown".to_string()
+            } else {
+                earliest_utxo_height.to_string()
+            }
+        ),
+        "info",
+    );
 
     if checkpoint_height == 0 || checkpoint_height > tip_height {
         return Err(JsValue::from_str(&format!(
@@ -7595,9 +8274,21 @@ pub async fn compute_utxo_proofs(
                     loaded_from_cache = true;
 
                     let blocks_remaining = tip_height - cached_height;
-                    log(&format!("Loaded cached accumulator at height {} ({} blocks to process)", cached_height, blocks_remaining), "ok");
+                    log(
+                        &format!(
+                            "Loaded cached accumulator at height {} ({} blocks to process)",
+                            cached_height, blocks_remaining
+                        ),
+                        "ok",
+                    );
                 } else {
-                    log(&format!("Cached accumulator at height {} out of range (tip={}), rebuilding", cached_height, tip_height), "info");
+                    log(
+                        &format!(
+                            "Cached accumulator at height {} out of range (tip={}), rebuilding",
+                            cached_height, tip_height
+                        ),
+                        "info",
+                    );
                     acc = sia::consensus::ElementAccumulator::default();
                     siafund_pool = Currency::zero();
                     start_height = checkpoint_height;
@@ -7626,9 +8317,19 @@ pub async fn compute_utxo_proofs(
             id: checkpoint_id,
         };
 
-        log(&format!("Fetching checkpoint at height {}...", checkpoint_height), "info");
-        let (checkpoint_block, checkpoint_state) = send_checkpoint_rpc(&conn.wt, checkpoint_index).await?;
-        log(&format!("Checkpoint loaded. Accumulator num_leaves: {}", checkpoint_state.elements.num_leaves), "ok");
+        log(
+            &format!("Fetching checkpoint at height {}...", checkpoint_height),
+            "info",
+        );
+        let (checkpoint_block, checkpoint_state) =
+            send_checkpoint_rpc(&conn.wt, checkpoint_index).await?;
+        log(
+            &format!(
+                "Checkpoint loaded. Accumulator num_leaves: {}",
+                checkpoint_state.elements.num_leaves
+            ),
+            "ok",
+        );
 
         acc = checkpoint_state.elements.clone();
         siafund_pool = checkpoint_state.siafund_pool;
@@ -7642,18 +8343,21 @@ pub async fn compute_utxo_proofs(
                 &genesis_id_hex,
                 &siafund_pool,
             );
-            acc.apply_block(&mut updated, &mut added)
-                .map_err(|e| JsValue::from_str(&format!("apply_block on checkpoint block failed: {e}")))?;
+            acc.apply_block(&mut updated, &mut added).map_err(|e| {
+                JsValue::from_str(&format!("apply_block on checkpoint block failed: {e}"))
+            })?;
             for txn in &checkpoint_block.v2_transactions {
                 for fc in &txn.file_contracts {
-                    siafund_pool = siafund_pool + v2_fc_tax(fc.renter_output.value, fc.host_output.value);
+                    siafund_pool =
+                        siafund_pool + v2_fc_tax(fc.renter_output.value, fc.host_output.value);
                 }
                 for fcr in &txn.file_contract_resolutions {
                     if let ContractResolution::Renewal(renewal) = &fcr.resolution {
-                        siafund_pool = siafund_pool + v2_fc_tax(
-                            renewal.new_contract.renter_output.value,
-                            renewal.new_contract.host_output.value,
-                        );
+                        siafund_pool = siafund_pool
+                            + v2_fc_tax(
+                                renewal.new_contract.renter_output.value,
+                                renewal.new_contract.host_output.value,
+                            );
                     }
                 }
             }
@@ -7664,7 +8368,13 @@ pub async fn compute_utxo_proofs(
 
     // Process blocks from start_height to tip
     let total_blocks = tip_height - start_height + 1;
-    log(&format!("Processing {} blocks ({} to {})...", total_blocks, start_height, tip_height), "info");
+    log(
+        &format!(
+            "Processing {} blocks ({} to {})...",
+            total_blocks, start_height, tip_height
+        ),
+        "info",
+    );
 
     let mut blocks_processed: u64 = 0;
     let mut next_height = start_height;
@@ -7678,14 +8388,12 @@ pub async fn compute_utxo_proofs(
         };
 
         let batch_max: u64 = 100;
-        let (blocks, _remaining) = send_v2_blocks_rpc(
-            &conn.wt,
-            vec![prev_id],
-            batch_max,
-            false,
-        ).await?;
+        let (blocks, _remaining) =
+            send_v2_blocks_rpc(&conn.wt, vec![prev_id], batch_max, false).await?;
 
-        if blocks.is_empty() { break; }
+        if blocks.is_empty() {
+            break;
+        }
 
         for (bi, (block, _raw)) in blocks.iter().enumerate() {
             // block_height here is the "base index height" (parent height),
@@ -7742,11 +8450,12 @@ pub async fn compute_utxo_proofs(
             }
             // foundation subsidy (if applicable)
             {
-                let (foundation_height, blocks_per_month) = if genesis_id_hex.starts_with("25f6e3b9") {
-                    (298_000u64, 4380u64)
-                } else {
-                    (30u64, 4380u64)
-                };
+                let (foundation_height, blocks_per_month) =
+                    if genesis_id_hex.starts_with("25f6e3b9") {
+                        (298_000u64, 4380u64)
+                    } else {
+                        (30u64, 4380u64)
+                    };
                 let child_height = block_height + 1;
                 if child_height >= foundation_height
                     && (child_height - foundation_height) % blocks_per_month == 0
@@ -7757,15 +8466,12 @@ pub async fn compute_utxo_proofs(
             }
 
             // Extract and apply block elements
-            let (mut updated, mut added) = extract_block_elements(
-                block,
-                block_height,
-                &genesis_id_hex,
-                &siafund_pool,
-            );
+            let (mut updated, mut added) =
+                extract_block_elements(block, block_height, &genesis_id_hex, &siafund_pool);
 
-            let update = acc.apply_block(&mut updated, &mut added)
-                .map_err(|e| JsValue::from_str(&format!("apply_block at height {block_height} failed: {e}")))?;
+            let update = acc.apply_block(&mut updated, &mut added).map_err(|e| {
+                JsValue::from_str(&format!("apply_block at height {block_height} failed: {e}"))
+            })?;
 
             // After apply_block, added elements have their leaf_index and
             // merkle_proof filled in. Match siacoin elements against our UTXO IDs.
@@ -7804,14 +8510,16 @@ pub async fn compute_utxo_proofs(
             // Update siafund pool: add tax from new file contracts and renewals
             for txn in &block.v2_transactions {
                 for fc in &txn.file_contracts {
-                    siafund_pool = siafund_pool + v2_fc_tax(fc.renter_output.value, fc.host_output.value);
+                    siafund_pool =
+                        siafund_pool + v2_fc_tax(fc.renter_output.value, fc.host_output.value);
                 }
                 for fcr in &txn.file_contract_resolutions {
                     if let ContractResolution::Renewal(renewal) = &fcr.resolution {
-                        siafund_pool = siafund_pool + v2_fc_tax(
-                            renewal.new_contract.renter_output.value,
-                            renewal.new_contract.host_output.value,
-                        );
+                        siafund_pool = siafund_pool
+                            + v2_fc_tax(
+                                renewal.new_contract.renter_output.value,
+                                renewal.new_contract.host_output.value,
+                            );
                     }
                 }
             }
@@ -7822,7 +8530,15 @@ pub async fn compute_utxo_proofs(
         next_height += blocks.len() as u64;
 
         if blocks_processed % 100 == 0 || next_height > tip_height {
-            log(&format!("  Processed {}/{} blocks (tracked {} UTXOs)", blocks_processed, total_blocks, tracked_utxos.len()), "progress");
+            log(
+                &format!(
+                    "  Processed {}/{} blocks (tracked {} UTXOs)",
+                    blocks_processed,
+                    total_blocks,
+                    tracked_utxos.len()
+                ),
+                "progress",
+            );
         }
     }
 
@@ -7842,15 +8558,27 @@ pub async fn compute_utxo_proofs(
         cache_bytes.extend_from_slice(&((pool_val >> 64) as u64).to_le_bytes()); // hi 8 bytes
         let arr = js_sys::Uint8Array::from(&cache_bytes[..]);
         let _ = JsFuture::from(idb_save(&cache_key, arr)).await;
-        log(&format!("Saved accumulator state at height {}", tip_height), "ok");
+        log(
+            &format!("Saved accumulator state at height {}", tip_height),
+            "ok",
+        );
     }
 
-    log(&format!("Done! {} UTXOs with proofs, final acc.num_leaves={}", tracked_utxos.len(), acc.num_leaves), "ok");
+    log(
+        &format!(
+            "Done! {} UTXOs with proofs, final acc.num_leaves={}",
+            tracked_utxos.len(),
+            acc.num_leaves
+        ),
+        "ok",
+    );
 
     // Build result — include verification data
     let mut result: Vec<serde_json::Value> = Vec::new();
     for (id_hex, se) in &tracked_utxos {
-        let proof_hex: Vec<String> = se.merkle_proof.iter()
+        let proof_hex: Vec<String> = se
+            .merkle_proof
+            .iter()
             .map(|h| hex::encode(h.as_ref() as &[u8]))
             .collect();
         result.push(json!({
@@ -7922,13 +8650,17 @@ pub async fn listen_for_relays(
                                 if let Ok(write_fn) = Reflect::get(&writer, &"write".into()) {
                                     if let Some(write_fn) = write_fn.dyn_ref::<js_sys::Function>() {
                                         if let Ok(promise) = write_fn.call1(&writer, &data) {
-                                            let _ = JsFuture::from(js_sys::Promise::from(promise)).await;
+                                            let _ = JsFuture::from(js_sys::Promise::from(promise))
+                                                .await;
                                         }
                                     }
                                 }
                                 // release lock
-                                if let Ok(release_fn) = Reflect::get(&writer, &"releaseLock".into()) {
-                                    if let Some(release_fn) = release_fn.dyn_ref::<js_sys::Function>() {
+                                if let Ok(release_fn) = Reflect::get(&writer, &"releaseLock".into())
+                                {
+                                    if let Some(release_fn) =
+                                        release_fn.dyn_ref::<js_sys::Function>()
+                                    {
                                         let _ = release_fn.call0(&writer);
                                     }
                                 }
@@ -7949,7 +8681,10 @@ pub async fn listen_for_relays(
     keepalive_closure.forget(); // prevent the closure from being dropped
 
     // Loop accepting incoming streams from the peer
-    emit("debug", "entering relay loop, waiting for incoming streams...");
+    emit(
+        "debug",
+        "entering relay loop, waiting for incoming streams...",
+    );
     loop {
         emit("debug", "calling reader.read() for next incoming stream...");
         let read_result = JsFuture::from(reader.read()).await;
@@ -7979,7 +8714,9 @@ pub async fn listen_for_relays(
             .get_reader()
             .dyn_into::<ReadableStreamDefaultReader>()
             .map_err(|_| JsValue::from_str("failed to get stream reader"))?;
-        let stream_writer = bidi.writable().get_writer()
+        let stream_writer = bidi
+            .writable()
+            .get_writer()
             .map_err(|_| JsValue::from_str("failed to get stream writer"))?;
         let mut stream = WtStream {
             reader: stream_reader,
@@ -7994,7 +8731,9 @@ pub async fn listen_for_relays(
             continue;
         }
         let specifier = sia::types::Specifier::new(rpc_id);
-        let rpc_name = String::from_utf8_lossy(&rpc_id).trim_end_matches('\0').to_string();
+        let rpc_name = String::from_utf8_lossy(&rpc_id)
+            .trim_end_matches('\0')
+            .to_string();
         emit("debug", &format!("received RPC: {}", rpc_name));
 
         if specifier == RPC_RELAY_V2_HEADER {
@@ -8009,7 +8748,8 @@ pub async fn listen_for_relays(
                     let header = req.header;
                     let bid = header.id();
                     let block_id = hex::encode(<BlockID as AsRef<[u8]>>::as_ref(&bid));
-                    let parent_id = hex::encode(<BlockID as AsRef<[u8]>>::as_ref(&header.parent_id));
+                    let parent_id =
+                        hex::encode(<BlockID as AsRef<[u8]>>::as_ref(&header.parent_id));
                     emit(
                         "relay_header",
                         &format!(
@@ -8028,10 +8768,7 @@ pub async fn listen_for_relays(
                 Ok(d) => d,
                 Err(_) => continue,
             };
-            emit(
-                "relay_block",
-                &format!("{{\"size\":{}}}", data.len()),
-            );
+            emit("relay_block", &format!("{{\"size\":{}}}", data.len()));
         } else if specifier == RPC_RELAY_V2_TRANSACTION_SET {
             // Decode transaction set and emit full transaction details
             let data = match stream.read_to_end().await {
@@ -8127,7 +8864,9 @@ pub async fn listen_for_relays(
     }
 
     // Stop keepalive timer
-    let _ = web_sys::window().unwrap().clear_interval_with_handle(keepalive_id);
+    let _ = web_sys::window()
+        .unwrap()
+        .clear_interval_with_handle(keepalive_id);
 
     let _ = conn.wt.close();
     Ok(JsValue::from_str("disconnected"))
@@ -8146,12 +8885,12 @@ mod tests {
             0x1D, 0x1E, 0x1F, 0x20,
         ];
         let addr0: [u8; 32] = [
-            1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23,
-            24, 25, 26, 27, 28, 29, 30, 31, 32,
+            1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24,
+            25, 26, 27, 28, 29, 30, 31, 32,
         ];
         let addr1: [u8; 32] = [
-            32, 31, 30, 29, 28, 27, 26, 25, 24, 23, 22, 21, 20, 19, 18, 17, 16, 15, 14, 13, 12,
-            11, 10, 9, 8, 7, 6, 5, 4, 3, 2, 1,
+            32, 31, 30, 29, 28, 27, 26, 25, 24, 23, 22, 21, 20, 19, 18, 17, 16, 15, 14, 13, 12, 11,
+            10, 9, 8, 7, 6, 5, 4, 3, 2, 1,
         ];
         let addr2: [u8; 32] = [
             0xAA, 0xBB, 0xCC, 0xDD, 0xEE, 0xFF, 0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88,
@@ -8159,8 +8898,8 @@ mod tests {
             0x77, 0x88, 0x99, 0x00,
         ];
         let not_in_set: [u8; 32] = [
-            0xFF, 0xFF, 0xFF, 0xFF, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-            0, 0, 0, 0, 0, 0, 0, 0,
+            0xFF, 0xFF, 0xFF, 0xFF, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+            0, 0, 0, 0, 0, 0, 0,
         ];
 
         let filter_hex = "20d88202d3f472b8";
