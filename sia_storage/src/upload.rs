@@ -8,7 +8,7 @@ use sia_core::rhp4::{self as rhp, SECTOR_SIZE};
 use sia_core::signing::PublicKey;
 use thiserror::Error;
 use tokio::io::{
-    AsyncBufRead, AsyncRead, AsyncWriteExt, BufReader, SimplexStream, WriteHalf, copy, simplex,
+    AsyncRead, AsyncWriteExt, BufReader, SimplexStream, WriteHalf, copy, simplex,
 };
 use tokio::sync::{OwnedSemaphorePermit, Semaphore, mpsc};
 use crate::task::{TaskError, TaskSet};

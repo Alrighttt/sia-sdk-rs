@@ -41,6 +41,7 @@ jobs:
 
       - name: Prepare Pages artifact
         run: |
+          mkdir -p sia_storage_wasm/example/pkg
           cp sia_storage_wasm/pkg/sia_storage_wasm_bg.wasm sia_storage_wasm/example/pkg/
           cp sia_storage_wasm/pkg/sia_storage_wasm.js sia_storage_wasm/example/pkg/
           cp sia_storage_wasm/pkg/sia_storage_wasm.d.ts sia_storage_wasm/example/pkg/

@@ -397,24 +397,6 @@ impl<T: Transport> Hosts<T> {
         }
     }
 
-    pub fn transport(&self) -> &T {
-        &self.transport
-    }
-
-    pub fn upload_hosts(&self) -> Vec<HostEndpoint> {
-        self.hosts
-            .hosts
-            .read()
-            .unwrap()
-            .iter()
-            .filter(|(_, h)| h.good_for_upload)
-            .map(|(pk, h)| HostEndpoint {
-                public_key: *pk,
-                addresses: h.addresses.clone(),
-            })
-            .collect()
-    }
-
     fn host_endpoint(&self, host_key: PublicKey) -> Result<HostEndpoint, RPCError> {
         let addresses = self.hosts.addresses(&host_key);
         match addresses {

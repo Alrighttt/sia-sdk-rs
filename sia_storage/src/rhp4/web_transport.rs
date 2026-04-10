@@ -312,10 +312,6 @@ impl Client {
         self.pool.borrow_mut().remove(host_key);
     }
 
-    pub fn clear_pool(&self) {
-        self.pool.borrow_mut().clear();
-    }
-
     /// Returns true if the error indicates the connection is broken and
     /// should be evicted from the pool. Transport and I/O errors mean the
     /// session is dead; RPC-level errors (e.g. insufficient funds) are
