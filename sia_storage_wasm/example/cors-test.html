@@ -1,0 +1,73 @@
+<!DOCTYPE html>
+<html>
+<head><title>sia.storage CORS Test</title></head>
+<body>
+<h2>sia.storage duplicate CORS header test</h2>
+<p>This page connects to sia.storage via the SDK and makes API calls.
+If the server returns duplicate <code>Access-Control-Allow-Origin</code> headers,
+the browser will block the request with a CORS error visible in the console.</p>
+
+<div>
+  <label>Indexer URL: <input id="indexer" value="https://sia.storage" size="40"></label><br>
+  <label>App Key (hex): <input id="appkey" size="80" placeholder="paste app key hex"></label><br>
+  <button id="btn" onclick="run()" disabled>Connect &amp; Test</button>
+</div>
+<pre id="log"></pre>
+
+<script type="module">
+import init, { AppKey, SdkBuilder, set_log_level } from './pkg/sia_storage_wasm.js';
+
+const log = document.getElementById('log');
+function print(msg) {
+  const ts = new Date().toLocaleTimeString();
+  log.textContent += `[${ts}] ${msg}\n`;
+}
+
+const saved = localStorage.getItem('cors-test-appkey');
+if (saved) document.getElementById('appkey').value = saved;
+
+print('Loading WASM...');
+await init();
+set_log_level('debug');
+print('WASM ready.');
+document.getElementById('btn').disabled = false;
+
+window.run = async function() {
+  log.textContent = '';
+  const indexerUrl = document.getElementById('indexer').value;
+  const appKeyHex = document.getElementById('appkey').value.trim();
+  if (!appKeyHex) { print('ERROR: paste an app key hex'); return; }
+  localStorage.setItem('cors-test-appkey', appKeyHex);
+
+  const APP_ID = '567b03ee1fb87c52af8012e61f3273b987ff6b4c04d9c8cd6e265977d61152b9';
+
+  try {
+    print('Connecting to ' + indexerUrl + '...');
+    const builder = new SdkBuilder(indexerUrl, APP_ID, 'CORS Test', 'CORS duplicate header test', 'https://github.com/SiaFoundation/sia-sdk-rs');
+    const appKey = AppKey.fromHex(appKeyHex);
+    const sdk = await builder.connected(appKey);
+    if (!sdk) { print('ERROR: connected() returned null — key not registered'); return; }
+    print('Connected.');
+
+    print('');
+    print('--- Testing sdk.account() ---');
+    const account = await sdk.account();
+    print('OK: account ready=' + account.ready + ' storage=' + account.remainingStorage);
+
+    print('');
+    print('--- Testing sdk.hosts() ---');
+    const hosts = await sdk.hosts(null);
+    print('OK: ' + hosts.length + ' hosts returned');
+
+    print('');
+    print('All requests succeeded. No CORS issues detected.');
+    print('If you see CORS errors in the console above, the server is sending duplicate Access-Control-Allow-Origin headers.');
+  } catch (e) {
+    print('ERROR: ' + e);
+    print('');
+    print('Check the browser console (F12) for CORS-specific error messages.');
+  }
+};
+</script>
+</body>
+</html>
